@@ -1,0 +1,1057 @@
+#!/bin/bash
+# Spawn into a Docker container with Claude Code ready to execute
+#
+# Usage:
+#   claude-container [dockerfile] [--build] [--dir <path>]
+#   claude-container                    # Use ./Dockerfile or ./.devcontainer/Dockerfile
+#   claude-container path/to/Dockerfile # Use specific Dockerfile
+#   claude-container --build            # Force rebuild image
+#   claude-container --dir ./myproject  # Use overlay for myproject directory
+#
+# Environment:
+#   CLAUDE_CODE_OAUTH_TOKEN  OAuth token for authentication (required)
+
+set -e
+
+VERSION="0.1.0"
+DEFAULT_IMAGE="ghcr.io/hypermemetic/claude-container:latest"
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+info() { echo -e "${BLUE}→${NC} $*"; }
+success() { echo -e "${GREEN}✓${NC} $*"; }
+warn() { echo -e "${YELLOW}⚠${NC} $*"; }
+error() { echo -e "${RED}✗${NC} $*" >&2; }
+
+# Spinner for long operations
+spin() {
+    local pid=$1
+    local delay=0.1
+    local spinstr='|/-\'
+    while ps -p $pid &>/dev/null; do
+        local temp=${spinstr#?}
+        printf " [%c]  " "$spinstr"
+        local spinstr=$temp${spinstr%"$temp"}
+        sleep $delay
+        printf "\b\b\b\b\b\b"
+    done
+    printf "    \b\b\b\b"
+}
+
+DOCKERFILE=""
+FORCE_BUILD=false
+SESSION_DIR=""
+VERIFY_MODE=false
+TOKEN_TMPFILE=""
+PLATFORM=""
+IS_CI=false
+SESSION_NAME="default"
+GIT_SESSION=""
+USE_GIT_SESSION=false
+CONTINUE_SESSION=false
+RUN_AS_USER=false
+RUN_AS_ROOTISH=false
+AUTO_SYNC_BRANCH=""
+
+# Platform detection
+detect_platform() {
+    case "$(uname -s)" in
+        Darwin)
+            PLATFORM="macos"
+            ;;
+        Linux)
+            PLATFORM="linux"
+            # Detect WSL
+            if grep -qi microsoft /proc/version 2>/dev/null; then
+                PLATFORM="wsl"
+            fi
+            ;;
+        MINGW*|MSYS*|CYGWIN*)
+            PLATFORM="windows"
+            ;;
+        *)
+            PLATFORM="unknown"
+            ;;
+    esac
+}
+
+# CI environment detection
+detect_ci() {
+    if [[ -n "${CI:-}" ]] || [[ -n "${GITHUB_ACTIONS:-}" ]] || [[ -n "${GITLAB_CI:-}" ]]; then
+        IS_CI=true
+    else
+        IS_CI=false
+    fi
+}
+
+# Get host UID dynamically (platform-aware)
+get_host_uid() {
+    case "$PLATFORM" in
+        windows)
+            echo "1000"  # Default for Windows containers
+            ;;
+        *)
+            id -u
+            ;;
+    esac
+}
+
+# Get host GID dynamically (platform-aware)
+get_host_gid() {
+    case "$PLATFORM" in
+        windows)
+            echo "1000"  # Default for Windows containers
+            ;;
+        *)
+            id -g
+            ;;
+    esac
+}
+
+# Platform-specific SSH socket arguments
+get_ssh_socket_args() {
+    if [[ -z "${SSH_AUTH_SOCK:-}" ]]; then
+        return
+    fi
+
+    case "$PLATFORM" in
+        macos)
+            # macOS Docker Desktop uses a special socket path
+            echo "-v /run/host-services/ssh-auth.sock:/ssh-agent -e SSH_AUTH_SOCK=/ssh-agent"
+            ;;
+        linux|wsl)
+            # Linux/WSL can directly mount the SSH socket
+            echo "-v $SSH_AUTH_SOCK:/ssh-agent -e SSH_AUTH_SOCK=/ssh-agent"
+            ;;
+        windows)
+            # Windows named pipe - not directly supported, skip SSH forwarding
+            echo ""
+            ;;
+        *)
+            # Unknown platform - try direct mount as fallback
+            echo "-v $SSH_AUTH_SOCK:/ssh-agent -e SSH_AUTH_SOCK=/ssh-agent"
+            ;;
+    esac
+}
+
+# Initialize platform and CI detection
+detect_platform
+detect_ci
+
+# Secure token injection - mounts token as file instead of env var
+# This prevents token from being visible in `docker inspect`
+inject_token_securely() {
+    local token="$1"
+
+    # Use a path that Docker VM can definitely access
+    # On macOS with Colima/Docker Desktop, $TMPDIR (/var/folders/...) may not be shared
+    # Use $HOME/.cache which is always shared
+    local token_dir="$HOME/.cache/claude-container"
+    mkdir -p "$token_dir"
+    chmod 700 "$token_dir"
+
+    TOKEN_TMPFILE="$token_dir/token-$$"
+    echo -n "$token" > "$TOKEN_TMPFILE"
+    chmod 600 "$TOKEN_TMPFILE"
+
+    # Verify file exists and has content (prevents Docker creating a directory)
+    if [[ ! -f "$TOKEN_TMPFILE" ]] || [[ ! -s "$TOKEN_TMPFILE" ]]; then
+        error "Failed to create token file"
+        exit 1
+    fi
+
+    # Add cleanup trap
+    trap "rm -f '$TOKEN_TMPFILE'" EXIT
+
+    # Mount as file (must be absolute path for Docker)
+    DOCKER_ARGS+=("-v" "$TOKEN_TMPFILE:/run/secrets/claude_token:ro")
+}
+
+# Session state persistence - stores conversation history and settings
+setup_session_state() {
+    local session_name="${1:-default}"
+    local state_volume="claude-state-${session_name}"
+
+    # Create volume if it doesn't exist
+    docker volume inspect "$state_volume" &>/dev/null || \
+        docker volume create "$state_volume" >/dev/null
+
+    # Add to docker args
+    DOCKER_ARGS+=("-v" "$state_volume:/home/developer/.claude")
+}
+
+# Dev tool caches - persist cargo/npm/pip caches across sessions
+# Fixes permission issues (e.g., cargo registry owned by root)
+setup_dev_caches() {
+    local session_name="${1:-default}"
+
+    for cache in cargo npm pip; do
+        local vol="claude-${cache}-${session_name}"
+        docker volume inspect "$vol" &>/dev/null || \
+            docker volume create "$vol" >/dev/null
+    done
+
+    DOCKER_ARGS+=(
+        "-v" "claude-cargo-${session_name}:/home/developer/.cargo"
+        "-v" "claude-npm-${session_name}:/home/developer/.npm"
+        "-v" "claude-pip-${session_name}:/home/developer/.cache/pip"
+        "-e" "CARGO_HOME=/home/developer/.cargo"
+        "-e" "npm_config_cache=/home/developer/.npm"
+        "-e" "PIP_CACHE_DIR=/home/developer/.cache/pip"
+    )
+}
+
+# Git-based session isolation - clones repo into volume, strips remotes
+# This replaces privileged overlay mode with a safer git-based approach
+create_git_session() {
+    local name="$1"
+    local source_dir="$2"
+    local volume="claude-session-${name}"
+
+    # Check if session already exists
+    if docker volume inspect "$volume" &>/dev/null; then
+        info "Resuming existing git session: $name"
+        return 0
+    fi
+
+    # Verify source directory exists and is a git repo
+    if [[ ! -d "$source_dir" ]]; then
+        error "Source directory does not exist: $source_dir"
+        exit 1
+    fi
+    if [[ ! -d "$source_dir/.git" ]]; then
+        error "Source directory is not a git repository: $source_dir"
+        exit 1
+    fi
+
+    info "Creating git session: $name"
+    docker volume create "$volume" >/dev/null
+
+    # Clone repo into volume, strip remotes for safety
+    # Use main image (has git) instead of pulling alpine/git
+    local git_image="${IMAGE_NAME:-$DEFAULT_IMAGE}"
+    info "Cloning repository into session volume..."
+
+    # Run clone and capture exit status
+    # Mark /source as safe to avoid "dubious ownership" errors (container user != host user)
+    local host_uid
+    host_uid=$(get_host_uid)
+    local clone_output
+    if ! clone_output=$(docker run --rm \
+        -v "$source_dir:/source:ro" \
+        -v "$volume:/session" \
+        "$git_image" \
+        sh -c 'git config --global --add safe.directory "*" && git clone /source /session' 2>&1); then
+        error "Git clone failed:"
+        echo "$clone_output" >&2
+        docker volume rm "$volume" >/dev/null 2>&1
+        exit 1
+    fi
+
+    # Configure the cloned repo and fix ownership for developer user
+    docker run --rm \
+        -v "$volume:/session" \
+        -e "HOST_UID=$host_uid" \
+        "$git_image" \
+        sh -c '
+            cd /session
+            git config --global --add safe.directory "*"
+            git remote remove origin 2>/dev/null || true
+            git config user.email "claude@container"
+            git config user.name "Claude"
+            chown -R ${HOST_UID:-1000}:${HOST_UID:-1000} /session
+        '
+
+    success "Git session created: $name"
+}
+
+# Show diff between git session and original repo
+diff_git_session() {
+    local name="$1"
+    local source_dir="$2"
+    local volume="claude-session-${name}"
+
+    # Check if session exists
+    if ! docker volume inspect "$volume" &>/dev/null; then
+        error "Session not found: $name"
+        exit 1
+    fi
+
+    local git_image="${IMAGE_NAME:-$DEFAULT_IMAGE}"
+    info "Comparing session '$name' with source repository..."
+    echo ""
+
+    # Show commits made in session
+    echo "=== Commits in session ==="
+    docker run --rm \
+        -v "$volume:/session:ro" \
+        "$git_image" \
+        sh -c '
+            git config --global --add safe.directory "*"
+            cd /session
+            # Get the initial commit (the clone point)
+            initial=$(git rev-list --max-parents=0 HEAD 2>/dev/null | tail -1)
+            # Show commits after initial
+            git log --oneline "$initial"..HEAD 2>/dev/null || git log --oneline -10
+        '
+
+    echo ""
+    echo "=== File changes (session vs source) ==="
+    docker run --rm \
+        -v "$source_dir:/source:ro" \
+        -v "$volume:/session:ro" \
+        "$git_image" \
+        sh -c '
+            git config --global --add safe.directory "*"
+            cd /session
+            # Create a temporary remote to compare
+            git remote add source /source 2>/dev/null || true
+            git fetch source --quiet 2>/dev/null || true
+            # Show diff against source
+            git diff --stat source/HEAD HEAD 2>/dev/null || \
+                echo "  (unable to compare - source may not be a git repo)"
+        '
+}
+
+# Merge session commits back to original repo
+merge_git_session() {
+    local name="$1"
+    local target_dir="$2"
+    local target_branch="${3:-}"
+    local auto_mode="${4:-false}"
+    local volume="claude-session-${name}"
+
+    # Check if session exists
+    if ! docker volume inspect "$volume" &>/dev/null; then
+        error "Session not found: $name"
+        exit 1
+    fi
+
+    # Check if target is a git repo
+    if [[ ! -d "$target_dir/.git" ]]; then
+        error "Target directory is not a git repository: $target_dir"
+        exit 1
+    fi
+
+    local git_image="${IMAGE_NAME:-$DEFAULT_IMAGE}"
+
+    # Handle target branch
+    if [[ -n "$target_branch" ]]; then
+        info "Merging session '$name' into branch: $target_branch"
+        cd "$target_dir"
+        # Create branch if it doesn't exist, or switch to it
+        if git show-ref --verify --quiet "refs/heads/$target_branch"; then
+            info "Switching to existing branch: $target_branch"
+            git checkout "$target_branch"
+        else
+            info "Creating new branch: $target_branch"
+            git checkout -b "$target_branch"
+        fi
+    else
+        info "Merging session '$name' into: $target_dir (current branch)"
+    fi
+    echo ""
+
+    # Show what will be merged
+    echo "=== Commits to merge ==="
+    docker run --rm \
+        -v "$volume:/session:ro" \
+        "$git_image" \
+        sh -c '
+            git config --global --add safe.directory "*"
+            cd /session
+            initial=$(git rev-list --max-parents=0 HEAD 2>/dev/null | tail -1)
+            git log --oneline "$initial"..HEAD 2>/dev/null || git log --oneline -10
+        '
+
+    echo ""
+
+    if [[ "$auto_mode" == "true" ]]; then
+        choice="y"
+    else
+        read -p "Merge all commits? [y/n/select] " choice
+    fi
+
+    case "$choice" in
+        y|Y)
+            info "Exporting and applying patches..."
+
+            # Create temp directory for patches
+            # Use Docker-accessible path (mktemp -d creates /var/folders/... on macOS which Docker can't mount)
+            local patch_cache="$HOME/.cache/claude-container"
+            mkdir -p "$patch_cache"
+            local patch_dir="$patch_cache/merge-$$-$(date +%s)"
+            mkdir -p "$patch_dir"
+            trap "rm -rf $patch_dir" RETURN
+
+            # Export patches from session
+            docker run --rm \
+                -v "$volume:/session:ro" \
+                -v "$patch_dir:/patches" \
+                "$git_image" \
+                sh -c '
+                    git config --global --add safe.directory "*"
+                    cd /session
+                    initial=$(git rev-list --max-parents=0 HEAD 2>/dev/null | tail -1)
+                    git format-patch -o /patches "$initial"..HEAD 2>/dev/null || \
+                        git format-patch -o /patches -10
+                '
+
+            # Apply patches to target
+            cd "$target_dir"
+            local patch_count
+            patch_count=$(ls -1 "$patch_dir"/*.patch 2>/dev/null | wc -l | tr -d ' ')
+
+            if [[ "$patch_count" -eq 0 ]]; then
+                warn "No patches to apply"
+                return 0
+            fi
+
+            for patch in "$patch_dir"/*.patch; do
+                if git am "$patch"; then
+                    success "Applied: $(basename "$patch")"
+                else
+                    error "Failed to apply: $(basename "$patch")"
+                    echo "Run 'git am --abort' to cancel or 'git am --skip' to skip this patch"
+                    return 1
+                fi
+            done
+
+            success "Successfully merged $patch_count commit(s)"
+
+            # In auto mode, don't prompt to delete (preserve session for --continue)
+            if [[ "$auto_mode" != "true" ]]; then
+                echo ""
+                read -p "Delete session '$name'? [y/n] " delete_choice
+                if [[ "$delete_choice" == "y" ]]; then
+                    docker volume rm "$volume" >/dev/null
+                    success "Session deleted: $name"
+                fi
+            fi
+            ;;
+        n|N)
+            echo "Cancelled"
+            ;;
+        select|s|S)
+            warn "Interactive selection not yet implemented"
+            echo "Use 'git cherry-pick' manually after inspecting the session"
+            ;;
+        *)
+            echo "Invalid choice"
+            ;;
+    esac
+}
+
+# Handle cleanup commands (before main argument parsing)
+case "${1:-}" in
+    --cleanup)
+        echo "Cleaning up claude-container resources..."
+
+        # List volumes
+        volumes=$(docker volume ls -q | grep -E "^(claude-session-|claude-state-|claude-cargo-|claude-npm-|claude-pip-|session-data-)" || true)
+
+        if [[ -z "$volumes" ]]; then
+            echo "No volumes to clean up"
+            exit 0
+        fi
+
+        echo "Found volumes:"
+        echo "$volumes" | sed 's/^/  /'
+        echo ""
+
+        read -p "Delete all? [y/n] " confirm
+        if [[ "$confirm" == "y" ]]; then
+            echo "$volumes" | xargs docker volume rm
+            echo "Done"
+        else
+            echo "Cancelled"
+        fi
+        exit 0
+        ;;
+
+    --list-sessions)
+        echo "Session volumes:"
+        docker volume ls -q | grep -E "^(claude-session-|claude-state-|claude-cargo-|claude-npm-|claude-pip-|session-data-)" | sed 's/^/  /' || echo "  (none)"
+        exit 0
+        ;;
+
+    --delete-session)
+        if [[ -z "${2:-}" ]]; then
+            echo "Error: --delete-session requires a session name"
+            echo "Usage: claude-container --delete-session <name>"
+            exit 1
+        fi
+        session="$2"
+        deleted=false
+
+        # Try to delete all possible volume patterns for this session
+        for pattern in "claude-session-${session}" "claude-state-${session}" "claude-cargo-${session}" "claude-npm-${session}" "claude-pip-${session}" "session-data-${session}"; do
+            if docker volume inspect "$pattern" &>/dev/null; then
+                docker volume rm "$pattern"
+                echo "Deleted: $pattern"
+                deleted=true
+            fi
+        done
+
+        if ! $deleted; then
+            echo "No volumes found for session: $session"
+            exit 1
+        fi
+        echo "Done"
+        exit 0
+        ;;
+
+    --restart-session)
+        if [[ -z "${2:-}" ]]; then
+            echo "Error: --restart-session requires a session name"
+            echo "Usage: claude-container --restart-session <name> [options]"
+            exit 1
+        fi
+        session="$2"
+        shift 2
+        extra_args=("$@")  # Capture remaining args (e.g., --as-rootish)
+
+        # Find and stop any running container for this session
+        running=$(docker ps -q --filter "name=claude-dev-" 2>/dev/null || true)
+        if [[ -n "$running" ]]; then
+            info "Stopping running container..."
+            docker stop $running >/dev/null 2>&1 || true
+        fi
+
+        # Fix permissions on existing volumes before restart
+        info "Fixing volume permissions..."
+        docker run --rm \
+            -v "claude-cargo-${session}:/cargo" \
+            -v "claude-npm-${session}:/npm" \
+            -v "claude-pip-${session}:/pip" \
+            -v "claude-state-${session}:/state" \
+            alpine sh -c 'chown -R 1000:1000 /cargo /npm /pip /state 2>/dev/null || true'
+
+        # Re-exec with same session + continue + any extra args
+        info "Restarting session: $session"
+        exec "$0" --git-session "$session" --continue "${extra_args[@]}"
+        ;;
+
+    --diff-session)
+        if [[ -z "${2:-}" ]]; then
+            echo "Error: --diff-session requires a session name"
+            echo "Usage: claude-container --diff-session <name>"
+            exit 1
+        fi
+        diff_git_session "$2" "$(pwd)"
+        exit 0
+        ;;
+
+    --merge-session)
+        if [[ -z "${2:-}" ]]; then
+            echo "Error: --merge-session requires a session name"
+            echo "Usage: claude-container --merge-session <name> [--into <branch>] [--auto]"
+            exit 1
+        fi
+        session_name="$2"
+        target_branch=""
+        auto_mode=false
+        shift 2
+        # Parse options
+        while [[ $# -gt 0 ]]; do
+            case $1 in
+                --into)
+                    target_branch="$2"
+                    shift 2
+                    ;;
+                --auto)
+                    auto_mode=true
+                    shift
+                    ;;
+                *)
+                    shift
+                    ;;
+            esac
+        done
+        merge_git_session "$session_name" "$(pwd)" "$target_branch" "$auto_mode"
+        exit 0
+        ;;
+esac
+
+# Parse arguments
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --build|-b)
+            FORCE_BUILD=true
+            shift
+            ;;
+        --dir|-d)
+            SESSION_DIR="$2"
+            shift 2
+            ;;
+        --verify|-v)
+            VERIFY_MODE=true
+            shift
+            ;;
+        --session|-s)
+            SESSION_NAME="$2"
+            shift 2
+            ;;
+        --git-session|-g)
+            GIT_SESSION="$2"
+            USE_GIT_SESSION=true
+            shift 2
+            ;;
+        --continue|-c)
+            CONTINUE_SESSION=true
+            shift
+            ;;
+        --as-user)
+            RUN_AS_USER=true
+            shift
+            ;;
+        --as-rootish)
+            RUN_AS_ROOTISH=true
+            shift
+            ;;
+        --auto-sync)
+            AUTO_SYNC_BRANCH="$2"
+            shift 2
+            ;;
+        --version|-V)
+            echo "claude-container $VERSION"
+            exit 0
+            ;;
+        --help|-h)
+            cat <<EOF
+Usage: claude-container [options] [dockerfile]
+
+Spawn into a Docker container with Claude Code ready.
+
+Options:
+  --build, -b              Force rebuild the image
+  --dir, -d <path>         Directory to use with overlay (changes persist in session volume)
+                           DEPRECATED: Use --git-session instead (requires --privileged)
+  --git-session, -g <name> Create/resume a git-based isolated session (recommended)
+                           Clones repo into a volume, strips remotes for safety
+                           Claude can commit changes without affecting your working copy
+  --session, -s <name>     Session name for state persistence (default: "default")
+                           Conversation history and settings persist between container restarts
+  --continue, -c           Continue the most recent Claude conversation
+  --as-user                Run as non-root developer user (default: run as root)
+  --as-rootish             Run as developer user who owns install dirs (recommended)
+  --auto-sync <branch>     Auto-merge session commits to branch on exit
+  --verify, -v             Verify container setup works (run checks and exit)
+  --version, -V            Show version
+  --help, -h               Show this help
+
+Git Session Management:
+  --git-session, -g <name> Create or resume a git-based session
+  --restart-session <name> Restart a session (fixes permissions, continues conversation)
+  --diff-session <name>    Show changes made in a git session vs original repo
+  --merge-session <name> [--into <branch>]
+                           Merge session commits back to repo
+                           With --into: creates/switches to branch before applying
+
+Session Management:
+  --cleanup                List and optionally delete all claude-related volumes
+  --list-sessions          List all session volumes
+  --delete-session <name>  Delete a specific session by name
+
+Environment:
+  CLAUDE_CODE_OAUTH_TOKEN   OAuth token for authentication (required)
+                            Get one with: claude setup-token
+
+Dockerfile search order:
+  1. Explicit path argument
+  2. ./Dockerfile
+  3. ./.devcontainer/Dockerfile
+  4. ./docker/Dockerfile
+  5. Default image: $DEFAULT_IMAGE (if no Dockerfile found)
+
+The container will have:
+  - Current directory mounted at /workspace (or git clone if --git-session used)
+  - Claude Code CLI available
+  - Git configured from host
+  - SSH agent forwarded
+
+Examples:
+  claude-container                        # Start with current dir mounted
+  claude-container --git-session feature  # Start isolated git session "feature"
+  claude-container -g feature --continue  # Resume session AND continue conversation
+  claude-container --restart-session feature # Restart session, fix perms, continue
+  claude-container --diff-session feature # See what changed in the session
+  claude-container --merge-session feature # Apply session commits to repo
+EOF
+            exit 0
+            ;;
+        *)
+            DOCKERFILE="$1"
+            shift
+            ;;
+    esac
+done
+
+# Check for token
+if [[ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]]; then
+    error "CLAUDE_CODE_OAUTH_TOKEN is required"
+    echo ""
+    echo "Get a token by running: claude setup-token"
+    echo "Then: export CLAUDE_CODE_OAUTH_TOKEN=<token>"
+    exit 1
+fi
+
+# Find Dockerfile
+if [[ -z "$DOCKERFILE" ]]; then
+    for candidate in "./Dockerfile" "./.devcontainer/Dockerfile" "./docker/Dockerfile"; do
+        if [[ -f "$candidate" ]]; then
+            DOCKERFILE="$candidate"
+            break
+        fi
+    done
+fi
+
+USE_DEFAULT_IMAGE=false
+
+if [[ -z "$DOCKERFILE" ]]; then
+    info "No Dockerfile found, using default image: $DEFAULT_IMAGE"
+    USE_DEFAULT_IMAGE=true
+    IMAGE_NAME="$DEFAULT_IMAGE"
+elif [[ ! -f "$DOCKERFILE" ]]; then
+    error "Dockerfile not found: $DOCKERFILE"
+    exit 1
+fi
+
+if $USE_DEFAULT_IMAGE; then
+    # Pull default image if not present locally
+    IMAGE_EXISTS=$(docker images -q "$IMAGE_NAME" 2>/dev/null)
+    if [[ -z "$IMAGE_EXISTS" ]] || $FORCE_BUILD; then
+        info "Pulling image: $IMAGE_NAME"
+        docker pull "$IMAGE_NAME" &
+        spin $!
+        wait $!
+        success "Image pulled: $IMAGE_NAME"
+        echo ""
+    fi
+else
+    info "Using Dockerfile: $DOCKERFILE"
+
+    # Determine context directory (parent of Dockerfile)
+    CONTEXT_DIR="$(dirname "$DOCKERFILE")"
+    if [[ "$CONTEXT_DIR" == "." ]]; then
+        CONTEXT_DIR="$(pwd)"
+    fi
+
+    # Generate image name from current directory
+    PROJECT_NAME="$(basename "$(pwd)" | tr '[:upper:]' '[:lower:]' | tr -cd '[:alnum:]-')"
+    IMAGE_NAME="claude-dev-${PROJECT_NAME}"
+
+    # Check if image exists or needs rebuild
+    IMAGE_EXISTS=$(docker images -q "$IMAGE_NAME" 2>/dev/null)
+
+    if [[ -z "$IMAGE_EXISTS" ]] || $FORCE_BUILD; then
+        info "Building image: $IMAGE_NAME"
+        docker build -t "$IMAGE_NAME" -f "$DOCKERFILE" "$CONTEXT_DIR" &
+        spin $!
+        wait $!
+        success "Image built: $IMAGE_NAME"
+        echo ""
+    fi
+fi
+
+# Prepare mount points
+WORKSPACE_DIR="$(pwd)"
+SSH_AUTH_SOCK="${SSH_AUTH_SOCK:-}"
+USE_OVERLAY=false
+
+# Handle session directory with overlay (deprecated)
+SESSION_VOLUME=""
+if [[ -n "$SESSION_DIR" ]]; then
+    warn "The --dir option is deprecated. Consider using --git-session instead."
+    SESSION_DIR="$(cd "$SESSION_DIR" && pwd)"
+    SESSION_UUID="$(uuidgen | tr '[:upper:]' '[:lower:]')"
+    SESSION_VOLUME="session-data-${SESSION_UUID}"
+    info "Creating session volume: $SESSION_VOLUME"
+    docker volume create "$SESSION_VOLUME" >/dev/null
+    USE_OVERLAY=true
+    WORKSPACE_DIR="$SESSION_DIR"
+fi
+
+# Handle git-based session isolation (recommended)
+GIT_SESSION_VOLUME=""
+if $USE_GIT_SESSION; then
+    GIT_SESSION_VOLUME="claude-session-${GIT_SESSION}"
+    create_git_session "$GIT_SESSION" "$WORKSPACE_DIR"
+fi
+
+# Build docker run command
+DOCKER_ARGS=(
+    "--rm"
+    "--name" "claude-dev-$$"
+    "-w" "/workspace"
+)
+
+# Add TTY based on CI detection and terminal availability
+if $IS_CI; then
+    # No TTY in CI environments
+    :
+elif ! $VERIFY_MODE && [[ -t 0 ]]; then
+    DOCKER_ARGS+=("-it")
+fi
+
+# Mount workspace
+if $USE_GIT_SESSION; then
+    # Git session: mount the cloned volume directly at /workspace
+    DOCKER_ARGS+=("-v" "$GIT_SESSION_VOLUME:/workspace")
+elif $USE_OVERLAY; then
+    # Legacy overlay mode (deprecated, requires privileged)
+    DOCKER_ARGS+=(
+        "--privileged"
+        "--device" "/dev/fuse"
+        "-v" "$WORKSPACE_DIR:/workspace-lower:ro"
+        "-v" "$SESSION_VOLUME:/session-data"
+        "-e" "USE_OVERLAY=1"
+        "-e" "SESSION_VOLUME=$SESSION_VOLUME"
+    )
+else
+    # Direct mount (default)
+    DOCKER_ARGS+=("-v" "$WORKSPACE_DIR:/workspace")
+fi
+
+# Mount git config and SSH
+DOCKER_ARGS+=(
+    "-v" "$HOME/.gitconfig:/root/.gitconfig:ro"
+    "-v" "$HOME/.ssh:/root/.ssh:ro"
+)
+
+# Forward SSH agent if available (cross-platform)
+SSH_SOCKET_ARGS=$(get_ssh_socket_args)
+if [[ -n "$SSH_SOCKET_ARGS" ]]; then
+    # shellcheck disable=SC2086
+    DOCKER_ARGS+=($SSH_SOCKET_ARGS)
+fi
+
+# Add environment variables (using dynamic UID/GID for cross-platform support)
+DOCKER_ARGS+=(
+    "-e" "TERM=${TERM:-xterm-256color}"
+    "-e" "HOST_UID=$(get_host_uid)"
+    "-e" "HOST_GID=$(get_host_gid)"
+    "-e" "PLATFORM=$PLATFORM"
+    "-e" "IS_CI=$IS_CI"
+)
+
+# Inject token securely via file mount (not env var - prevents exposure in docker inspect)
+inject_token_securely "${CLAUDE_CODE_OAUTH_TOKEN}"
+
+# Set up session state persistence (conversation history, settings)
+setup_session_state "$SESSION_NAME"
+
+# Set up dev tool caches (cargo, npm, pip)
+setup_dev_caches "$SESSION_NAME"
+
+if $VERIFY_MODE; then
+    DOCKER_ARGS+=("-e" "VERIFY_MODE=1")
+fi
+
+if $CONTINUE_SESSION; then
+    DOCKER_ARGS+=("-e" "CONTINUE_SESSION=1")
+fi
+
+if $RUN_AS_USER; then
+    DOCKER_ARGS+=("-e" "RUN_AS_USER=1")
+fi
+
+if $RUN_AS_ROOTISH; then
+    DOCKER_ARGS+=("-e" "RUN_AS_ROOTISH=1")
+    # Allow user namespace creation for rootish wrappers
+    DOCKER_ARGS+=("--security-opt" "seccomp=unconfined")
+fi
+
+info "Starting container..."
+echo "  Image: $IMAGE_NAME"
+if $USE_GIT_SESSION; then
+    echo "  Workspace: $GIT_SESSION_VOLUME -> /workspace (git session)"
+else
+    echo "  Workspace: $WORKSPACE_DIR -> /workspace"
+fi
+echo "  Platform: $PLATFORM"
+echo "  State: claude-state-${SESSION_NAME}"
+if $IS_CI; then
+    echo "  CI Mode: enabled"
+fi
+if $USE_OVERLAY; then
+    echo "  Session: $SESSION_VOLUME (overlay mode - deprecated)"
+fi
+if $USE_GIT_SESSION; then
+    echo "  Git Session: $GIT_SESSION"
+fi
+echo ""
+
+# Run container
+docker run "${DOCKER_ARGS[@]}" "$IMAGE_NAME" /bin/bash -c '
+    set -e
+
+    # Read token from securely mounted file (not passed via env var)
+    export CLAUDE_CODE_OAUTH_TOKEN=$(cat /run/secrets/claude_token)
+
+    # Create non-root user matching host UID
+    HOST_UID=${HOST_UID:-1000}
+    DEV_GID=61000
+
+    # Set up overlayfs if requested
+    if [[ "${USE_OVERLAY:-}" == "1" ]]; then
+        echo "Setting up overlay filesystem..."
+        mkdir -p /session-data/upper /session-data/work
+        # Remove existing /workspace if present from Dockerfile WORKDIR
+        rmdir /workspace 2>/dev/null || rm -f /workspace 2>/dev/null || true
+        mkdir -p /workspace
+        if fuse-overlayfs \
+            -o lowerdir=/workspace-lower,upperdir=/session-data/upper,workdir=/session-data/work \
+            /workspace 2>&1; then
+            echo "  Overlay mounted at /workspace"
+        else
+            # Fallback to bind mount or symlink
+            mount --bind /workspace-lower /workspace 2>/dev/null || ln -sf /workspace-lower /workspace
+            echo "  Fallback: direct mount, read-only"
+        fi
+        # Re-enter workspace after mount to fix cwd
+        cd /workspace
+        echo ""
+    fi
+
+    # Set up home directory (volumes mount at /home/developer regardless of user)
+    mkdir -p /home/developer/.claude /home/developer/.cargo /home/developer/.npm /home/developer/.cache/pip
+
+    # Create .claude.json with theme + bypass acceptance to skip all onboarding
+    cat > /home/developer/.claude.json << EOF
+{"theme":"dark-ansi","hasCompletedOnboarding":true,"bypassPermissionsModeAccepted":true}
+EOF
+
+    # Copy git config
+    if [[ -f /root/.gitconfig ]]; then
+        cp /root/.gitconfig /home/developer/.gitconfig 2>/dev/null || true
+    fi
+
+    if [[ "${RUN_AS_USER:-}" == "1" ]] || [[ "${RUN_AS_ROOTISH:-}" == "1" ]]; then
+        # Create non-root developer user matching host UID
+        groupadd -g $DEV_GID developer 2>/dev/null || true
+        useradd -u $HOST_UID -g $DEV_GID -m -s /bin/bash developer 2>/dev/null || true
+
+        # Fix ownership for developer user
+        chown -R developer:developer /home/developer
+        chown developer:developer /workspace 2>/dev/null || true
+
+        if [[ "${RUN_AS_ROOTISH:-}" == "1" ]]; then
+            # Create a universal "rootish" wrapper that runs ANY command in a user namespace
+            # This makes the process appear as root without actual root privileges
+            cat > /usr/local/bin/rootish << 'WRAPPER'
+#!/bin/bash
+# If called as a symlink (e.g., apt-get-rootish), extract the real command
+cmd=$(basename "$0")
+if [[ "$cmd" != "rootish" ]]; then
+    # Strip -rootish suffix to get real command (apt-get-rootish -> apt-get)
+    realcmd="${cmd%-rootish}"
+    exec unshare --user --map-root-user -- "$realcmd" "$@"
+else
+    exec unshare --user --map-root-user -- "$@"
+fi
+WRAPPER
+            chmod +x /usr/local/bin/rootish
+
+            # Convenience symlinks for common commands
+            for cmd in apt apt-get dpkg; do
+                ln -sf rootish /usr/local/bin/${cmd}-rootish
+            done
+
+            echo "rootish wrapper installed (use: rootish <cmd> or apt-get-rootish, etc.)"
+        fi
+    fi
+
+    # Verify mode
+    if [[ "${VERIFY_MODE:-}" == "1" ]]; then
+        VERIFY_FAILED=false
+
+        echo "=== Verification ==="
+        echo "Run as: $(if [[ "${RUN_AS_ROOTISH:-}" == "1" ]]; then echo "developer (sudo)"; elif [[ "${RUN_AS_USER:-}" == "1" ]]; then echo "developer"; else echo "root"; fi)"
+        echo "Claude: $(which claude 2>&1)"
+        echo "Platform: ${PLATFORM:-unknown}"
+        echo "CI Mode: ${IS_CI:-false}"
+
+        echo ""
+        echo "=== Token Check ==="
+        if [[ -f /run/secrets/claude_token ]]; then
+            echo "  Token file: OK"
+            echo "  Token: ${CLAUDE_CODE_OAUTH_TOKEN:0:20}..."
+        elif [[ -d /run/secrets/claude_token ]]; then
+            echo "  ✗ Token is a DIRECTORY (mount failed)"
+            VERIFY_FAILED=true
+        else
+            echo "  ✗ Token file missing"
+            VERIFY_FAILED=true
+        fi
+
+        echo ""
+        echo "=== .claude Directory Check ==="
+        if touch /home/developer/.claude/.verify-test 2>/dev/null; then
+            echo "  .claude writable: OK"
+            rm -f /home/developer/.claude/.verify-test
+        else
+            echo "  ✗ Cannot write to .claude directory"
+            ls -la /home/developer/.claude 2>&1 | head -3
+            VERIFY_FAILED=true
+        fi
+
+        if [[ "${USE_OVERLAY:-}" == "1" ]]; then
+            echo ""
+            echo "=== Overlay Test ==="
+            echo "Mount info:"
+            mount | grep workspace || echo "  No workspace mount found"
+            echo ""
+            echo "Creating test file in overlay..."
+            touch /workspace/.overlay-test-file 2>&1 && echo "  Write succeeded" || echo "  Write failed"
+            echo ""
+            echo "Checking session data (upper dir):"
+            ls -la /session-data/upper/ 2>&1 | head -5
+            echo ""
+            echo "Checking source (lower dir):"
+            ls /workspace-lower/.overlay-test-file 2>&1 || echo "  Source unchanged - OVERLAY WORKING!"
+            rm -f /workspace/.overlay-test-file 2>/dev/null
+        fi
+
+        echo ""
+        echo "=== Claude Test ==="
+        if $VERIFY_FAILED; then
+            echo "  Skipping (prerequisites failed)"
+            exit 1
+        fi
+        HOME=/home/developer claude --print "test" 2>&1 | head -5
+        exit 0
+    fi
+
+    # Run claude
+    # --dangerously-skip-permissions only works for non-privileged users (no root/sudo)
+    if [[ "${RUN_AS_USER:-}" == "1" ]] || [[ "${RUN_AS_ROOTISH:-}" == "1" ]]; then
+        CLAUDE_ARGS="--dangerously-skip-permissions"
+    else
+        CLAUDE_ARGS=""
+    fi
+
+    if [[ "${CONTINUE_SESSION:-}" == "1" ]]; then
+        CLAUDE_ARGS="--continue $CLAUDE_ARGS"
+    fi
+
+    if [[ "${RUN_AS_USER:-}" == "1" ]] || [[ "${RUN_AS_ROOTISH:-}" == "1" ]]; then
+        exec gosu developer claude $CLAUDE_ARGS
+    else
+        HOME=/home/developer exec claude $CLAUDE_ARGS
+    fi
+'
+
+# Auto-sync on exit if configured
+if [[ -n "$AUTO_SYNC_BRANCH" ]] && $USE_GIT_SESSION; then
+    echo ""
+    info "Auto-syncing session to branch: $AUTO_SYNC_BRANCH"
+
+    # Run merge-session non-interactively
+    "$0" --merge-session "$GIT_SESSION" --into "$AUTO_SYNC_BRANCH" --auto
+fi
