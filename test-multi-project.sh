@@ -140,7 +140,10 @@ test_create_session() {
     cd "$TEST_DIR"
 
     # This should detect the config and create a multi-project session
-    if "$CLAUDE_CONTAINER" --git-session "$SESSION_NAME" <<< "exit" 2>&1 | tee /tmp/create-output.log | grep -q "Multi-project config detected"; then
+    # Use --no-run to create session without launching the container
+    "$CLAUDE_CONTAINER" --git-session "$SESSION_NAME" --no-run 2>&1 | tee /tmp/create-output.log
+
+    if grep -q "Multi-project config detected" /tmp/create-output.log; then
         success "Multi-project config was detected"
     else
         error "Multi-project config was NOT detected"

@@ -59,6 +59,7 @@ RUN_AS_USER=false
 RUN_AS_ROOTISH=false
 AUTO_SYNC_BRANCH=""
 CONFIG_FILE=""
+NO_RUN=false
 
 # Platform detection
 detect_platform() {
@@ -292,10 +293,19 @@ parse_config_file() {
     # Try yq first (most robust), fall back to Python
     if command -v yq &>/dev/null; then
         # Parse with yq: extract project names and paths
-        yq eval '.projects | to_entries | .[] | .key + "|" + .value.path' "$config_file" 2>/dev/null || {
+        local yq_output
+        yq_output=$(yq eval '.projects | to_entries | .[] | .key + "|" + .value.path' "$config_file" 2>/dev/null) || {
             error "Failed to parse config file with yq"
             exit 1
         }
+
+        # Resolve relative paths to absolute
+        while IFS='|' read -r name path; do
+            if [[ "$path" != /* ]]; then
+                path="$(cd "$config_dir" && cd "$path" && pwd)"
+            fi
+            echo "$name|$path"
+        done <<< "$yq_output"
     elif command -v python3 &>/dev/null; then
         # Fallback to Python
         python3 -c "
@@ -438,10 +448,19 @@ create_multi_project_session() {
 
     # Copy config file into volume for later reference (needed for merge/diff)
     info "Storing config in session volume..."
-    cat "$config_file" | docker run --rm -i \
+    local config_content
+    config_content=$(cat "$config_file")
+    if ! docker run --rm \
+        -e "CONFIG_CONTENT=$config_content" \
         -v "$volume:/session" \
         "$git_image" \
-        sh -c "cat > /session/.claude-projects.yml"
+        sh -c 'printf "%s\n" "$CONFIG_CONTENT" > /session/.claude-projects.yml' 2>&1; then
+        error "Failed to store config in volume"
+        docker volume rm "$volume" >/dev/null 2>&1
+        exit 1
+    fi
+
+    info "Config stored successfully"
 
     # Clone each project into its subdirectory
     local project_count=0
@@ -1233,6 +1252,10 @@ while [[ $# -gt 0 ]]; do
             CONFIG_FILE="$2"
             shift 2
             ;;
+        --no-run)
+            NO_RUN=true
+            shift
+            ;;
         --version|-V)
             echo "claude-container $VERSION"
             exit 0
@@ -1453,6 +1476,12 @@ GIT_SESSION_VOLUME=""
 if $USE_GIT_SESSION; then
     GIT_SESSION_VOLUME="claude-session-${GIT_SESSION}"
     create_git_session "$GIT_SESSION" "$WORKSPACE_DIR"
+
+    # Exit early if --no-run specified (session created, don't launch container)
+    if $NO_RUN; then
+        success "Session ready: $GIT_SESSION"
+        exit 0
+    fi
 fi
 
 # Build docker run command
