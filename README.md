@@ -227,7 +227,51 @@ Delete session 'feature-name'? [y/n]
 
 ## Multi-Project Sessions
 
-Work across multiple related repositories (e.g., frontend + backend + shared libraries) in a single Claude session.
+Work across multiple related repositories (e.g., frontend + backend + shared libraries) in a single Claude session. This enables Claude to make coordinated changes across your entire codebase, understanding dependencies and relationships between different projects.
+
+### Why Use Multi-Project Sessions?
+
+**Perfect for:**
+- Full-stack applications (frontend + backend + shared types)
+- Microservices architectures (multiple service repos)
+- Monorepo-style workflows (multiple packages in separate repos)
+- Library ecosystems (core library + plugins + examples)
+- Coordinated refactoring across multiple repos
+
+**Benefits:**
+- Claude sees the full context across all repositories
+- Make type-safe changes across frontend/backend boundaries
+- Coordinate API changes with client updates
+- Refactor shared code and update all consumers simultaneously
+- Single conversation history for the entire feature
+
+### Quick Start
+
+```bash
+# 1. Create config file listing your repos
+cat > .claude-projects.yml << 'EOF'
+version: "1"
+projects:
+  frontend:
+    path: ./frontend
+  backend:
+    path: ./backend
+  shared:
+    path: ./shared
+EOF
+
+# 2. Start multi-project session
+./claude-container --git-session fullstack-feature
+
+# 3. Claude can now see and modify all three repos
+# Inside container: /workspace/frontend/, /workspace/backend/, /workspace/shared/
+
+# 4. Review changes across all projects
+./claude-container --diff-session fullstack-feature
+
+# 5. Merge changes back to all source repos
+./claude-container --merge-session fullstack-feature
+```
 
 ### Configuration File
 
@@ -239,10 +283,17 @@ projects:
   frontend:
     path: ./frontend          # Relative to config file location
   backend:
-    path: /absolute/path/to/backend
+    path: ./backend
   shared-lib:
-    path: ../shared-library
+    path: ../shared-library   # Can reference parent directories
+  mobile:
+    path: /absolute/path/to/mobile  # Absolute paths work too
 ```
+
+**Path Resolution:**
+- Relative paths (starting with `./` or `../`) are resolved relative to the config file location
+- Absolute paths (starting with `/`) are used as-is
+- All paths must point to valid git repositories
 
 **Config Discovery Order:**
 1. `--config <path>` CLI flag (highest priority)
@@ -250,6 +301,106 @@ projects:
 3. `./.devcontainer/claude-projects.yml`
 4. `./claude-projects.yml`
 5. Falls back to single-repo mode if no config found
+
+### Example: Monorepo-Style Workspace
+
+For a directory structure like:
+```
+~/dev/myproject/
+├── .claude-projects.yml
+├── frontend/          # React app
+├── backend/           # Node.js API
+├── mobile/            # React Native app
+└── shared/            # Shared TypeScript types
+```
+
+Config file:
+```yaml
+version: "1"
+projects:
+  frontend:
+    path: ./frontend
+  backend:
+    path: ./backend
+  mobile:
+    path: ./mobile
+  shared:
+    path: ./shared
+```
+
+Inside the container:
+```
+/workspace/
+├── frontend/      # Full clone of frontend repo
+├── backend/       # Full clone of backend repo
+├── mobile/        # Full clone of mobile repo
+└── shared/        # Full clone of shared repo
+```
+
+### Example: All Repos in a Directory
+
+Clone all git repositories in a directory:
+
+```bash
+# Automatically generate config for all git repos in a directory
+cd ~/dev/hypermemetic
+
+# List all git repos
+for dir in */; do
+    if [[ -d "$dir/.git" ]]; then
+        echo "  $(basename "$dir"):"
+        echo "    path: ./$dir"
+    fi
+done
+
+# Or use this one-liner to create the config
+cat > .claude-projects.yml << 'EOF'
+version: "1"
+projects:
+EOF
+
+for dir in */; do
+    if [[ -d "$dir/.git" ]]; then
+        name=$(basename "$dir")
+        echo "  $name:" >> .claude-projects.yml
+        echo "    path: ./$dir" >> .claude-projects.yml
+    fi
+done
+```
+
+**Real Example** (10 repositories):
+```yaml
+version: "1"
+projects:
+  hub-codegen:
+    path: ./hub-codegen
+  hub-core:
+    path: ./hub-core
+  hub-macro:
+    path: ./hub-macro
+  hub-transport:
+    path: ./hub-transport
+  hyperforge:
+    path: ./hyperforge
+  substrate-protocol:
+    path: ./substrate-protocol
+  substrate-rust-codegen:
+    path: ./substrate-rust-codegen
+  substrate-sandbox-ts:
+    path: ./substrate-sandbox-ts
+  substrate:
+    path: ./substrate
+  synapse:
+    path: ./synapse
+```
+
+Then start a session:
+```bash
+cd ~/dev/hypermemetic
+./claude-container --git-session hypermemetic-all
+
+# All 10 repos are now available in /workspace/
+```
 
 ### Creating a Multi-Project Session
 
@@ -259,14 +410,70 @@ projects:
 
 # Explicit config path
 ./claude-container --git-session feature-name --config ~/my-projects.yml
+
+# Create session without starting container (for testing)
+./claude-container --git-session feature-name --no-run
 ```
 
-When the config is detected, all specified projects are cloned into the session volume:
+**What happens during creation:**
+1. Validates the config file (YAML syntax, required fields)
+2. Checks all project paths exist and are git repositories
+3. Creates a Docker volume for the session
+4. Stores the config (with absolute paths) in the volume
+5. Clones each repository into `/workspace/{project-name}/`
+6. Configures git in each repo (user, email, strips remotes)
+7. Fixes file ownership for the host user
+
+**Output example:**
 ```
-/workspace/
-├── frontend/       # Your frontend repo
-├── backend/        # Your backend repo
-└── shared-lib/     # Your shared library repo
+→ Multi-project config detected: /Users/you/dev/.claude-projects.yml
+→ Validating multi-project config...
+→   ✓ frontend: /Users/you/dev/frontend
+→   ✓ backend: /Users/you/dev/backend
+→   ✓ shared: /Users/you/dev/shared
+✓ Config validation passed
+→ Creating multi-project session: my-feature
+→ Storing config in session volume...
+→ Config stored successfully
+→ Cloning project 'frontend' from /Users/you/dev/frontend...
+✓   ✓ Cloned: frontend
+→ Cloning project 'backend' from /Users/you/dev/backend...
+✓   ✓ Cloned: backend
+→ Cloning project 'shared' from /Users/you/dev/shared...
+✓   ✓ Cloned: shared
+→ Fixing ownership...
+✓ Multi-project session created: my-feature (3 projects)
+```
+
+### Working with Multi-Project Sessions
+
+Once inside the container, Claude can work across all projects:
+
+```
+You: Add a new User type to shared, update the backend API to use it,
+     and update the frontend to consume the new API
+
+Claude: I'll coordinate changes across all three repos:
+
+1. First, I'll add the User type to shared:
+> cd /workspace/shared
+> [creates types/user.ts]
+> git add types/user.ts
+> git commit -m "Add User type definition"
+
+2. Now update the backend to use it:
+> cd /workspace/backend
+> [updates API routes to use User type]
+> git add src/routes/users.ts
+> git commit -m "Update API to use shared User type"
+
+3. Finally, update the frontend:
+> cd /workspace/frontend
+> [updates React components]
+> git add src/components/UserProfile.tsx
+> git commit -m "Update frontend to use new User type"
+
+All three projects are now in sync with the new User type!
 ```
 
 ### Viewing Changes
@@ -278,6 +485,8 @@ When the config is detected, all specified projects are cloned into the session 
 
 Output:
 ```
+→ Multi-project session: feature-name
+
 Project: frontend (2 commits)
   abc1234 Add login form
   def5678 Update styles
@@ -285,8 +494,13 @@ Project: frontend (2 commits)
 Project: backend (1 commit)
   ghi9012 Add auth endpoint
 
-Project: shared-lib (0 commits)
+Project: shared (1 commit)
+  jkl3456 Add User type
+
+Project: mobile (0 commits)
   (no changes)
+
+Tip: Use --diff-session feature-name <project-name> to see detailed changes for a specific project
 ```
 
 **Detailed view** (specific project):
@@ -294,7 +508,25 @@ Project: shared-lib (0 commits)
 ./claude-container --diff-session feature-name frontend
 ```
 
-Shows detailed diff and file changes for just the `frontend` project.
+Shows detailed diff and file changes for just the `frontend` project:
+```
+=== Commits in session ===
+abc1234 Add login form
+def5678 Update styles
+
+=== File changes (session vs source) ===
+ src/components/Login.tsx  | 45 +++++++++++++++++++++---------
+ src/styles/login.css      | 12 ++++++++
+ 2 files changed, 42 insertions(+), 15 deletions(-)
+
+[detailed diff output...]
+```
+
+**Check specific project:**
+```bash
+# Quick check if a project has changes
+./claude-container --diff-session feature-name backend | grep "commits"
+```
 
 ### Merging Changes
 
@@ -303,33 +535,356 @@ Shows detailed diff and file changes for just the `frontend` project.
 ./claude-container --merge-session feature-name
 ```
 
-**Auto-merge** (merge all projects with commits):
+Output:
+```
+=== Merging multi-project session: feature-name ===
+
+Projects to merge:
+  [x] frontend (2 commits)
+  [x] backend (1 commit)
+  [x] shared (1 commit)
+  [ ] mobile (0 commits - skipped)
+
+Merge all selected? [y/n/select] y
+
+→ Merging project: frontend
+  Applied: 0001-Add-login-form.patch
+  Applied: 0002-Update-styles.patch
+✓ Merged 2 commit(s) to frontend
+
+→ Merging project: backend
+  Applied: 0001-Add-auth-endpoint.patch
+✓ Merged 1 commit(s) to backend
+
+→ Merging project: shared
+  Applied: 0001-Add-User-type.patch
+✓ Merged 1 commit(s) to shared
+
+✓ Successfully merged all projects (3 projects)
+
+Delete session 'feature-name'? [y/n]
+```
+
+**Auto-merge** (merge all projects with commits, no prompts):
 ```bash
 ./claude-container --merge-session feature-name --auto
 ```
 
-**Merge to specific branch** (across all projects):
+**Merge to specific branch** (creates/switches branch in each project):
 ```bash
 ./claude-container --merge-session feature-name --into claude/feature-name
 ```
 
-Each project with commits will be merged back to its source repository. Projects without changes are skipped automatically.
+This will:
+- Create or switch to branch `claude/feature-name` in each project
+- Apply commits to that branch
+- Leave you ready to review and push
 
-### Requirements
+**Selective merge** (just one project):
+```bash
+# First, copy patches manually
+./claude-container-cp feature-name:/workspace/frontend/.git/patches ./frontend-patches
 
-- All project paths must exist and be git repositories
-- Config file must be valid YAML
-- Project names must be unique (no duplicates)
-- Reserved names not allowed: `.git`, `.claude`, `.devcontainer`, `workspace`, `session`
+# Then apply manually in your source repo
+cd ~/dev/frontend
+git am ./frontend-patches/*.patch
+```
+
+### Merge Behavior
+
+**Per-project merging:**
+- Each project is merged independently to its source repository
+- Projects without commits are automatically skipped
+- Merge uses `git format-patch` and `git am` (preserves commit metadata)
+- If a merge fails in one project, others continue
+- Failed merges show instructions for manual resolution
+
+**Conflict resolution:**
+```
+→ Merging project: frontend
+  Applied: 0001-Add-login-form.patch
+  Failed to apply: 0002-Update-styles.patch
+  Run 'git am --abort' to cancel in: /Users/you/dev/frontend
+
+✗ Merge completed with errors (1 succeeded, 1 failed)
+```
+
+To resolve:
+```bash
+cd ~/dev/frontend
+git am --show-current-patch    # See what failed
+# Fix conflicts manually
+git add .
+git am --continue
+```
+
+### Requirements and Validation
+
+**Config file requirements:**
+- Valid YAML syntax (version: "1")
+- `projects` key with at least one project
+- Each project must have a `path` field
+- Project names must be unique
+
+**Project requirements:**
+- Path must exist on filesystem
+- Path must be a git repository (has `.git` directory)
+- No reserved names: `.git`, `.claude`, `.devcontainer`, `workspace`, `session`
+
+**Validation errors:**
+```bash
+# Missing repo
+✗ Project 'frontend': path does not exist: /Users/you/dev/frontend
+
+# Not a git repo
+✗ Project 'backend': not a git repository: /Users/you/dev/backend
+
+# Duplicate name
+✗ Duplicate project name: shared
+
+# Reserved name
+✗ Reserved project name: workspace
+```
+
+### Real-World Examples
+
+#### Example 1: Full-Stack Feature Development
+
+**Setup:**
+```yaml
+# .claude-projects.yml
+version: "1"
+projects:
+  web:
+    path: ./web-app
+  api:
+    path: ./api-server
+  types:
+    path: ./shared-types
+```
+
+**Workflow:**
+```bash
+# Start session
+./claude-container --git-session user-authentication
+
+# Inside container, ask Claude:
+"Implement user authentication with JWT tokens. Add the auth endpoints
+to the API, update shared types, and create a login form in the web app."
+
+# Claude makes coordinated changes across all three repos with commits
+
+# Exit and review
+./claude-container --diff-session user-authentication
+
+# Merge to feature branches
+./claude-container --merge-session user-authentication --into feature/auth
+
+# Push all branches
+cd ~/dev/web-app && git push -u origin feature/auth
+cd ~/dev/api-server && git push -u origin feature/auth
+cd ~/dev/shared-types && git push -u origin feature/auth
+```
+
+#### Example 2: Microservices Update
+
+**Setup:**
+```yaml
+# .claude-projects.yml
+version: "1"
+projects:
+  users-service:
+    path: ./services/users
+  orders-service:
+    path: ./services/orders
+  notifications-service:
+    path: ./services/notifications
+  shared-proto:
+    path: ./proto
+```
+
+**Workflow:**
+```bash
+./claude-container --git-session add-user-preferences
+
+# Ask Claude:
+"Add user preferences to the proto definitions, update the users service
+to store them, and update notifications service to respect user
+notification preferences"
+
+# Claude updates all affected services + proto definitions
+
+./claude-container --merge-session add-user-preferences --auto
+```
+
+#### Example 3: Library Refactoring
+
+**Setup:**
+```yaml
+# .claude-projects.yml
+version: "1"
+projects:
+  core:
+    path: ./packages/core
+  plugin-auth:
+    path: ./packages/plugin-auth
+  plugin-storage:
+    path: ./packages/plugin-storage
+  examples:
+    path: ./examples
+```
+
+**Workflow:**
+```bash
+./claude-container --git-session refactor-plugin-api
+
+# Ask Claude:
+"Refactor the plugin API in core to use async/await instead of callbacks.
+Update all plugins and examples to use the new API."
+
+# Review changes per project
+./claude-container --diff-session refactor-plugin-api core
+./claude-container --diff-session refactor-plugin-api plugin-auth
+
+# Merge
+./claude-container --merge-session refactor-plugin-api
+```
+
+### Tips and Best Practices
+
+**Start small:**
+- Begin with 2-3 related repos
+- Verify the workflow before adding more projects
+
+**Use descriptive session names:**
+```bash
+# Good
+./claude-container --git-session add-graphql-api-and-client
+
+# Less helpful
+./claude-container --git-session test
+```
+
+**Review before merging:**
+```bash
+# Always check the diff first
+./claude-container --diff-session my-feature
+
+# Review each project individually
+./claude-container --diff-session my-feature frontend
+./claude-container --diff-session my-feature backend
+```
+
+**Use feature branches:**
+```bash
+# Merge to branches for review
+./claude-container --merge-session my-feature --into claude/my-feature
+
+# Then review and test before merging to main
+```
+
+**Keep sessions focused:**
+- One session = one feature/task
+- Don't accumulate too many unrelated changes
+- Merge or discard sessions regularly
+
+**Config in version control:**
+```bash
+# Commit the config for team use
+git add .claude-projects.yml
+git commit -m "Add multi-project config for claude-container"
+```
+
+### Troubleshooting Multi-Project Sessions
+
+**Config not detected:**
+```bash
+# Specify explicitly
+./claude-container --git-session my-feature --config ./.claude-projects.yml
+
+# Check file location and name
+ls -la .claude-projects.yml
+```
+
+**YAML parsing errors:**
+```bash
+# Validate YAML syntax
+yq eval .claude-projects.yml
+
+# Or with Python
+python3 -c "import yaml; yaml.safe_load(open('.claude-projects.yml'))"
+```
+
+**"No YAML parser found" error:**
+```bash
+# Install yq (recommended)
+brew install yq  # macOS
+sudo apt-get install yq  # Ubuntu/Debian
+
+# Or install PyYAML
+pip3 install pyyaml
+```
+
+**Projects not cloning:**
+```bash
+# Check all paths exist
+for proj in frontend backend shared; do
+    ls -ld ./$proj
+done
+
+# Check they're git repos
+for proj in frontend backend shared; do
+    ls -la ./$proj/.git
+done
+```
+
+**Merge conflicts:**
+```bash
+# Per-project conflict resolution
+cd ~/dev/frontend
+git am --show-current-patch
+# Fix conflicts
+git add .
+git am --continue
+```
+
+**Want to exclude a project temporarily:**
+```yaml
+# Comment it out in the config
+version: "1"
+projects:
+  frontend:
+    path: ./frontend
+  backend:
+    path: ./backend
+  # shared:
+  #   path: ./shared  # Temporarily disabled
+```
+
+### Limitations
+
+**What multi-project sessions DON'T do:**
+- Don't enforce consistency checks across repos
+- Don't validate cross-repo references
+- Don't handle git submodules specially (they're cloned as independent projects)
+- Don't support non-git repositories
+- Don't support nested project structures (project within a project)
+
+**Current limits:**
+- No hard limit on number of projects (tested with 10+)
+- Each project is cloned independently (disk space scales linearly)
+- Merge is sequential (not parallel)
 
 ### Backward Compatibility
 
 Single-repo mode continues to work exactly as before when no config file exists:
 
 ```bash
-# No config file = single-repo mode
+# No config file = single-repo mode (original behavior)
 ./claude-container --git-session feature-name
 ```
+
+The presence of a `.claude-projects.yml` file automatically enables multi-project mode. To temporarily disable, rename or remove the config file.
 
 ## Copying Files
 

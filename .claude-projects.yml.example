@@ -1,38 +1,148 @@
-# Example configuration for multi-project Claude sessions
-# Copy this file to .claude-projects.yml and customize for your project
+# Multi-Project Configuration for claude-container
+# Copy this file to .claude-projects.yml and customize for your projects
+#
+# This enables Claude to work across multiple related repositories in a single session.
+# Perfect for full-stack apps, microservices, monorepo-style workflows, or library ecosystems.
 
 version: "1"
 
 projects:
-  # Example 1: Relative path (relative to this config file)
+  # ============================================================================
+  # EXAMPLE 1: Full-Stack Application
+  # ============================================================================
+  # Relative paths (recommended - easier to share config with team)
   frontend:
     path: ./frontend
 
-  # Example 2: Absolute path
   backend:
-    path: /Users/yourname/projects/backend
+    path: ./backend
 
-  # Example 3: Parent directory reference
-  shared-lib:
-    path: ../shared-library
+  shared:
+    path: ./shared
 
-# Usage:
-#   1. Copy this file: cp .claude-projects.yml.example .claude-projects.yml
-#   2. Edit paths to point to your actual repositories
-#   3. Start a session: ./claude-container --git-session feature-name
+  # ============================================================================
+  # EXAMPLE 2: Microservices
+  # ============================================================================
+  # users-service:
+  #   path: ./services/users
+  #
+  # orders-service:
+  #   path: ./services/orders
+  #
+  # notifications-service:
+  #   path: ./services/notifications
+  #
+  # shared-proto:
+  #   path: ./proto
+
+  # ============================================================================
+  # EXAMPLE 3: Library + Plugins
+  # ============================================================================
+  # core:
+  #   path: ./packages/core
+  #
+  # plugin-auth:
+  #   path: ./packages/plugin-auth
+  #
+  # plugin-storage:
+  #   path: ./packages/plugin-storage
+  #
+  # examples:
+  #   path: ./examples
+
+  # ============================================================================
+  # EXAMPLE 4: Parent Directory Reference
+  # ============================================================================
+  # common-lib:
+  #   path: ../common-library
+
+  # ============================================================================
+  # EXAMPLE 5: Absolute Path
+  # ============================================================================
+  # mobile:
+  #   path: /Users/yourname/projects/mobile-app
+
+  # ============================================================================
+  # EXAMPLE 6: All Repos in a Directory (auto-generated)
+  # ============================================================================
+  # Use this bash snippet to generate entries for all git repos in a directory:
+  #
+  # for dir in */; do
+  #   if [[ -d "$dir/.git" ]]; then
+  #     name=$(basename "$dir")
+  #     echo "  $name:"
+  #     echo "    path: ./$dir"
+  #   fi
+  # done
+
+# ============================================================================
+# USAGE
+# ============================================================================
 #
-# All specified projects will be cloned into:
-#   /workspace/frontend/
-#   /workspace/backend/
-#   /workspace/shared-lib/
+# 1. Copy and customize:
+#    cp .claude-projects.yml.example .claude-projects.yml
+#    # Edit .claude-projects.yml with your actual project paths
 #
-# Requirements:
-#   - All paths must exist and be git repositories
-#   - Project names must be unique
-#   - Avoid reserved names: .git, .claude, .devcontainer, workspace, session
+# 2. Start a multi-project session:
+#    ./claude-container --git-session my-feature
 #
-# Commands:
-#   View changes:  ./claude-container --diff-session feature-name
-#   View project:  ./claude-container --diff-session feature-name frontend
-#   Merge all:     ./claude-container --merge-session feature-name
-#   Auto-merge:    ./claude-container --merge-session feature-name --auto
+# 3. Inside the container, all projects are available:
+#    /workspace/frontend/
+#    /workspace/backend/
+#    /workspace/shared/
+#
+# 4. Claude can work across all repos simultaneously:
+#    "Add a new User type to shared, update the backend API to use it,
+#     and update the frontend components"
+#
+# 5. View changes across all projects:
+#    ./claude-container --diff-session my-feature
+#
+# 6. View specific project:
+#    ./claude-container --diff-session my-feature frontend
+#
+# 7. Merge changes back to source repos:
+#    ./claude-container --merge-session my-feature
+#
+# 8. Or auto-merge without prompts:
+#    ./claude-container --merge-session my-feature --auto
+
+# ============================================================================
+# REQUIREMENTS
+# ============================================================================
+#
+# - All paths must exist and be git repositories
+# - Project names must be unique (no duplicates)
+# - Reserved names not allowed: .git, .claude, .devcontainer, workspace, session
+# - Need yq or python3 with PyYAML installed:
+#     macOS:        brew install yq
+#     Ubuntu/Debian: sudo apt-get install yq
+#     Or:           pip3 install pyyaml
+
+# ============================================================================
+# TIPS
+# ============================================================================
+#
+# - Use relative paths when possible (easier to share config with team)
+# - Keep project names short and descriptive
+# - Comment out projects to temporarily exclude them
+# - Commit this config file for team collaboration
+# - Use feature branches for merging: --into feature/my-feature
+# - Review changes before merging: --diff-session first
+# - Start small (2-3 repos) before adding more
+
+# ============================================================================
+# TROUBLESHOOTING
+# ============================================================================
+#
+# Config not detected:
+#   ./claude-container --git-session my-feature --config ./.claude-projects.yml
+#
+# Validate YAML syntax:
+#   yq eval .claude-projects.yml
+#
+# Test config without starting container:
+#   ./claude-container --git-session test --no-run
+#
+# Check what will be cloned:
+#   # All project names and paths will be shown during validation
