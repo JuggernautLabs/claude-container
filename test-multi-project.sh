@@ -164,7 +164,7 @@ test_create_session() {
     info "Verifying projects in session volume..."
     local projects=$(docker run --rm \
         -v "claude-session-$SESSION_NAME:/session:ro" \
-        alpine ls -1 /session 2>/dev/null || echo "")
+        alpine ls -1a /session 2>/dev/null || echo "")
 
     if echo "$projects" | grep -q "frontend"; then
         success "  ✓ frontend cloned"
@@ -199,11 +199,15 @@ test_create_session() {
 test_make_changes() {
     info "TEST 2: Making changes in session..."
 
+    local git_image="ghcr.io/hypermemetic/claude-container:latest"
+
     # Add a commit to frontend
     docker run --rm \
         -v "claude-session-$SESSION_NAME:/workspace" \
         -w /workspace/frontend \
-        alpine/git sh -c "
+        "$git_image" \
+        sh -c "
+            git config --global --add safe.directory /workspace/frontend
             git config user.email 'test@example.com'
             git config user.name 'Test User'
             echo 'export const API_URL = \"http://localhost:3000\";' > config.ts
@@ -217,7 +221,9 @@ test_make_changes() {
     docker run --rm \
         -v "claude-session-$SESSION_NAME:/workspace" \
         -w /workspace/backend \
-        alpine/git sh -c "
+        "$git_image" \
+        sh -c "
+            git config --global --add safe.directory /workspace/backend
             git config user.email 'test@example.com'
             git config user.name 'Test User'
             echo 'const PORT = 3000' > config.go

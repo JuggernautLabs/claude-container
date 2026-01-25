@@ -446,15 +446,20 @@ create_multi_project_session() {
     local host_uid
     host_uid=$(get_host_uid)
 
-    # Copy config file into volume for later reference (needed for merge/diff)
+    # Create config file with absolute paths and store in volume
     info "Storing config in session volume..."
     local config_content
-    config_content=$(cat "$config_file")
+    config_content="version: \"1\"\nprojects:\n"
+    while IFS='|' read -r proj_name proj_path; do
+        [[ -z "$proj_name" ]] && continue
+        config_content+="  ${proj_name}:\n    path: ${proj_path}\n"
+    done <<< "$projects"
+
     if ! docker run --rm \
         -e "CONFIG_CONTENT=$config_content" \
         -v "$volume:/session" \
         "$git_image" \
-        sh -c 'printf "%s\n" "$CONFIG_CONTENT" > /session/.claude-projects.yml' 2>&1; then
+        sh -c 'printf "%b" "$CONFIG_CONTENT" > /session/.claude-projects.yml' 2>&1; then
         error "Failed to store config in volume"
         docker volume rm "$volume" >/dev/null 2>&1
         exit 1
@@ -462,10 +467,18 @@ create_multi_project_session() {
 
     info "Config stored successfully"
 
+    # Verify projects variable is populated
+    if [[ -z "$projects" ]]; then
+        error "No projects to clone (parse result was empty)"
+        docker volume rm "$volume" >/dev/null 2>&1
+        exit 1
+    fi
+
     # Clone each project into its subdirectory
     local project_count=0
     while IFS='|' read -r project_name source_path; do
-        ((project_count++))
+        [[ -z "$project_name" ]] && continue  # Skip empty lines
+        project_count=$((project_count + 1))
 
         info "Cloning project '$project_name' from $source_path..."
 
@@ -858,7 +871,7 @@ merge_multi_project_session() {
         # Verify source path is a git repo
         if [[ ! -d "$source_path/.git" ]]; then
             error "  Source is not a git repo: $source_path"
-            ((fail_count++))
+            fail_count=$((fail_count + 1))
             continue
         fi
 
@@ -915,9 +928,9 @@ merge_multi_project_session() {
 
         if $project_success; then
             success "  Merged $patch_count commit(s) to $project_name"
-            ((success_count++))
+            success_count=$((success_count + 1))
         else
-            ((fail_count++))
+            fail_count=$((fail_count + 1))
         fi
     done
 
