@@ -300,11 +300,11 @@ parse_config_file() {
         }
 
         # Resolve relative paths to absolute
-        while IFS='|' read -r name path; do
-            if [[ "$path" != /* ]]; then
-                path="$(cd "$config_dir" && cd "$path" && pwd)"
+        while IFS='|' read -r proj_name proj_path; do
+            if [[ "$proj_path" != /* ]]; then
+                proj_path="$(cd "$config_dir" && cd "$proj_path" && pwd)"
             fi
-            echo "$name|$path"
+            echo "$proj_name|$proj_path"
         done <<< "$yq_output"
     elif command -v python3 &>/dev/null; then
         # Fallback to Python
@@ -374,35 +374,35 @@ validate_config() {
     declare -A seen_names
 
     # Validate each project
-    while IFS='|' read -r name path; do
+    while IFS='|' read -r proj_name proj_path; do
         # Check for duplicate names
-        if [[ -n "${seen_names[$name]:-}" ]]; then
-            error "Duplicate project name: $name"
+        if [[ -n "${seen_names[$proj_name]:-}" ]]; then
+            error "Duplicate project name: $proj_name"
             exit 1
         fi
-        seen_names[$name]=1
+        seen_names[$proj_name]=1
 
         # Check for reserved names
-        case "$name" in
+        case "$proj_name" in
             .git|.claude|.devcontainer|workspace|session)
-                error "Reserved project name: $name"
+                error "Reserved project name: $proj_name"
                 exit 1
                 ;;
         esac
 
         # Validate path exists
-        if [[ ! -d "$path" ]]; then
-            error "Project '$name': path does not exist: $path"
+        if [[ ! -d "$proj_path" ]]; then
+            error "Project '$proj_name': path does not exist: $proj_path"
             exit 1
         fi
 
         # Validate it's a git repo
-        if [[ ! -d "$path/.git" ]]; then
-            error "Project '$name': not a git repository: $path"
+        if [[ ! -d "$proj_path/.git" ]]; then
+            error "Project '$proj_name': not a git repository: $proj_path"
             exit 1
         fi
 
-        info "  ✓ $name: $path"
+        info "  ✓ $proj_name: $proj_path"
     done <<< "$projects"
 
     success "Config validation passed"
