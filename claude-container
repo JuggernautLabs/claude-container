@@ -210,6 +210,46 @@ setup_dev_caches() {
 
 # Multi-project session support functions
 
+# Check if YAML parser is available (yq or python3 with yaml)
+check_yaml_parser_available() {
+    if command -v yq &>/dev/null; then
+        return 0
+    elif command -v python3 &>/dev/null && python3 -c "import yaml" &>/dev/null; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+# Show helpful message for installing YAML parser
+show_yaml_parser_install_help() {
+    error "No YAML parser found. Multi-project sessions require 'yq' or 'python3' with PyYAML."
+    echo ""
+    echo "Installation options:"
+    echo ""
+    echo "Option 1: Install yq (recommended)"
+    case "$PLATFORM" in
+        macos)
+            echo "  brew install yq"
+            ;;
+        linux|wsl)
+            echo "  # Ubuntu/Debian:"
+            echo "  sudo apt-get install yq"
+            echo ""
+            echo "  # Or using snap:"
+            echo "  sudo snap install yq"
+            ;;
+        *)
+            echo "  See: https://github.com/mikefarah/yq#install"
+            ;;
+    esac
+    echo ""
+    echo "Option 2: Install Python PyYAML"
+    echo "  pip3 install pyyaml"
+    echo "  # or: python3 -m pip install pyyaml"
+    echo ""
+}
+
 # Find .claude-projects.yml config file
 # Search order: --config flag > ./.claude-projects.yml > ./.devcontainer/claude-projects.yml
 find_config_file() {
@@ -291,8 +331,7 @@ except Exception as e:
             exit 1
         }
     else
-        error "No YAML parser found (need 'yq' or 'python3' with PyYAML)"
-        echo "Install yq: brew install yq (macOS) or apt-get install yq (Linux)"
+        show_yaml_parser_install_help
         exit 1
     fi
 }
@@ -301,6 +340,12 @@ except Exception as e:
 validate_config() {
     local config_file="$1"
     local projects
+
+    # Check for YAML parser before proceeding
+    if ! check_yaml_parser_available; then
+        show_yaml_parser_install_help
+        exit 1
+    fi
 
     info "Validating multi-project config..."
 
@@ -1299,6 +1344,35 @@ if [[ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]]; then
     exit 1
 fi
 
+# Check for YAML parser if we'll need it (multi-project mode)
+if $USE_GIT_SESSION || [[ -n "$CONFIG_FILE" ]]; then
+    # Check if config file exists or will be auto-detected
+    will_use_config=false
+    if [[ -n "$CONFIG_FILE" ]]; then
+        will_use_config=true
+    elif $USE_GIT_SESSION; then
+        # Check if config exists in workspace
+        workspace="${WORKSPACE_DIR:-$(pwd)}"
+        for candidate in \
+            "$workspace/.claude-projects.yml" \
+            "$workspace/.devcontainer/claude-projects.yml" \
+            "$workspace/claude-projects.yml"; do
+            if [[ -f "$candidate" ]]; then
+                will_use_config=true
+                break
+            fi
+        done
+    fi
+
+    # If config will be used, verify YAML parser is available
+    if $will_use_config && ! check_yaml_parser_available; then
+        echo ""
+        warn "Multi-project config detected but YAML parser not available"
+        show_yaml_parser_install_help
+        exit 1
+    fi
+fi
+
 # Find Dockerfile
 if [[ -z "$DOCKERFILE" ]]; then
     for candidate in "./Dockerfile" "./.devcontainer/Dockerfile" "./docker/Dockerfile"; do
@@ -1574,6 +1648,30 @@ WRAPPER
         echo "Claude: $(which claude 2>&1)"
         echo "Platform: ${PLATFORM:-unknown}"
         echo "CI Mode: ${IS_CI:-false}"
+
+        echo ""
+        echo "=== Multi-Project Prerequisites ==="
+        if command -v yq &>/dev/null; then
+            echo "  yq: $(which yq) ($(yq --version 2>&1 | head -1))"
+        else
+            echo "  yq: not found"
+        fi
+        if command -v python3 &>/dev/null; then
+            echo "  python3: $(which python3) ($(python3 --version 2>&1))"
+            if python3 -c "import yaml" &>/dev/null; then
+                echo "  PyYAML: installed"
+            else
+                echo "  PyYAML: not found"
+            fi
+        else
+            echo "  python3: not found"
+        fi
+        if command -v yq &>/dev/null || (command -v python3 &>/dev/null && python3 -c "import yaml" &>/dev/null); then
+            echo "  ✓ YAML parser available (multi-project support enabled)"
+        else
+            echo "  ✗ No YAML parser (multi-project support disabled)"
+            echo "    Install: yq or python3 with PyYAML"
+        fi
 
         echo ""
         echo "=== Token Check ==="

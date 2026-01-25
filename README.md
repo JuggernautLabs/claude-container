@@ -44,8 +44,23 @@ ln -s $(pwd)/claude-container-cp /usr/local/bin/
 
 ### Prerequisites
 
+**Required:**
 - Docker (Docker Desktop, Colima, or native Docker)
 - A Claude Code OAuth token (set `CLAUDE_CODE_OAUTH_TOKEN`)
+
+**Optional (for multi-project sessions):**
+- `yq` (YAML processor) - recommended
+  - macOS: `brew install yq`
+  - Ubuntu/Debian: `sudo apt-get install yq`
+  - Other: See https://github.com/mikefarah/yq#install
+- OR `python3` with PyYAML: `pip3 install pyyaml`
+
+**Verify your setup:**
+```bash
+./claude-container --verify
+```
+
+This will check for all dependencies including YAML parser availability.
 
 ## Starting a Session
 
