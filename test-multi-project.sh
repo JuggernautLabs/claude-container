@@ -19,7 +19,8 @@ warn() { echo -e "${YELLOW}⚠${NC} $*"; }
 error() { echo -e "${RED}✗${NC} $*" >&2; }
 
 # Configuration
-TEST_DIR="/tmp/claude-container-test-$$"
+# Use $HOME instead of /tmp because Colima/Docker on macOS only mounts $HOME by default
+TEST_DIR="$HOME/.cache/claude-container-test-$$"
 SESSION_NAME="test-multi-$$"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CLAUDE_CONTAINER="$SCRIPT_DIR/claude-container"
