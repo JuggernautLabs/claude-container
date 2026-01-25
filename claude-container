@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Spawn into a Docker container with Claude Code ready to execute
 #
 # Usage:
@@ -438,11 +438,10 @@ create_multi_project_session() {
 
     # Copy config file into volume for later reference (needed for merge/diff)
     info "Storing config in session volume..."
-    docker run --rm \
-        -v "$(cd "$(dirname "$config_file")" && pwd):/config:ro" \
+    cat "$config_file" | docker run --rm -i \
         -v "$volume:/session" \
         "$git_image" \
-        sh -c "cp /config/$(basename "$config_file") /session/.claude-projects.yml"
+        sh -c "cat > /session/.claude-projects.yml"
 
     # Clone each project into its subdirectory
     local project_count=0
