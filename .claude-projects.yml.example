@@ -1,0 +1,38 @@
+# Example configuration for multi-project Claude sessions
+# Copy this file to .claude-projects.yml and customize for your project
+
+version: "1"
+
+projects:
+  # Example 1: Relative path (relative to this config file)
+  frontend:
+    path: ./frontend
+
+  # Example 2: Absolute path
+  backend:
+    path: /Users/yourname/projects/backend
+
+  # Example 3: Parent directory reference
+  shared-lib:
+    path: ../shared-library
+
+# Usage:
+#   1. Copy this file: cp .claude-projects.yml.example .claude-projects.yml
+#   2. Edit paths to point to your actual repositories
+#   3. Start a session: ./claude-container --git-session feature-name
+#
+# All specified projects will be cloned into:
+#   /workspace/frontend/
+#   /workspace/backend/
+#   /workspace/shared-lib/
+#
+# Requirements:
+#   - All paths must exist and be git repositories
+#   - Project names must be unique
+#   - Avoid reserved names: .git, .claude, .devcontainer, workspace, session
+#
+# Commands:
+#   View changes:  ./claude-container --diff-session feature-name
+#   View project:  ./claude-container --diff-session feature-name frontend
+#   Merge all:     ./claude-container --merge-session feature-name
+#   Auto-merge:    ./claude-container --merge-session feature-name --auto
