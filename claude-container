@@ -1363,7 +1363,9 @@ case "${1:-}" in
         # Interactive wizard using Claude Code to configure and launch a session
         WIZARD_DIR="$HOME/.cache/claude-container/wizard-$$"
         WIZARD_CMD_FILE="$WIZARD_DIR/command.sh"
+        WIZARD_CONTEXT_FILE="$WIZARD_DIR/context.md"
         SCRIPT_PATH="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+        SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
         mkdir -p "$WIZARD_DIR"
         trap "rm -rf '$WIZARD_DIR'" EXIT
@@ -1372,13 +1374,7 @@ case "${1:-}" in
         echo "╔════════════════════════════════════════════════════════════════╗"
         echo "║              Claude Container Setup Wizard                      ║"
         echo "╠════════════════════════════════════════════════════════════════╣"
-        echo "║  Claude will help you configure your container session.        ║"
-        echo "║  Answer a few questions and it will set everything up.         ║"
-        echo "║                                                                 ║"
-        echo "║  When done, Claude will write the command to:                   ║"
-        echo "║  $WIZARD_CMD_FILE"
-        echo "║                                                                 ║"
-        echo "║  Type 'exit' or Ctrl+D when finished.                          ║"
+        echo "║  Gathering context...                                          ║"
         echo "╚════════════════════════════════════════════════════════════════╝"
         echo ""
 
@@ -1389,35 +1385,158 @@ case "${1:-}" in
             exit 1
         fi
 
-        # Create the wizard system prompt
-        WIZARD_SYSTEM_PROMPT="You are the claude-container setup wizard. Help the user configure a claude-container session.
+        # Gather context
+        echo "  → Scanning for existing sessions..."
+        EXISTING_SESSIONS=$(docker volume ls -q 2>/dev/null | grep "^claude-session-" | sed 's/claude-session-//' | sort -u || echo "(none)")
 
-YOUR TASK:
-1. Ask the user about their project(s) - single repo or multiple repos?
-2. Get the path(s) to their project(s)
-3. Suggest a session name
-4. Ask if they want --as-rootish (recommended for installing packages)
-5. Generate the final command and write it to: $WIZARD_CMD_FILE
+        echo "  → Checking current directory..."
+        CURRENT_DIR="$(pwd)"
+        CURRENT_DIR_CONTENTS=$(ls -la 2>/dev/null | head -20 || echo "(empty)")
 
-AVAILABLE COMMANDS:
-- Single repo: claude-container --git-session NAME
-- Multiple repos (auto-discover): claude-container --git-session NAME --discover-repos /path/to/dir
-- With rootish: add --as-rootish (recommended)
-- Continue conversation: add --continue
+        echo "  → Looking for git repositories..."
+        GIT_REPOS_HERE=""
+        if [[ -d ".git" ]]; then
+            GIT_REPOS_HERE="Current directory is a git repo: $CURRENT_DIR"
+        fi
+        for dir in */; do
+            if [[ -d "$dir/.git" ]]; then
+                GIT_REPOS_HERE="$GIT_REPOS_HERE
+  - $dir"
+            fi
+        done
+        [[ -z "$GIT_REPOS_HERE" ]] && GIT_REPOS_HERE="(no git repos found in current directory)"
 
-WHEN READY:
-Write the final command to $WIZARD_CMD_FILE using the Write tool. Example:
-  Write to $WIZARD_CMD_FILE:
-  $SCRIPT_PATH --git-session my-project --discover-repos ~/dev/projects --as-rootish
+        echo "  → Building context file..."
 
-After writing, tell the user: 'Command saved! Exit the wizard (Ctrl+D) to run it.'
+        # Create comprehensive context file
+        cat > "$WIZARD_CONTEXT_FILE" << WIZARD_CONTEXT_EOF
+# Claude Container Wizard Context
 
-Be friendly, ask one question at a time, and suggest sensible defaults. Most users want --as-rootish."
+## Your Task
+Help the user configure and launch a claude-container session. Ask questions to understand their needs, then generate the appropriate command.
 
-        # Launch Claude Code interactively
-        claude -p "$WIZARD_SYSTEM_PROMPT
+## Output Location
+When ready, write the final command to: $WIZARD_CMD_FILE
+After writing, tell the user to exit (Ctrl+D) to execute it.
 
-Start by greeting the user and asking: Do you want to work with a single repository or multiple repositories in one session?"
+---
+
+## Current Environment
+
+**Working Directory:** $CURRENT_DIR
+
+**Git Repos Found:**
+$GIT_REPOS_HERE
+
+**Directory Contents:**
+\`\`\`
+$CURRENT_DIR_CONTENTS
+\`\`\`
+
+---
+
+## Existing Sessions
+
+These sessions already exist (user can resume with --continue or start fresh):
+\`\`\`
+$EXISTING_SESSIONS
+\`\`\`
+
+---
+
+## Available Commands
+
+### Basic Usage
+\`\`\`bash
+# Start session with current directory (must be a git repo)
+$SCRIPT_PATH --git-session SESSION_NAME
+
+# Start session with specific directory
+cd /path/to/repo && $SCRIPT_PATH --git-session SESSION_NAME
+
+# Multiple repos - auto-discover all git repos in a directory
+$SCRIPT_PATH --git-session SESSION_NAME --discover-repos /path/to/parent/dir
+\`\`\`
+
+### Common Options
+| Flag | Description |
+|------|-------------|
+| \`--git-session NAME\` | Create/resume isolated git session (required) |
+| \`--discover-repos DIR\` | Auto-discover all git repos in directory |
+| \`--as-rootish\` | Run with fake-root for installing packages (RECOMMENDED) |
+| \`--continue\` | Continue previous Claude conversation |
+| \`--config PATH\` | Use specific .claude-projects.yml config file |
+| \`--no-run\` | Create session but don't start container |
+
+### Session Management
+\`\`\`bash
+# List sessions with disk usage
+$SCRIPT_PATH --sessions
+
+# View changes in a session
+$SCRIPT_PATH --diff-session SESSION_NAME
+
+# Merge changes back to source repos
+$SCRIPT_PATH --merge-session SESSION_NAME
+
+# Delete a session
+$SCRIPT_PATH --delete-session SESSION_NAME
+\`\`\`
+
+---
+
+## Recommendations
+
+1. **Always use \`--as-rootish\`** - Allows installing system packages without issues
+2. **For multiple related repos** - Use \`--discover-repos\` to work across all of them
+3. **Session names** - Use descriptive names like \`feature-auth\` or \`bugfix-api\`
+4. **Existing sessions** - If a session exists, ask if they want to resume or start fresh
+
+---
+
+## Example Commands
+
+\`\`\`bash
+# Single repo, current directory
+$SCRIPT_PATH --git-session my-feature --as-rootish
+
+# Multiple repos in ~/dev/myproject
+$SCRIPT_PATH --git-session fullstack --discover-repos ~/dev/myproject --as-rootish
+
+# Resume existing session
+$SCRIPT_PATH --git-session existing-session --continue --as-rootish
+
+# Specific config file
+$SCRIPT_PATH --git-session custom --config ./my-projects.yml --as-rootish
+\`\`\`
+
+---
+
+## Your Approach
+
+1. **Greet the user** and briefly explain what you'll help with
+2. **Check if they want to resume** an existing session (if any exist)
+3. **Ask about their project** - single repo or multiple?
+4. **Get the path** - offer current directory as default if it's a git repo
+5. **Suggest a session name** based on the directory/project name
+6. **Confirm options** - recommend --as-rootish
+7. **Generate command** and write to $WIZARD_CMD_FILE
+8. **Tell user to exit** (Ctrl+D) to run the command
+
+Be conversational but efficient. Most users just want to get started quickly.
+WIZARD_CONTEXT_EOF
+
+        echo ""
+        echo "╔════════════════════════════════════════════════════════════════╗"
+        echo "║  Context gathered! Starting wizard...                          ║"
+        echo "║  Type 'exit' or Ctrl+D when finished.                          ║"
+        echo "╚════════════════════════════════════════════════════════════════╝"
+        echo ""
+
+        # Launch Claude Code with the context file
+        claude -p "Read your instructions and context from: $WIZARD_CONTEXT_FILE
+
+Then start helping the user configure their claude-container session. Be friendly and conversational."
 
         # After Claude exits, check for the command file
         if [[ -f "$WIZARD_CMD_FILE" ]]; then
