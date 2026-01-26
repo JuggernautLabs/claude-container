@@ -99,10 +99,14 @@ This:
 | Flag | Description |
 |------|-------------|
 | `--git-session, -g <name>` | Create/resume isolated git session |
+| `--discover-repos <dir>` | Auto-discover all git repos in directory (no config needed) |
+| `--config, -C <path>` | Explicit path to `.claude-projects.yml` config file |
 | `--session, -s <name>` | Override state volume name (for sharing state) |
 | `--continue, -c` | Continue the most recent Claude conversation |
 | `--as-rootish` | Run as user with fake-root capabilities (recommended) |
 | `--build, -b` | Force rebuild the container image |
+| `--sessions` | List all sessions with disk usage |
+| `--delete-session <name>` | Delete a session and all its volumes |
 
 ## Working Inside the Container
 
@@ -337,23 +341,40 @@ Inside the container:
 └── shared/        # Full clone of shared repo
 ```
 
-### Example: All Repos in a Directory
+### Example: All Repos in a Directory (Easy Way)
 
-Clone all git repositories in a directory:
+Use `--discover-repos` to automatically find and clone all git repos in a directory - **no config file needed!**
 
 ```bash
-# Automatically generate config for all git repos in a directory
+# Single command - discovers all git repos automatically
+./claude-container --git-session my-feature --discover-repos ~/dev/hypermemetic
+```
+
+Output:
+```
+→ Discovering git repositories in: ~/dev/hypermemetic
+→   ✓ Found: hub-codegen
+→   ✓ Found: hub-core
+→   ✓ Found: hub-macro
+→   ✓ Found: substrate
+→   ✓ Found: synapse
+... (discovers all repos)
+✓ Discovered 10 repositories
+→ Creating multi-project session: my-feature
+→ Cloning project 'hub-codegen'...
+✓   ✓ Cloned: hub-codegen
+...
+✓ Multi-project session created: my-feature (10 projects)
+```
+
+### Example: All Repos in a Directory (Config File)
+
+If you prefer a config file (useful for sharing with team or excluding certain repos):
+
+```bash
+# Generate config for all git repos in a directory
 cd ~/dev/hypermemetic
 
-# List all git repos
-for dir in */; do
-    if [[ -d "$dir/.git" ]]; then
-        echo "  $(basename "$dir"):"
-        echo "    path: ./$dir"
-    fi
-done
-
-# Or use this one-liner to create the config
 cat > .claude-projects.yml << 'EOF'
 version: "1"
 projects:
@@ -366,45 +387,17 @@ for dir in */; do
         echo "    path: ./$dir" >> .claude-projects.yml
     fi
 done
-```
 
-**Real Example** (10 repositories):
-```yaml
-version: "1"
-projects:
-  hub-codegen:
-    path: ./hub-codegen
-  hub-core:
-    path: ./hub-core
-  hub-macro:
-    path: ./hub-macro
-  hub-transport:
-    path: ./hub-transport
-  hyperforge:
-    path: ./hyperforge
-  substrate-protocol:
-    path: ./substrate-protocol
-  substrate-rust-codegen:
-    path: ./substrate-rust-codegen
-  substrate-sandbox-ts:
-    path: ./substrate-sandbox-ts
-  substrate:
-    path: ./substrate
-  synapse:
-    path: ./synapse
-```
-
-Then start a session:
-```bash
-cd ~/dev/hypermemetic
+# Then start session (config auto-detected)
 ./claude-container --git-session hypermemetic-all
-
-# All 10 repos are now available in /workspace/
 ```
 
 ### Creating a Multi-Project Session
 
 ```bash
+# Auto-discover repos in a directory (no config needed!)
+./claude-container --git-session feature-name --discover-repos ~/dev/myprojects
+
 # Auto-detect config in current directory
 ./claude-container --git-session feature-name
 
@@ -925,11 +918,33 @@ For files that aren't git-tracked (build artifacts, generated files, logs):
 
 ## Session Management
 
-### List Sessions
+### List Sessions with Disk Usage
 
 ```bash
-./claude-container --list-sessions
+./claude-container --sessions
+# or: ./claude-container --list-sessions
 ```
+
+Output shows disk usage per volume type:
+```
+SESSION                         WORKSPACE      STATE      CARGO        NPM        PIP
+-------                         ---------      -----      -----        ---        ---
+cllient-review                       4.1G       4.0K       4.0K       4.0K       4.0K
+default                                 -      30.1M     212.1M       1.5M       4.0K
+hypermemetic-all                     7.6G          -          -          -          -
+my-feature                          25.1M          -          -          -          -
+
+Total disk usage: 14.8G
+
+Commands:
+  Delete session:  ./claude-container --delete-session <name>
+  Delete all:      ./claude-container --cleanup
+```
+
+**Column meanings:**
+- **WORKSPACE**: Your cloned repos (`/workspace/*`)
+- **STATE**: Claude conversation history and settings
+- **CARGO/NPM/PIP**: Package manager caches (shared across sessions by default)
 
 ### Delete a Session
 
@@ -937,11 +952,15 @@ For files that aren't git-tracked (build artifacts, generated files, logs):
 ./claude-container --delete-session feature-name
 ```
 
+This deletes all volumes associated with the session (workspace, state, and caches).
+
 ### Clean Up All Sessions
 
 ```bash
 ./claude-container --cleanup
 ```
+
+Lists all claude-container volumes and prompts before deleting.
 
 ## Common Workflows
 
