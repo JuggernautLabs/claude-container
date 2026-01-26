@@ -112,6 +112,18 @@ create_multi_project_session() {
 
     info "Config stored successfully"
 
+    # Store main project name for container startup (determines initial working directory)
+    local main_project
+    main_project=$(get_main_project "$config_file")
+    if [[ -n "$main_project" ]]; then
+        docker run --rm \
+            --user "$host_uid:$host_uid" \
+            -v "$volume:/session" \
+            "$git_image" \
+            sh -c "echo '$main_project' > /session/.main-project" 2>/dev/null
+        info "Main project: $main_project"
+    fi
+
     # Clone all projects in parallel, running as target UID (no chown needed)
     local project_count=0
     local pids=()

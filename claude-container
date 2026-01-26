@@ -536,12 +536,21 @@ WRAPPER
         exit 0
     fi
 
-    # Shell-only mode - just run bash in /workspace
+    # Determine working directory (main project if specified, otherwise /workspace)
+    WORK_DIR="/workspace"
+    if [[ -f /workspace/.main-project ]]; then
+        MAIN_PROJ=$(cat /workspace/.main-project)
+        if [[ -d "/workspace/$MAIN_PROJ" ]]; then
+            WORK_DIR="/workspace/$MAIN_PROJ"
+        fi
+    fi
+
+    # Shell-only mode - just run bash in working directory
     if [[ "${SHELL_ONLY:-}" == "1" ]]; then
         if [[ "${RUN_AS_USER:-}" == "1" ]] || [[ "${RUN_AS_ROOTISH:-}" == "1" ]]; then
-            exec gosu developer bash -c "cd /workspace && exec bash"
+            exec gosu developer bash -c "cd $WORK_DIR && exec bash"
         else
-            exec bash -c "cd /workspace && exec bash"
+            exec bash -c "cd $WORK_DIR && exec bash"
         fi
     fi
 
@@ -556,7 +565,7 @@ WRAPPER
         CLAUDE_ARGS="--continue $CLAUDE_ARGS"
     fi
 
-    cd /workspace
+    cd $WORK_DIR
     if [[ "${RUN_AS_USER:-}" == "1" ]] || [[ "${RUN_AS_ROOTISH:-}" == "1" ]]; then
         exec gosu developer claude $CLAUDE_ARGS
     else

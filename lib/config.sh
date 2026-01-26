@@ -325,7 +325,7 @@ validate_config() {
     declare -A seen_names
 
     # Validate each project
-    while IFS='|' read -r proj_name proj_path; do
+    while IFS='|' read -r proj_name proj_path _branch; do
         # Check for duplicate names
         if [[ -n "${seen_names[$proj_name]:-}" ]]; then
             error "Duplicate project name: $proj_name"
@@ -357,4 +357,42 @@ validate_config() {
     done <<< "$projects"
 
     success "Config validation passed"
+}
+
+# Get the main project name from config
+# Returns the project marked with "main: true", or the first project if none marked
+# Arguments:
+#   $1 - path to config file
+# Returns:
+#   Project name (stdout)
+get_main_project() {
+    local config_file="$1"
+
+    if command -v yq &>/dev/null; then
+        # Try to find project with main: true
+        local main_proj
+        main_proj=$(yq eval '.projects | to_entries | .[] | select(.value.main == true) | .key' "$config_file" 2>/dev/null | head -1)
+
+        if [[ -n "$main_proj" ]]; then
+            echo "$main_proj"
+        else
+            # Fall back to first project
+            yq eval '.projects | keys | .[0]' "$config_file" 2>/dev/null
+        fi
+    elif command -v python3 &>/dev/null; then
+        python3 -c "
+import yaml
+with open('$config_file', 'r') as f:
+    config = yaml.safe_load(f)
+projects = config.get('projects', {})
+# Find main project
+for name, info in projects.items():
+    if isinstance(info, dict) and info.get('main'):
+        print(name)
+        exit(0)
+# Fall back to first project
+if projects:
+    print(list(projects.keys())[0])
+" 2>/dev/null
+    fi
 }
