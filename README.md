@@ -13,6 +13,17 @@ Claude Code's `--dangerously-skip-permissions` flag lets Claude work autonomousl
 
 ## Quick Start
 
+### Option 1: Interactive Wizard (Recommended for first-time users)
+
+```bash
+# Claude will guide you through setup
+./claude-container --wizard
+```
+
+The wizard asks about your project(s), suggests options, and generates the right command for you.
+
+### Option 2: Direct Command
+
 ```bash
 # 1. Set up authentication
 export CLAUDE_CODE_OAUTH_TOKEN=$(claude auth status | grep -o 'oauth:[^ ]*')
@@ -61,6 +72,47 @@ ln -s $(pwd)/claude-container-cp /usr/local/bin/
 ```
 
 This will check for all dependencies including YAML parser availability.
+
+## Setup Wizard
+
+For an interactive guided setup, use the wizard:
+
+```bash
+./claude-container --wizard
+```
+
+Claude Code will help you configure your session by asking questions:
+
+```
+╔════════════════════════════════════════════════════════════════╗
+║              Claude Container Setup Wizard                      ║
+╚════════════════════════════════════════════════════════════════╝
+
+Claude: Do you want to work with a single repository or multiple
+        repositories in one session?
+
+User: Multiple repos - everything in ~/dev/myprojects
+
+Claude: Great! I found 5 git repos in that directory. What should
+        I name this session?
+
+User: my-feature
+
+Claude: I recommend --as-rootish for installing packages. Sound good?
+
+User: yes
+
+Claude: Perfect! I've saved the command. Exit (Ctrl+D) to run it.
+
+════════════════════════════════════════════════════════════════
+Generated command:
+  claude-container --git-session my-feature --discover-repos ~/dev/myprojects --as-rootish
+════════════════════════════════════════════════════════════════
+
+Execute this command? [Y/n] y
+```
+
+The wizard requires Claude Code CLI to be installed (`claude` command).
 
 ## Starting a Session
 
