@@ -251,6 +251,53 @@ show_yaml_parser_install_help() {
     echo ""
 }
 
+# Discover all git repositories in a directory and generate config
+discover_repos_in_dir() {
+    local search_dir="$1"
+    local temp_config="$HOME/.cache/claude-container/discovered-config-$$.yml"
+
+    mkdir -p "$HOME/.cache/claude-container"
+
+    # Redirect output to stderr to avoid interfering with return value
+    info "Discovering git repositories in: $search_dir" >&2
+
+    # Find all git repos (only direct subdirectories, not nested)
+    local found_count=0
+    local projects=""
+
+    for dir in "$search_dir"/*/; do
+        if [[ -d "$dir/.git" ]]; then
+            local repo_name
+            repo_name=$(basename "$dir")
+            info "  ✓ Found: $repo_name" >&2
+            projects+="$repo_name|$dir"$'\n'
+            found_count=$((found_count + 1))
+        fi
+    done
+
+    if [[ $found_count -eq 0 ]]; then
+        error "No git repositories found in: $search_dir" >&2
+        exit 1
+    fi
+
+    # Generate temporary config file
+    cat > "$temp_config" << 'EOF'
+version: "1"
+projects:
+EOF
+
+    while IFS='|' read -r name path; do
+        [[ -z "$name" ]] && continue
+        echo "  $name:" >> "$temp_config"
+        echo "    path: $path" >> "$temp_config"
+    done <<< "$projects"
+
+    success "Discovered $found_count repositories" >&2
+
+    # Return path to temp config (only thing on stdout)
+    echo "$temp_config"
+}
+
 # Find .claude-projects.yml config file
 # Search order: --config flag > ./.claude-projects.yml > ./.devcontainer/claude-projects.yml
 find_config_file() {
@@ -446,33 +493,43 @@ create_multi_project_session() {
     local host_uid
     host_uid=$(get_host_uid)
 
-    # Create config file with absolute paths and store in volume
-    info "Storing config in session volume..."
-    local config_content
-    config_content="version: \"1\"\nprojects:\n"
-    while IFS='|' read -r proj_name proj_path; do
-        [[ -z "$proj_name" ]] && continue
-        config_content+="  ${proj_name}:\n    path: ${proj_path}\n"
-    done <<< "$projects"
-
-    if ! docker run --rm \
-        -e "CONFIG_CONTENT=$config_content" \
-        -v "$volume:/session" \
-        "$git_image" \
-        sh -c 'printf "%b" "$CONFIG_CONTENT" > /session/.claude-projects.yml' 2>&1; then
-        error "Failed to store config in volume"
-        docker volume rm "$volume" >/dev/null 2>&1
-        exit 1
-    fi
-
-    info "Config stored successfully"
-
     # Verify projects variable is populated
     if [[ -z "$projects" ]]; then
         error "No projects to clone (parse result was empty)"
         docker volume rm "$volume" >/dev/null 2>&1
         exit 1
     fi
+
+    # Create config file with absolute paths using temp file (avoids env var size limits)
+    info "Storing config in session volume..."
+    local temp_config="$HOME/.cache/claude-container/session-config-$$.yml"
+    mkdir -p "$HOME/.cache/claude-container"
+
+    # Write config to temp file (streaming, not accumulating in memory)
+    {
+        echo 'version: "1"'
+        echo 'projects:'
+        while IFS='|' read -r proj_name proj_path; do
+            [[ -z "$proj_name" ]] && continue
+            echo "  ${proj_name}:"
+            echo "    path: ${proj_path}"
+        done <<< "$projects"
+    } > "$temp_config"
+
+    # Copy via mounted temp file (works for any size)
+    if ! docker run --rm \
+        -v "$temp_config:/tmp/config.yml:ro" \
+        -v "$volume:/session" \
+        "$git_image" \
+        cp /tmp/config.yml /session/.claude-projects.yml 2>&1; then
+        error "Failed to store config in volume"
+        rm -f "$temp_config"
+        docker volume rm "$volume" >/dev/null 2>&1
+        exit 1
+    fi
+    rm -f "$temp_config"  # Clean up immediately
+
+    info "Config stored successfully"
 
     # Clone each project into its subdirectory
     local project_count=0
@@ -528,6 +585,15 @@ create_git_session() {
     local name="$1"
     local source_dir="$2"
     local volume="claude-session-${name}"
+
+    # Check for --discover-repos flag (highest priority)
+    if [[ -n "${DISCOVER_REPOS_DIR:-}" ]]; then
+        local discovered_config
+        discovered_config=$(discover_repos_in_dir "$DISCOVER_REPOS_DIR")
+        create_multi_project_session "$name" "$discovered_config"
+        rm -f "$discovered_config"  # Clean up temp file
+        return $?
+    fi
 
     # Check for multi-project config file
     local config_file
@@ -1114,9 +1180,83 @@ case "${1:-}" in
         exit 0
         ;;
 
-    --list-sessions)
-        echo "Session volumes:"
-        docker volume ls -q | grep -E "^(claude-session-|claude-state-|claude-cargo-|claude-npm-|claude-pip-|session-data-)" | sed 's/^/  /' || echo "  (none)"
+    --list-sessions|--sessions)
+        # Get all claude volumes
+        all_volumes=$(docker volume ls -q | grep -E "^(claude-session-|claude-state-|claude-cargo-|claude-npm-|claude-pip-)" || true)
+
+        if [[ -z "$all_volumes" ]]; then
+            echo "No claude-container sessions found."
+            exit 0
+        fi
+
+        # Extract unique session names
+        declare -A sessions
+        while read -r vol; do
+            [[ -z "$vol" ]] && continue
+            session_name=""
+            case "$vol" in
+                claude-session-*) session_name="${vol#claude-session-}" ;;
+                claude-state-*)   session_name="${vol#claude-state-}" ;;
+                claude-cargo-*)   session_name="${vol#claude-cargo-}" ;;
+                claude-npm-*)     session_name="${vol#claude-npm-}" ;;
+                claude-pip-*)     session_name="${vol#claude-pip-}" ;;
+            esac
+            [[ -n "$session_name" ]] && sessions[$session_name]=1
+        done <<< "$all_volumes"
+
+        # Build mount arguments for all volumes at once
+        echo "Scanning $(echo "$all_volumes" | wc -l | tr -d ' ') volumes..."
+        mount_args=""
+        vol_list=""
+        while read -r vol; do
+            [[ -z "$vol" ]] && continue
+            mount_args="$mount_args -v $vol:/$vol:ro"
+            vol_list="$vol_list $vol"
+        done <<< "$all_volumes"
+
+        # Get all sizes in one container run (much faster!)
+        sizes=$(docker run --rm $mount_args alpine sh -c '
+            for dir in /claude-*/; do
+                [ -d "$dir" ] || continue
+                name=$(basename "$dir")
+                size=$(du -sh "$dir" 2>/dev/null | cut -f1)
+                echo "$name $size"
+            done
+        ' 2>/dev/null || echo "")
+
+        # Parse sizes into associative array
+        declare -A vol_sizes
+        while read -r vol size; do
+            [[ -z "$vol" ]] && continue
+            vol_sizes[$vol]="$size"
+        done <<< "$sizes"
+
+        # Display table
+        echo ""
+        printf "%-30s %10s %10s %10s %10s %10s\n" "SESSION" "WORKSPACE" "STATE" "CARGO" "NPM" "PIP"
+        printf "%-30s %10s %10s %10s %10s %10s\n" "-------" "---------" "-----" "-----" "---" "---"
+
+        for session in $(echo "${!sessions[@]}" | tr ' ' '\n' | sort); do
+            ws="${vol_sizes[claude-session-$session]:-"-"}"
+            st="${vol_sizes[claude-state-$session]:-"-"}"
+            ca="${vol_sizes[claude-cargo-$session]:-"-"}"
+            np="${vol_sizes[claude-npm-$session]:-"-"}"
+            pi="${vol_sizes[claude-pip-$session]:-"-"}"
+            printf "%-30s %10s %10s %10s %10s %10s\n" "$session" "$ws" "$st" "$ca" "$np" "$pi"
+        done
+
+        # Calculate total size across all volumes
+        total=$(docker run --rm $mount_args alpine sh -c '
+            du -sh /claude-*/ 2>/dev/null | awk "{sum+=\$1} END {print sum}"
+        ' 2>/dev/null || echo "?")
+        total_human=$(docker run --rm $mount_args alpine sh -c 'du -sch /claude-*/ 2>/dev/null | tail -1 | cut -f1' 2>/dev/null || echo "?")
+
+        echo ""
+        echo "Total disk usage: $total_human"
+        echo ""
+        echo "Commands:"
+        echo "  Delete session:  ./claude-container --delete-session <name>"
+        echo "  Delete all:      ./claude-container --cleanup"
         exit 0
         ;;
 
@@ -1261,6 +1401,10 @@ while [[ $# -gt 0 ]]; do
             AUTO_SYNC_BRANCH="$2"
             shift 2
             ;;
+        --discover-repos)
+            DISCOVER_REPOS_DIR="$2"
+            shift 2
+            ;;
         --config|-C)
             CONFIG_FILE="$2"
             shift 2
@@ -1293,6 +1437,8 @@ Options:
   --as-user                Run as non-root developer user (default: run as root)
   --as-rootish             Run as developer user who owns install dirs (recommended)
   --auto-sync <branch>     Auto-merge session commits to branch on exit
+  --discover-repos <dir>   Auto-discover all git repos in directory and create multi-project session
+                           Example: --discover-repos ~/dev/myprojects
   --config, -C <path>      Explicit path to .claude-projects.yml config file
   --verify, -v             Verify container setup works (run checks and exit)
   --version, -V            Show version
@@ -1327,8 +1473,8 @@ Multi-Project Sessions:
 
 Session Management:
   --cleanup                List and optionally delete all claude-related volumes
-  --list-sessions          List all session volumes
-  --delete-session <name>  Delete a specific session by name
+  --list-sessions, --sessions  List all sessions with disk usage per volume
+  --delete-session <name>  Delete a specific session and all its volumes
 
 Environment:
   CLAUDE_CODE_OAUTH_TOKEN   OAuth token for authentication (required)
