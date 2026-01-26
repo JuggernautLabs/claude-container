@@ -16,6 +16,14 @@ set -e
 VERSION="0.1.0"
 DEFAULT_IMAGE="ghcr.io/hypermemetic/claude-container:latest"
 
+# Config and cache directories
+CONFIG_DIR="$HOME/.config/claude-container"
+CACHE_DIR="$CONFIG_DIR/cache"
+
+# Ensure directories exist
+mkdir -p "$CONFIG_DIR" "$CACHE_DIR"
+chmod 700 "$CONFIG_DIR"
+
 # Colors
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -154,7 +162,7 @@ inject_token_securely() {
     # Use a path that Docker VM can definitely access
     # On macOS with Colima/Docker Desktop, $TMPDIR (/var/folders/...) may not be shared
     # Use $HOME/.cache which is always shared
-    local token_dir="$HOME/.cache/claude-container"
+    local token_dir="$CACHE_DIR"
     mkdir -p "$token_dir"
     chmod 700 "$token_dir"
 
@@ -254,9 +262,9 @@ show_yaml_parser_install_help() {
 # Discover all git repositories in a directory and generate config
 discover_repos_in_dir() {
     local search_dir="$1"
-    local temp_config="$HOME/.cache/claude-container/discovered-config-$$.yml"
+    local temp_config="$CACHE_DIR/discovered-config-$$.yml"
 
-    mkdir -p "$HOME/.cache/claude-container"
+    mkdir -p "$CACHE_DIR"
 
     # Redirect output to stderr to avoid interfering with return value
     info "Discovering git repositories in: $search_dir" >&2
@@ -502,8 +510,8 @@ create_multi_project_session() {
 
     # Create config file with absolute paths using temp file (avoids env var size limits)
     info "Storing config in session volume..."
-    local temp_config="$HOME/.cache/claude-container/session-config-$$.yml"
-    mkdir -p "$HOME/.cache/claude-container"
+    local temp_config="$CACHE_DIR/session-config-$$.yml"
+    mkdir -p "$CACHE_DIR"
 
     # Write config to temp file (streaming, not accumulating in memory)
     {
@@ -681,8 +689,8 @@ diff_multi_project_session() {
     # Parse config to get project list (name|path pairs)
     local projects
     # Create temp file for config
-    local temp_config="$HOME/.cache/claude-container/temp-config-$$.yml"
-    mkdir -p "$HOME/.cache/claude-container"
+    local temp_config="$CACHE_DIR/temp-config-$$.yml"
+    mkdir -p "$CACHE_DIR"
     echo "$config_data" > "$temp_config"
     trap "rm -f '$temp_config'" RETURN
 
@@ -855,8 +863,8 @@ merge_multi_project_session() {
     }
 
     # Parse config
-    local temp_config="$HOME/.cache/claude-container/temp-config-$$.yml"
-    mkdir -p "$HOME/.cache/claude-container"
+    local temp_config="$CACHE_DIR/temp-config-$$.yml"
+    mkdir -p "$CACHE_DIR"
     echo "$config_data" > "$temp_config"
     trap "rm -f '$temp_config'" RETURN
 
@@ -914,7 +922,7 @@ merge_multi_project_session() {
     fi
 
     # Prepare patch directory
-    local patch_cache="$HOME/.cache/claude-container"
+    local patch_cache="$CACHE_DIR"
     mkdir -p "$patch_cache"
     local patch_dir="$patch_cache/merge-multi-$$-$(date +%s)"
     mkdir -p "$patch_dir"
@@ -1089,7 +1097,7 @@ merge_git_session() {
 
             # Create temp directory for patches
             # Use Docker-accessible path (mktemp -d creates /var/folders/... on macOS which Docker can't mount)
-            local patch_cache="$HOME/.cache/claude-container"
+            local patch_cache="$CACHE_DIR"
             mkdir -p "$patch_cache"
             local patch_dir="$patch_cache/merge-$$-$(date +%s)"
             mkdir -p "$patch_dir"
@@ -1359,218 +1367,6 @@ case "${1:-}" in
         exit 0
         ;;
 
-    --wizard)
-        # Interactive wizard using Claude Code to configure and launch a session
-        WIZARD_DIR="$HOME/.cache/claude-container/wizard-$$"
-        WIZARD_CMD_FILE="$WIZARD_DIR/command.sh"
-        WIZARD_CONTEXT_FILE="$WIZARD_DIR/context.md"
-        SCRIPT_PATH="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
-        SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-
-        mkdir -p "$WIZARD_DIR"
-        trap "rm -rf '$WIZARD_DIR'" EXIT
-
-        echo ""
-        echo "╔════════════════════════════════════════════════════════════════╗"
-        echo "║              Claude Container Setup Wizard                      ║"
-        echo "╠════════════════════════════════════════════════════════════════╣"
-        echo "║  Gathering context...                                          ║"
-        echo "╚════════════════════════════════════════════════════════════════╝"
-        echo ""
-
-        # Check for Claude Code
-        if ! command -v claude &>/dev/null; then
-            error "Claude Code CLI not found. Please install it first:"
-            echo "  npm install -g @anthropic-ai/claude-code"
-            exit 1
-        fi
-
-        # Gather context
-        echo "  → Scanning for existing sessions..."
-        EXISTING_SESSIONS=$(docker volume ls -q 2>/dev/null | grep "^claude-session-" | sed 's/claude-session-//' | sort -u || echo "(none)")
-
-        echo "  → Checking current directory..."
-        CURRENT_DIR="$(pwd)"
-        CURRENT_DIR_CONTENTS=$(ls -la 2>/dev/null | head -20 || echo "(empty)")
-
-        echo "  → Looking for git repositories..."
-        GIT_REPOS_HERE=""
-        if [[ -d ".git" ]]; then
-            GIT_REPOS_HERE="Current directory is a git repo: $CURRENT_DIR"
-        fi
-        for dir in */; do
-            if [[ -d "$dir/.git" ]]; then
-                GIT_REPOS_HERE="$GIT_REPOS_HERE
-  - $dir"
-            fi
-        done
-        [[ -z "$GIT_REPOS_HERE" ]] && GIT_REPOS_HERE="(no git repos found in current directory)"
-
-        echo "  → Building context file..."
-
-        # Create comprehensive context file
-        cat > "$WIZARD_CONTEXT_FILE" << WIZARD_CONTEXT_EOF
-# Claude Container Wizard Context
-
-## Your Task
-Help the user configure and launch a claude-container session. Ask questions to understand their needs, then generate the appropriate command.
-
-## Output Location
-When ready, write the final command to: $WIZARD_CMD_FILE
-After writing, tell the user to exit (Ctrl+D) to execute it.
-
----
-
-## Current Environment
-
-**Working Directory:** $CURRENT_DIR
-
-**Git Repos Found:**
-$GIT_REPOS_HERE
-
-**Directory Contents:**
-\`\`\`
-$CURRENT_DIR_CONTENTS
-\`\`\`
-
----
-
-## Existing Sessions
-
-These sessions already exist (user can resume with --continue or start fresh):
-\`\`\`
-$EXISTING_SESSIONS
-\`\`\`
-
----
-
-## Available Commands
-
-### Basic Usage
-\`\`\`bash
-# Start session with current directory (must be a git repo)
-$SCRIPT_PATH --git-session SESSION_NAME
-
-# Start session with specific directory
-cd /path/to/repo && $SCRIPT_PATH --git-session SESSION_NAME
-
-# Multiple repos - auto-discover all git repos in a directory
-$SCRIPT_PATH --git-session SESSION_NAME --discover-repos /path/to/parent/dir
-\`\`\`
-
-### Common Options
-| Flag | Description |
-|------|-------------|
-| \`--git-session NAME\` | Create/resume isolated git session (required) |
-| \`--discover-repos DIR\` | Auto-discover all git repos in directory |
-| \`--as-rootish\` | Run with fake-root for installing packages (RECOMMENDED) |
-| \`--continue\` | Continue previous Claude conversation |
-| \`--config PATH\` | Use specific .claude-projects.yml config file |
-| \`--no-run\` | Create session but don't start container |
-
-### Session Management
-\`\`\`bash
-# List sessions with disk usage
-$SCRIPT_PATH --sessions
-
-# View changes in a session
-$SCRIPT_PATH --diff-session SESSION_NAME
-
-# Merge changes back to source repos
-$SCRIPT_PATH --merge-session SESSION_NAME
-
-# Delete a session
-$SCRIPT_PATH --delete-session SESSION_NAME
-\`\`\`
-
----
-
-## Recommendations
-
-1. **Always use \`--as-rootish\`** - Allows installing system packages without issues
-2. **For multiple related repos** - Use \`--discover-repos\` to work across all of them
-3. **Session names** - Use descriptive names like \`feature-auth\` or \`bugfix-api\`
-4. **Existing sessions** - If a session exists, ask if they want to resume or start fresh
-
----
-
-## Example Commands
-
-\`\`\`bash
-# Single repo, current directory
-$SCRIPT_PATH --git-session my-feature --as-rootish
-
-# Multiple repos in ~/dev/myproject
-$SCRIPT_PATH --git-session fullstack --discover-repos ~/dev/myproject --as-rootish
-
-# Resume existing session
-$SCRIPT_PATH --git-session existing-session --continue --as-rootish
-
-# Specific config file
-$SCRIPT_PATH --git-session custom --config ./my-projects.yml --as-rootish
-\`\`\`
-
----
-
-## Your Approach
-
-1. **Greet the user** and briefly explain what you'll help with
-2. **Check if they want to resume** an existing session (if any exist)
-3. **Ask about their project** - single repo or multiple?
-4. **Get the path** - offer current directory as default if it's a git repo
-5. **Suggest a session name** based on the directory/project name
-6. **Confirm options** - recommend --as-rootish
-7. **Generate command** and write to $WIZARD_CMD_FILE
-8. **Tell user to exit** (Ctrl+D) to run the command
-
-Be conversational but efficient. Most users just want to get started quickly.
-WIZARD_CONTEXT_EOF
-
-        echo ""
-        echo "╔════════════════════════════════════════════════════════════════╗"
-        echo "║  Context gathered! Starting wizard...                          ║"
-        echo "║  Type 'exit' or Ctrl+D when finished.                          ║"
-        echo "╚════════════════════════════════════════════════════════════════╝"
-        echo ""
-
-        # Launch Claude Code with the context file
-        claude -p "Read your instructions and context from: $WIZARD_CONTEXT_FILE
-
-Then start helping the user configure their claude-container session. Be friendly and conversational."
-
-        # After Claude exits, check for the command file
-        if [[ -f "$WIZARD_CMD_FILE" ]]; then
-            echo ""
-            echo "════════════════════════════════════════════════════════════════"
-            WIZARD_CMD=$(cat "$WIZARD_CMD_FILE")
-            echo "Generated command:"
-            echo "  $WIZARD_CMD"
-            echo "════════════════════════════════════════════════════════════════"
-            echo ""
-            read -p "Execute this command? [Y/n] " confirm
-            if [[ "$confirm" != "n" && "$confirm" != "N" ]]; then
-                echo ""
-                eval "$WIZARD_CMD"
-            else
-                echo ""
-                echo "Command saved to: $WIZARD_CMD_FILE"
-                echo "Run manually with: bash $WIZARD_CMD_FILE"
-                # Don't delete the file if user wants to run manually
-                trap - EXIT
-            fi
-        else
-            echo ""
-            warn "No command was generated."
-            echo ""
-            echo "Quick start examples:"
-            echo "  # Single repo (current directory)"
-            echo "  $SCRIPT_PATH --git-session my-project --as-rootish"
-            echo ""
-            echo "  # Multiple repos (auto-discover)"
-            echo "  $SCRIPT_PATH --git-session my-project --discover-repos ~/dev/myprojects --as-rootish"
-        fi
-        exit 0
-        ;;
 esac
 
 # Parse arguments
@@ -1655,7 +1451,6 @@ Options:
   --config, -C <path>      Explicit path to .claude-projects.yml config file
   --verify, -v             Verify container setup works (run checks and exit)
   --version, -V            Show version
-  --wizard                 Interactive setup wizard - Claude helps you configure your session
   --help, -h               Show this help
 
 Git Session Management:
@@ -1730,14 +1525,83 @@ if $USE_GIT_SESSION && ! $SESSION_NAME_SET; then
     SESSION_NAME="$GIT_SESSION"
 fi
 
-# Check for token
+# Check for token - try multiple sources
+TOKEN_FILE="$CONFIG_DIR/token"
 if [[ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]]; then
-    error "CLAUDE_CODE_OAUTH_TOKEN is required"
-    echo ""
-    echo "Get a token by running: claude setup-token"
-    echo "Then: export CLAUDE_CODE_OAUTH_TOKEN=<token>"
-    exit 1
+    # Try config file first
+    if [[ -f "$TOKEN_FILE" ]]; then
+        CLAUDE_CODE_OAUTH_TOKEN=$(cat "$TOKEN_FILE")
+        info "Using token from config file"
+    else
+        # Try macOS Keychain (where Claude Code stores its OAuth token)
+        info "No token found, attempting to fetch from keychain..."
+        if [[ "$PLATFORM" == "macos" ]] && command -v security &>/dev/null; then
+            # Claude Code stores token with service "claude.ai"
+            FETCHED_TOKEN=$(security find-generic-password -s "claude.ai" -w 2>/dev/null || true)
+            if [[ -n "$FETCHED_TOKEN" ]]; then
+                CLAUDE_CODE_OAUTH_TOKEN="$FETCHED_TOKEN"
+                # Store for future use
+                echo -n "$FETCHED_TOKEN" > "$TOKEN_FILE"
+                chmod 600 "$TOKEN_FILE"
+                success "Token fetched from Keychain and stored in $TOKEN_FILE"
+            fi
+        fi
+    fi
+
+    # Final check - still no token? Start auth flow
+    if [[ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]]; then
+        warn "No token found in keychain or config"
+        echo ""
+
+        if ! command -v claude &>/dev/null; then
+            error "claude CLI not found"
+            echo ""
+            echo "Install Claude Code first, then run: claude setup-token"
+            exit 1
+        fi
+
+        echo "Starting authentication flow..."
+        echo ""
+
+        # Capture output to extract token
+        AUTH_OUTPUT_FILE="$CACHE_DIR/auth-output-$$"
+
+        # Use script command to provide a proper PTY for claude setup-token
+        if [[ "$PLATFORM" == "macos" ]]; then
+            script -q "$AUTH_OUTPUT_FILE" claude setup-token
+        else
+            script -qc "claude setup-token" "$AUTH_OUTPUT_FILE"
+        fi
+
+        # Extract token from output (sk-ant-oat... pattern ending in AA)
+        # Token may span multiple lines due to terminal wrapping with ANSI codes
+        if [[ -f "$AUTH_OUTPUT_FILE" ]]; then
+            # Strip ANSI codes, join lines, then extract token (ends with AA)
+            FETCHED_TOKEN=$(cat "$AUTH_OUTPUT_FILE" | \
+                sed 's/\x1b\[[0-9;]*[a-zA-Z]//g' | \
+                tr -d '\n\r' | \
+                grep -oE 'sk-ant-oat[A-Za-z0-9_-]+AA' | \
+                head -1 || true)
+            rm -f "$AUTH_OUTPUT_FILE"
+
+            if [[ -n "$FETCHED_TOKEN" ]]; then
+                CLAUDE_CODE_OAUTH_TOKEN="$FETCHED_TOKEN"
+                echo -n "$FETCHED_TOKEN" > "$TOKEN_FILE"
+                chmod 600 "$TOKEN_FILE"
+                success "Token saved to $TOKEN_FILE"
+            else
+                error "Could not extract token from auth output"
+                echo "You may need to manually run: claude setup-token"
+                echo "Then store the token in: $TOKEN_FILE"
+                exit 1
+            fi
+        else
+            error "Auth output file not created"
+            exit 1
+        fi
+    fi
 fi
+export CLAUDE_CODE_OAUTH_TOKEN
 
 # Check for YAML parser if we'll need it (multi-project mode)
 if $USE_GIT_SESSION || [[ -n "$CONFIG_FILE" ]]; then
