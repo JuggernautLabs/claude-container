@@ -38,6 +38,7 @@ source "$SCRIPT_DIR/lib/session-mgmt.sh"
 # Global state variables
 DOCKERFILE=""
 FORCE_BUILD=false
+FORCE_DEFAULT_IMAGE=false
 SESSION_DIR=""
 VERIFY_MODE=false
 SESSION_NAME="default"
@@ -103,6 +104,10 @@ while [[ $# -gt 0 ]]; do
     case $1 in
         --build|-b)
             FORCE_BUILD=true
+            shift
+            ;;
+        --default-image)
+            FORCE_DEFAULT_IMAGE=true
             shift
             ;;
         --dir|-d)
@@ -172,6 +177,7 @@ Spawn into a Docker container with Claude Code ready.
 
 Options:
   --build, -b              Force rebuild the image
+  --default-image          Use default image (skip local Dockerfile)
   --dir, -d <path>         Directory to use with overlay (changes persist in session volume)
                            DEPRECATED: Use --git-session instead (requires --privileged)
   --git-session, -g <name> Create/resume a git-based isolated session (recommended)
@@ -261,7 +267,12 @@ fi
 
 USE_DEFAULT_IMAGE=false
 
-if [[ -z "$DOCKERFILE" ]]; then
+if $FORCE_DEFAULT_IMAGE; then
+    info "Using default image (--default-image): $DEFAULT_IMAGE"
+    USE_DEFAULT_IMAGE=true
+    IMAGE_NAME="$DEFAULT_IMAGE"
+    DOCKERFILE=""
+elif [[ -z "$DOCKERFILE" ]]; then
     info "No Dockerfile found, using default image: $DEFAULT_IMAGE"
     USE_DEFAULT_IMAGE=true
     IMAGE_NAME="$DEFAULT_IMAGE"

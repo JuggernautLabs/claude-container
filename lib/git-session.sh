@@ -124,8 +124,20 @@ create_multi_project_session() {
         project_count=$((project_count + 1))
         project_names+=("$project_name")
 
+        # Determine which branch to clone:
+        # 1. If source_branch specified in config, use that
+        # 2. Else if session name matches a branch in the repo, use that
+        # 3. Else use whatever is checked out (HEAD)
+        local clone_branch="$source_branch"
+        if [[ -z "$clone_branch" ]] && [[ -n "$name" ]]; then
+            # Check if a branch matching session name exists
+            if git -C "$source_path" show-ref --verify --quiet "refs/heads/$name" 2>/dev/null; then
+                clone_branch="$name"
+            fi
+        fi
+
         local branch_info=""
-        [[ -n "$source_branch" ]] && branch_info=" (branch: $source_branch)"
+        [[ -n "$clone_branch" ]] && branch_info=" (branch: $clone_branch)"
         info "Cloning '$project_name'$branch_info..."
 
         # Clone and configure in one docker run, in background
@@ -133,7 +145,7 @@ create_multi_project_session() {
         # Use git -c flags instead of --global config (no home dir for arbitrary UID)
         local safe_log_name="${project_name//\//_}"  # Replace / with _ for log filename
         local branch_flag=""
-        [[ -n "$source_branch" ]] && branch_flag="--branch $source_branch"
+        [[ -n "$clone_branch" ]] && branch_flag="--branch $clone_branch"
         (
             docker run --rm \
                 --user "$host_uid:$host_uid" \
@@ -257,7 +269,14 @@ create_git_session() {
         "$git_image" \
         chown "$host_uid:$host_uid" /session
 
-    info "Cloning repository into session volume..."
+    # Check if a branch matching session name exists, use it if so
+    local branch_flag=""
+    if git -C "$source_dir" show-ref --verify --quiet "refs/heads/$name" 2>/dev/null; then
+        branch_flag="--branch $name"
+        info "Cloning repository (branch: $name)..."
+    else
+        info "Cloning repository into session volume..."
+    fi
 
     # Run clone as target UID so files have correct ownership (no chown needed)
     # Use git -c flags instead of --global config (no home dir for arbitrary UID)
@@ -267,13 +286,13 @@ create_git_session() {
         -v "$source_dir:/source:ro" \
         -v "$volume:/session" \
         "$git_image" \
-        sh -c '
-            git -c safe.directory="*" clone --depth 1 /source /session &&
+        sh -c "
+            git -c safe.directory='*' clone --depth 1 $branch_flag /source /session &&
             cd /session &&
             git remote remove origin 2>/dev/null || true &&
-            git config user.email "claude@container" &&
-            git config user.name "Claude"
-        ' 2>&1); then
+            git config user.email 'claude@container' &&
+            git config user.name 'Claude'
+        " 2>&1); then
         error "Git clone failed:"
         echo "$clone_output" >&2
         docker volume rm "$volume" >/dev/null 2>&1
