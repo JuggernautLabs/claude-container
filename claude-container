@@ -24,40 +24,22 @@ CACHE_DIR="$CONFIG_DIR/cache"
 mkdir -p "$CONFIG_DIR" "$CACHE_DIR"
 chmod 700 "$CONFIG_DIR"
 
-# Colors
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m' # No Color
+# Source library modules
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+source "$SCRIPT_DIR/lib/utils.sh"
+source "$SCRIPT_DIR/lib/platform.sh"
+source "$SCRIPT_DIR/lib/config.sh"
+source "$SCRIPT_DIR/lib/auth.sh"
+source "$SCRIPT_DIR/lib/docker.sh"
+source "$SCRIPT_DIR/lib/git-session.sh"
+source "$SCRIPT_DIR/lib/git-ops.sh"
+source "$SCRIPT_DIR/lib/session-mgmt.sh"
 
-info() { echo -e "${BLUE}→${NC} $*"; }
-success() { echo -e "${GREEN}✓${NC} $*"; }
-warn() { echo -e "${YELLOW}⚠${NC} $*"; }
-error() { echo -e "${RED}✗${NC} $*" >&2; }
-
-# Spinner for long operations
-spin() {
-    local pid=$1
-    local delay=0.1
-    local spinstr='|/-\'
-    while ps -p $pid &>/dev/null; do
-        local temp=${spinstr#?}
-        printf " [%c]  " "$spinstr"
-        local spinstr=$temp${spinstr%"$temp"}
-        sleep $delay
-        printf "\b\b\b\b\b\b"
-    done
-    printf "    \b\b\b\b"
-}
-
+# Global state variables
 DOCKERFILE=""
 FORCE_BUILD=false
 SESSION_DIR=""
 VERIFY_MODE=false
-TOKEN_TMPFILE=""
-PLATFORM=""
-IS_CI=false
 SESSION_NAME="default"
 SESSION_NAME_SET=false
 GIT_SESSION=""
@@ -66,1307 +48,45 @@ CONTINUE_SESSION=false
 RUN_AS_USER=false
 RUN_AS_ROOTISH=false
 AUTO_SYNC_BRANCH=""
-CONFIG_FILE=""
 NO_RUN=false
+DISCOVER_REPOS_DIR=""
 
-# Platform detection
-detect_platform() {
-    case "$(uname -s)" in
-        Darwin)
-            PLATFORM="macos"
-            ;;
-        Linux)
-            PLATFORM="linux"
-            # Detect WSL
-            if grep -qi microsoft /proc/version 2>/dev/null; then
-                PLATFORM="wsl"
-            fi
-            ;;
-        MINGW*|MSYS*|CYGWIN*)
-            PLATFORM="windows"
-            ;;
-        *)
-            PLATFORM="unknown"
-            ;;
-    esac
-}
-
-# CI environment detection
-detect_ci() {
-    if [[ -n "${CI:-}" ]] || [[ -n "${GITHUB_ACTIONS:-}" ]] || [[ -n "${GITLAB_CI:-}" ]]; then
-        IS_CI=true
-    else
-        IS_CI=false
-    fi
-}
-
-# Get host UID dynamically (platform-aware)
-get_host_uid() {
-    case "$PLATFORM" in
-        windows)
-            echo "1000"  # Default for Windows containers
-            ;;
-        *)
-            id -u
-            ;;
-    esac
-}
-
-# Get host GID dynamically (platform-aware)
-get_host_gid() {
-    case "$PLATFORM" in
-        windows)
-            echo "1000"  # Default for Windows containers
-            ;;
-        *)
-            id -g
-            ;;
-    esac
-}
-
-# Platform-specific SSH socket arguments
-get_ssh_socket_args() {
-    if [[ -z "${SSH_AUTH_SOCK:-}" ]]; then
-        return
-    fi
-
-    case "$PLATFORM" in
-        macos)
-            # macOS Docker Desktop uses a special socket path
-            echo "-v /run/host-services/ssh-auth.sock:/ssh-agent -e SSH_AUTH_SOCK=/ssh-agent"
-            ;;
-        linux|wsl)
-            # Linux/WSL can directly mount the SSH socket
-            echo "-v $SSH_AUTH_SOCK:/ssh-agent -e SSH_AUTH_SOCK=/ssh-agent"
-            ;;
-        windows)
-            # Windows named pipe - not directly supported, skip SSH forwarding
-            echo ""
-            ;;
-        *)
-            # Unknown platform - try direct mount as fallback
-            echo "-v $SSH_AUTH_SOCK:/ssh-agent -e SSH_AUTH_SOCK=/ssh-agent"
-            ;;
-    esac
-}
-
-# Initialize platform and CI detection
-detect_platform
-detect_ci
-
-# Secure token injection - mounts token as file instead of env var
-# This prevents token from being visible in `docker inspect`
-inject_token_securely() {
-    local token="$1"
-
-    # Use a path that Docker VM can definitely access
-    # On macOS with Colima/Docker Desktop, $TMPDIR (/var/folders/...) may not be shared
-    # Use $HOME/.cache which is always shared
-    local token_dir="$CACHE_DIR"
-    mkdir -p "$token_dir"
-    chmod 700 "$token_dir"
-
-    TOKEN_TMPFILE="$token_dir/token-$$"
-    echo -n "$token" > "$TOKEN_TMPFILE"
-    chmod 600 "$TOKEN_TMPFILE"
-
-    # Verify file exists and has content (prevents Docker creating a directory)
-    if [[ ! -f "$TOKEN_TMPFILE" ]] || [[ ! -s "$TOKEN_TMPFILE" ]]; then
-        error "Failed to create token file"
-        exit 1
-    fi
-
-    # Add cleanup trap
-    trap "rm -f '$TOKEN_TMPFILE'" EXIT
-
-    # Mount as file (must be absolute path for Docker)
-    DOCKER_ARGS+=("-v" "$TOKEN_TMPFILE:/run/secrets/claude_token:ro")
-}
-
-# Session state persistence - stores conversation history and settings
-setup_session_state() {
-    local session_name="${1:-default}"
-    local state_volume="claude-state-${session_name}"
-
-    # Create volume if it doesn't exist
-    docker volume inspect "$state_volume" &>/dev/null || \
-        docker volume create "$state_volume" >/dev/null
-
-    # Add to docker args
-    DOCKER_ARGS+=("-v" "$state_volume:/home/developer/.claude")
-}
-
-# Dev tool caches - persist cargo/npm/pip caches across sessions
-# Fixes permission issues (e.g., cargo registry owned by root)
-setup_dev_caches() {
-    local session_name="${1:-default}"
-
-    for cache in cargo npm pip; do
-        local vol="claude-${cache}-${session_name}"
-        docker volume inspect "$vol" &>/dev/null || \
-            docker volume create "$vol" >/dev/null
-    done
-
-    DOCKER_ARGS+=(
-        "-v" "claude-cargo-${session_name}:/home/developer/.cargo"
-        "-v" "claude-npm-${session_name}:/home/developer/.npm"
-        "-v" "claude-pip-${session_name}:/home/developer/.cache/pip"
-        "-e" "CARGO_HOME=/home/developer/.cargo"
-        "-e" "npm_config_cache=/home/developer/.npm"
-        "-e" "PIP_CACHE_DIR=/home/developer/.cache/pip"
-    )
-}
-
-# Multi-project session support functions
-
-# Check if YAML parser is available (yq or python3 with yaml)
-check_yaml_parser_available() {
-    if command -v yq &>/dev/null; then
-        return 0
-    elif command -v python3 &>/dev/null && python3 -c "import yaml" &>/dev/null; then
-        return 0
-    else
-        return 1
-    fi
-}
-
-# Show helpful message for installing YAML parser
-show_yaml_parser_install_help() {
-    error "No YAML parser found. Multi-project sessions require 'yq' or 'python3' with PyYAML."
-    echo ""
-    echo "Installation options:"
-    echo ""
-    echo "Option 1: Install yq (recommended)"
-    case "$PLATFORM" in
-        macos)
-            echo "  brew install yq"
-            ;;
-        linux|wsl)
-            echo "  # Ubuntu/Debian:"
-            echo "  sudo apt-get install yq"
-            echo ""
-            echo "  # Or using snap:"
-            echo "  sudo snap install yq"
-            ;;
-        *)
-            echo "  See: https://github.com/mikefarah/yq#install"
-            ;;
-    esac
-    echo ""
-    echo "Option 2: Install Python PyYAML"
-    echo "  pip3 install pyyaml"
-    echo "  # or: python3 -m pip install pyyaml"
-    echo ""
-}
-
-# Discover all git repositories in a directory and generate config
-discover_repos_in_dir() {
-    local search_dir="$1"
-    local temp_config="$CACHE_DIR/discovered-config-$$.yml"
-
-    mkdir -p "$CACHE_DIR"
-
-    # Redirect output to stderr to avoid interfering with return value
-    info "Discovering git repositories in: $search_dir" >&2
-
-    # Find all git repos (only direct subdirectories, not nested)
-    local found_count=0
-    local projects=""
-
-    for dir in "$search_dir"/*/; do
-        if [[ -d "$dir/.git" ]]; then
-            local repo_name
-            repo_name=$(basename "$dir")
-            info "  ✓ Found: $repo_name" >&2
-            projects+="$repo_name|$dir"$'\n'
-            found_count=$((found_count + 1))
-        fi
-    done
-
-    if [[ $found_count -eq 0 ]]; then
-        error "No git repositories found in: $search_dir" >&2
-        exit 1
-    fi
-
-    # Generate temporary config file
-    cat > "$temp_config" << 'EOF'
-version: "1"
-projects:
-EOF
-
-    while IFS='|' read -r name path; do
-        [[ -z "$name" ]] && continue
-        echo "  $name:" >> "$temp_config"
-        echo "    path: $path" >> "$temp_config"
-    done <<< "$projects"
-
-    success "Discovered $found_count repositories" >&2
-
-    # Return path to temp config (only thing on stdout)
-    echo "$temp_config"
-}
-
-# Find .claude-projects.yml config file
-# Search order: --config flag > ./.claude-projects.yml > ./.devcontainer/claude-projects.yml
-find_config_file() {
-    local search_dir="${1:-.}"
-    local config_file=""
-
-    # If CONFIG_FILE is set via --config flag, use it directly
-    if [[ -n "${CONFIG_FILE:-}" ]]; then
-        if [[ -f "$CONFIG_FILE" ]]; then
-            echo "$CONFIG_FILE"
-            return 0
-        else
-            error "Config file not found: $CONFIG_FILE"
-            exit 1
-        fi
-    fi
-
-    # Search in standard locations
-    for candidate in \
-        "$search_dir/.claude-projects.yml" \
-        "$search_dir/.devcontainer/claude-projects.yml" \
-        "$search_dir/claude-projects.yml"; do
-        if [[ -f "$candidate" ]]; then
-            echo "$candidate"
-            return 0
-        fi
-    done
-
-    # Not found - return empty (will fall back to single-repo mode)
-    return 1
-}
-
-# Parse YAML config file and extract project mappings
-# Returns newline-delimited format: "project_name|absolute_path"
-parse_config_file() {
-    local config_file="$1"
-    local config_dir
-    config_dir="$(cd "$(dirname "$config_file")" && pwd)"
-
-    # Try yq first (most robust), fall back to Python
-    if command -v yq &>/dev/null; then
-        # Parse with yq: extract project names and paths
-        local yq_output
-        yq_output=$(yq eval '.projects | to_entries | .[] | .key + "|" + .value.path' "$config_file" 2>/dev/null) || {
-            error "Failed to parse config file with yq"
-            exit 1
-        }
-
-        # Resolve relative paths to absolute
-        while IFS='|' read -r proj_name proj_path; do
-            if [[ "$proj_path" != /* ]]; then
-                proj_path="$(cd "$config_dir" && cd "$proj_path" && pwd)"
-            fi
-            echo "$proj_name|$proj_path"
-        done <<< "$yq_output"
-    elif command -v python3 &>/dev/null; then
-        # Fallback to Python
-        python3 -c "
-import sys, yaml, os
-
-try:
-    with open('$config_file', 'r') as f:
-        config = yaml.safe_load(f)
-
-    if not config or 'projects' not in config:
-        print('Error: Config must have \"projects\" key', file=sys.stderr)
-        sys.exit(1)
-
-    for name, info in config['projects'].items():
-        if not isinstance(info, dict) or 'path' not in info:
-            print(f'Error: Project \"{name}\" missing \"path\" field', file=sys.stderr)
-            sys.exit(1)
-
-        path = info['path']
-        # Resolve relative paths
-        if not os.path.isabs(path):
-            path = os.path.abspath(os.path.join('$config_dir', path))
-
-        print(f'{name}|{path}')
-except yaml.YAMLError as e:
-    print(f'Error: Invalid YAML: {e}', file=sys.stderr)
-    sys.exit(1)
-except Exception as e:
-    print(f'Error: {e}', file=sys.stderr)
-    sys.exit(1)
-" || {
-            error "Failed to parse config file with Python"
-            exit 1
-        }
-    else
-        show_yaml_parser_install_help
-        exit 1
-    fi
-}
-
-# Validate config file and all project paths
-validate_config() {
-    local config_file="$1"
-    local projects
-
-    # Check for YAML parser before proceeding
-    if ! check_yaml_parser_available; then
-        show_yaml_parser_install_help
-        exit 1
-    fi
-
-    info "Validating multi-project config..."
-
-    # Parse projects
-    if ! projects=$(parse_config_file "$config_file"); then
-        error "Failed to parse config file"
-        exit 1
-    fi
-
-    if [[ -z "$projects" ]]; then
-        error "No projects defined in config file"
-        exit 1
-    fi
-
-    # Track project names to check for duplicates
-    declare -A seen_names
-
-    # Validate each project
-    while IFS='|' read -r proj_name proj_path; do
-        # Check for duplicate names
-        if [[ -n "${seen_names[$proj_name]:-}" ]]; then
-            error "Duplicate project name: $proj_name"
-            exit 1
-        fi
-        seen_names[$proj_name]=1
-
-        # Check for reserved names
-        case "$proj_name" in
-            .git|.claude|.devcontainer|workspace|session)
-                error "Reserved project name: $proj_name"
-                exit 1
-                ;;
-        esac
-
-        # Validate path exists
-        if [[ ! -d "$proj_path" ]]; then
-            error "Project '$proj_name': path does not exist: $proj_path"
-            exit 1
-        fi
-
-        # Validate it's a git repo
-        if [[ ! -d "$proj_path/.git" ]]; then
-            error "Project '$proj_name': not a git repository: $proj_path"
-            exit 1
-        fi
-
-        info "  ✓ $proj_name: $proj_path"
-    done <<< "$projects"
-
-    success "Config validation passed"
-}
-
-# Check if a volume contains multi-project config
-has_multi_project_config() {
-    local volume="$1"
-    local git_image="${IMAGE_NAME:-$DEFAULT_IMAGE}"
-
-    # Check if .claude-projects.yml exists in volume
-    docker run --rm \
-        -v "$volume:/session:ro" \
-        "$git_image" \
-        sh -c 'test -f /session/.claude-projects.yml' 2>/dev/null
-}
-
-# Create multi-project git session from config file
-create_multi_project_session() {
-    local name="$1"
-    local config_file="$2"
-    local volume="claude-session-${name}"
-
-    # Check if session already exists
-    if docker volume inspect "$volume" &>/dev/null; then
-        info "Resuming existing multi-project session: $name"
-        return 0
-    fi
-
-    # Validate config first (fail fast)
-    validate_config "$config_file"
-
-    # Parse projects
-    local projects
-    projects=$(parse_config_file "$config_file")
-
-    info "Creating multi-project session: $name"
-    docker volume create "$volume" >/dev/null
-
-    local git_image="${IMAGE_NAME:-$DEFAULT_IMAGE}"
-    local host_uid
-    host_uid=$(get_host_uid)
-
-    # Verify projects variable is populated
-    if [[ -z "$projects" ]]; then
-        error "No projects to clone (parse result was empty)"
-        docker volume rm "$volume" >/dev/null 2>&1
-        exit 1
-    fi
-
-    # Create config file with absolute paths using temp file (avoids env var size limits)
-    info "Storing config in session volume..."
-    local temp_config="$CACHE_DIR/session-config-$$.yml"
-    mkdir -p "$CACHE_DIR"
-
-    # Write config to temp file (streaming, not accumulating in memory)
-    {
-        echo 'version: "1"'
-        echo 'projects:'
-        while IFS='|' read -r proj_name proj_path; do
-            [[ -z "$proj_name" ]] && continue
-            echo "  ${proj_name}:"
-            echo "    path: ${proj_path}"
-        done <<< "$projects"
-    } > "$temp_config"
-
-    # Copy via mounted temp file (works for any size)
-    if ! docker run --rm \
-        -v "$temp_config:/tmp/config.yml:ro" \
-        -v "$volume:/session" \
-        "$git_image" \
-        cp /tmp/config.yml /session/.claude-projects.yml 2>&1; then
-        error "Failed to store config in volume"
-        rm -f "$temp_config"
-        docker volume rm "$volume" >/dev/null 2>&1
-        exit 1
-    fi
-    rm -f "$temp_config"  # Clean up immediately
-
-    info "Config stored successfully"
-
-    # Clone each project into its subdirectory
-    local project_count=0
-    while IFS='|' read -r project_name source_path; do
-        [[ -z "$project_name" ]] && continue  # Skip empty lines
-        project_count=$((project_count + 1))
-
-        info "Cloning project '$project_name' from $source_path..."
-
-        # Clone repo into /session/{project_name}/
-        local clone_output
-        if ! clone_output=$(docker run --rm \
-            -v "$source_path:/source:ro" \
-            -v "$volume:/session" \
-            "$git_image" \
-            sh -c "git config --global --add safe.directory '*' && \
-                   git clone /source /session/$project_name" 2>&1); then
-            error "Failed to clone project '$project_name':"
-            echo "$clone_output" >&2
-            docker volume rm "$volume" >/dev/null 2>&1
-            exit 1
-        fi
-
-        # Configure the cloned repo
-        docker run --rm \
-            -v "$volume:/session" \
-            "$git_image" \
-            sh -c "
-                cd /session/$project_name
-                git config --global --add safe.directory '*'
-                git remote remove origin 2>/dev/null || true
-                git config user.email 'claude@container'
-                git config user.name 'Claude'
-            "
-
-        success "  ✓ Cloned: $project_name"
-    done <<< "$projects"
-
-    # Fix ownership for all projects in one batch operation
-    info "Fixing ownership..."
-    docker run --rm \
-        -v "$volume:/session" \
-        -e "HOST_UID=$host_uid" \
-        "$git_image" \
-        sh -c 'chown -R ${HOST_UID:-1000}:${HOST_UID:-1000} /session'
-
-    success "Multi-project session created: $name ($project_count projects)"
-}
-
-# Git-based session isolation - clones repo into volume, strips remotes
-# This replaces privileged overlay mode with a safer git-based approach
-create_git_session() {
-    local name="$1"
-    local source_dir="$2"
-    local volume="claude-session-${name}"
-
-    # Check for --discover-repos flag (highest priority)
-    if [[ -n "${DISCOVER_REPOS_DIR:-}" ]]; then
-        local discovered_config
-        discovered_config=$(discover_repos_in_dir "$DISCOVER_REPOS_DIR")
-        create_multi_project_session "$name" "$discovered_config"
-        rm -f "$discovered_config"  # Clean up temp file
-        return $?
-    fi
-
-    # Check for multi-project config file
-    local config_file
-    if config_file=$(find_config_file "$source_dir"); then
-        info "Multi-project config detected: $config_file"
-        create_multi_project_session "$name" "$config_file"
-        return $?
-    fi
-
-    # Check if session already exists
-    if docker volume inspect "$volume" &>/dev/null; then
-        info "Resuming existing git session: $name"
-        return 0
-    fi
-
-    # Verify source directory exists and is a git repo
-    if [[ ! -d "$source_dir" ]]; then
-        error "Source directory does not exist: $source_dir"
-        exit 1
-    fi
-    if [[ ! -d "$source_dir/.git" ]]; then
-        error "Source directory is not a git repository: $source_dir"
-        exit 1
-    fi
-
-    info "Creating git session: $name"
-    docker volume create "$volume" >/dev/null
-
-    # Clone repo into volume, strip remotes for safety
-    # Use main image (has git) instead of pulling alpine/git
-    local git_image="${IMAGE_NAME:-$DEFAULT_IMAGE}"
-    info "Cloning repository into session volume..."
-
-    # Run clone and capture exit status
-    # Mark /source as safe to avoid "dubious ownership" errors (container user != host user)
-    local host_uid
-    host_uid=$(get_host_uid)
-    local clone_output
-    if ! clone_output=$(docker run --rm \
-        -v "$source_dir:/source:ro" \
-        -v "$volume:/session" \
-        "$git_image" \
-        sh -c 'git config --global --add safe.directory "*" && git clone /source /session' 2>&1); then
-        error "Git clone failed:"
-        echo "$clone_output" >&2
-        docker volume rm "$volume" >/dev/null 2>&1
-        exit 1
-    fi
-
-    # Configure the cloned repo and fix ownership for developer user
-    docker run --rm \
-        -v "$volume:/session" \
-        -e "HOST_UID=$host_uid" \
-        "$git_image" \
-        sh -c '
-            cd /session
-            git config --global --add safe.directory "*"
-            git remote remove origin 2>/dev/null || true
-            git config user.email "claude@container"
-            git config user.name "Claude"
-            chown -R ${HOST_UID:-1000}:${HOST_UID:-1000} /session
-        '
-
-    success "Git session created: $name"
-}
-
-# Show diff for multi-project session
-diff_multi_project_session() {
-    local name="$1"
-    local source_dir="$2"
-    local project_filter="${3:-}"
-    local volume="claude-session-${name}"
-    local git_image="${IMAGE_NAME:-$DEFAULT_IMAGE}"
-
-    # Extract config from volume to get project mappings
-    local config_data
-    config_data=$(docker run --rm \
-        -v "$volume:/session:ro" \
-        "$git_image" \
-        cat /session/.claude-projects.yml 2>/dev/null) || {
-        error "Failed to read config from session volume"
-        exit 1
-    }
-
-    # Parse config to get project list (name|path pairs)
-    local projects
-    # Create temp file for config
-    local temp_config="$CACHE_DIR/temp-config-$$.yml"
-    mkdir -p "$CACHE_DIR"
-    echo "$config_data" > "$temp_config"
-    trap "rm -f '$temp_config'" RETURN
-
-    projects=$(parse_config_file "$temp_config")
-
-    # If project filter specified, show detailed diff for that project only
-    if [[ -n "$project_filter" ]]; then
-        local found=false
-        while IFS='|' read -r project_name source_path; do
-            if [[ "$project_name" == "$project_filter" ]]; then
-                found=true
-                info "Comparing project '$project_name' with source: $source_path"
-                echo ""
-
-                # Show commits made in this project
-                echo "=== Commits in session (project: $project_name) ==="
-                docker run --rm \
-                    -v "$volume:/session:ro" \
-                    "$git_image" \
-                    sh -c "
-                        git config --global --add safe.directory '*'
-                        cd /session/$project_name
-                        initial=\$(git rev-list --max-parents=0 HEAD 2>/dev/null | tail -1)
-                        git log --oneline \"\$initial\"..HEAD 2>/dev/null || git log --oneline -10
-                    "
-
-                echo ""
-                echo "=== File changes (session vs source) ==="
-                docker run --rm \
-                    -v "$source_path:/source:ro" \
-                    -v "$volume:/session:ro" \
-                    "$git_image" \
-                    sh -c "
-                        git config --global --add safe.directory '*'
-                        cd /session/$project_name
-                        git remote add source /source 2>/dev/null || true
-                        git fetch source --quiet 2>/dev/null || true
-                        git diff --stat source/HEAD HEAD 2>/dev/null || \
-                            echo '  (unable to compare - source may not be a git repo)'
-                    "
-                break
-            fi
-        done <<< "$projects"
-
-        if ! $found; then
-            error "Project not found in session: $project_filter"
-            echo "Available projects:"
-            while IFS='|' read -r project_name source_path; do
-                echo "  - $project_name"
-            done <<< "$projects"
-            exit 1
-        fi
-        return 0
-    fi
-
-    # No filter - show summary of all projects
-    info "Multi-project session: $name"
-    echo ""
-
-    while IFS='|' read -r project_name source_path; do
-        # Count commits in this project
-        local commit_count
-        commit_count=$(docker run --rm \
-            -v "$volume:/session:ro" \
-            "$git_image" \
-            sh -c "
-                git config --global --add safe.directory '*'
-                cd /session/$project_name 2>/dev/null || exit 0
-                initial=\$(git rev-list --max-parents=0 HEAD 2>/dev/null | tail -1)
-                git rev-list --count \"\$initial\"..HEAD 2>/dev/null || echo 0
-            ") || echo "0"
-
-        echo "Project: $project_name ($commit_count commits)"
-
-        if [[ "$commit_count" -gt 0 ]]; then
-            # Show commit messages
-            docker run --rm \
-                -v "$volume:/session:ro" \
-                "$git_image" \
-                sh -c "
-                    git config --global --add safe.directory '*'
-                    cd /session/$project_name
-                    initial=\$(git rev-list --max-parents=0 HEAD 2>/dev/null | tail -1)
-                    git log --oneline \"\$initial\"..HEAD 2>/dev/null | sed 's/^/  /'
-                "
-        else
-            echo "  (no changes)"
-        fi
-        echo ""
-    done <<< "$projects"
-
-    echo "Tip: Use --diff-session $name <project-name> to see detailed changes for a specific project"
-}
-
-# Show diff between git session and original repo
-diff_git_session() {
-    local name="$1"
-    local source_dir="$2"
-    local project_filter="${3:-}"
-    local volume="claude-session-${name}"
-
-    # Check if session exists
-    if ! docker volume inspect "$volume" &>/dev/null; then
-        error "Session not found: $name"
-        exit 1
-    fi
-
-    # Check if this is a multi-project session
-    if has_multi_project_config "$volume"; then
-        diff_multi_project_session "$name" "$source_dir" "$project_filter"
-        return $?
-    fi
-
-    local git_image="${IMAGE_NAME:-$DEFAULT_IMAGE}"
-    info "Comparing session '$name' with source repository..."
-    echo ""
-
-    # Show commits made in session
-    echo "=== Commits in session ==="
-    docker run --rm \
-        -v "$volume:/session:ro" \
-        "$git_image" \
-        sh -c '
-            git config --global --add safe.directory "*"
-            cd /session
-            # Get the initial commit (the clone point)
-            initial=$(git rev-list --max-parents=0 HEAD 2>/dev/null | tail -1)
-            # Show commits after initial
-            git log --oneline "$initial"..HEAD 2>/dev/null || git log --oneline -10
-        '
-
-    echo ""
-    echo "=== File changes (session vs source) ==="
-    docker run --rm \
-        -v "$source_dir:/source:ro" \
-        -v "$volume:/session:ro" \
-        "$git_image" \
-        sh -c '
-            git config --global --add safe.directory "*"
-            cd /session
-            # Create a temporary remote to compare
-            git remote add source /source 2>/dev/null || true
-            git fetch source --quiet 2>/dev/null || true
-            # Show diff against source
-            git diff --stat source/HEAD HEAD 2>/dev/null || \
-                echo "  (unable to compare - source may not be a git repo)"
-        '
-}
-
-# Merge multi-project session commits back to source repositories
-merge_multi_project_session() {
-    local name="$1"
-    local target_dir="$2"
-    local target_branch="${3:-}"
-    local auto_mode="${4:-false}"
-    local volume="claude-session-${name}"
-    local git_image="${IMAGE_NAME:-$DEFAULT_IMAGE}"
-
-    info "Merging multi-project session: $name"
-    echo ""
-
-    # Extract config from volume
-    local config_data
-    config_data=$(docker run --rm \
-        -v "$volume:/session:ro" \
-        "$git_image" \
-        cat /session/.claude-projects.yml 2>/dev/null) || {
-        error "Failed to read config from session volume"
-        exit 1
-    }
-
-    # Parse config
-    local temp_config="$CACHE_DIR/temp-config-$$.yml"
-    mkdir -p "$CACHE_DIR"
-    echo "$config_data" > "$temp_config"
-    trap "rm -f '$temp_config'" RETURN
-
-    local projects
-    projects=$(parse_config_file "$temp_config")
-
-    # Analyze each project to see which have commits
-    declare -A project_commits
-    declare -A project_paths
-    local has_changes=false
-
-    echo "Projects to merge:"
-    while IFS='|' read -r project_name source_path; do
-        project_paths[$project_name]="$source_path"
-
-        # Count commits
-        local commit_count
-        commit_count=$(docker run --rm \
-            -v "$volume:/session:ro" \
-            "$git_image" \
-            sh -c "
-                git config --global --add safe.directory '*'
-                cd /session/$project_name 2>/dev/null || exit 0
-                initial=\$(git rev-list --max-parents=0 HEAD 2>/dev/null | tail -1)
-                git rev-list --count \"\$initial\"..HEAD 2>/dev/null || echo 0
-            ") || echo "0"
-
-        project_commits[$project_name]=$commit_count
-
-        if [[ "$commit_count" -gt 0 ]]; then
-            echo "  [x] $project_name ($commit_count commits)"
-            has_changes=true
-        else
-            echo "  [ ] $project_name (0 commits - skipped)"
-        fi
-    done <<< "$projects"
-
-    if ! $has_changes; then
-        warn "No changes to merge in any project"
-        return 0
-    fi
-
-    echo ""
-
-    # Confirm merge
-    if [[ "$auto_mode" == "true" ]]; then
-        choice="y"
-    else
-        read -p "Merge all selected? [y/n] " choice
-    fi
-
-    if [[ "$choice" != "y" && "$choice" != "Y" ]]; then
-        echo "Cancelled"
-        return 0
-    fi
-
-    # Prepare patch directory
-    local patch_cache="$CACHE_DIR"
-    mkdir -p "$patch_cache"
-    local patch_dir="$patch_cache/merge-multi-$$-$(date +%s)"
-    mkdir -p "$patch_dir"
-    trap "rm -rf $patch_dir $temp_config" RETURN
-
-    # Merge each project with commits
-    local success_count=0
-    local fail_count=0
-
-    for project_name in "${!project_commits[@]}"; do
-        local commit_count="${project_commits[$project_name]}"
-        if [[ "$commit_count" -eq 0 ]]; then
-            continue
-        fi
-
-        local source_path="${project_paths[$project_name]}"
-        echo ""
-        info "Merging project: $project_name"
-
-        # Verify source path is a git repo
-        if [[ ! -d "$source_path/.git" ]]; then
-            error "  Source is not a git repo: $source_path"
-            fail_count=$((fail_count + 1))
-            continue
-        fi
-
-        # Handle branch switching if specified
-        if [[ -n "$target_branch" ]]; then
-            cd "$source_path"
-            if git show-ref --verify --quiet "refs/heads/$target_branch"; then
-                info "  Switching to existing branch: $target_branch"
-                git checkout "$target_branch"
-            else
-                info "  Creating new branch: $target_branch"
-                git checkout -b "$target_branch"
-            fi
-        fi
-
-        # Create project-specific patch directory
-        local project_patch_dir="$patch_dir/$project_name"
-        mkdir -p "$project_patch_dir"
-
-        # Export patches from session
-        docker run --rm \
-            -v "$volume:/session:ro" \
-            -v "$project_patch_dir:/patches" \
-            "$git_image" \
-            sh -c "
-                git config --global --add safe.directory '*'
-                cd /session/$project_name
-                initial=\$(git rev-list --max-parents=0 HEAD 2>/dev/null | tail -1)
-                git format-patch -o /patches \"\$initial\"..HEAD 2>/dev/null || \
-                    git format-patch -o /patches -10
-            "
-
-        # Apply patches
-        cd "$source_path"
-        local patch_count
-        patch_count=$(ls -1 "$project_patch_dir"/*.patch 2>/dev/null | wc -l | tr -d ' ')
-
-        if [[ "$patch_count" -eq 0 ]]; then
-            warn "  No patches to apply for $project_name"
-            continue
-        fi
-
-        local project_success=true
-        for patch in "$project_patch_dir"/*.patch; do
-            if git am "$patch"; then
-                success "  Applied: $(basename "$patch")"
-            else
-                error "  Failed to apply: $(basename "$patch")"
-                echo "  Run 'git am --abort' to cancel in: $source_path"
-                project_success=false
-                break
-            fi
-        done
-
-        if $project_success; then
-            success "  Merged $patch_count commit(s) to $project_name"
-            success_count=$((success_count + 1))
-        else
-            fail_count=$((fail_count + 1))
-        fi
-    done
-
-    echo ""
-    if [[ $fail_count -eq 0 ]]; then
-        success "Successfully merged all projects ($success_count projects)"
-
-        if [[ "$auto_mode" != "true" ]]; then
-            echo ""
-            read -p "Delete session '$name'? [y/n] " delete_choice
-            if [[ "$delete_choice" == "y" ]]; then
-                docker volume rm "$volume" >/dev/null
-                success "Session deleted: $name"
-            fi
-        fi
-    else
-        error "Merge completed with errors ($success_count succeeded, $fail_count failed)"
-        return 1
-    fi
-}
-
-# Merge session commits back to original repo
-merge_git_session() {
-    local name="$1"
-    local target_dir="$2"
-    local target_branch="${3:-}"
-    local auto_mode="${4:-false}"
-    local volume="claude-session-${name}"
-
-    # Check if session exists
-    if ! docker volume inspect "$volume" &>/dev/null; then
-        error "Session not found: $name"
-        exit 1
-    fi
-
-    # Check if this is a multi-project session
-    if has_multi_project_config "$volume"; then
-        merge_multi_project_session "$name" "$target_dir" "$target_branch" "$auto_mode"
-        return $?
-    fi
-
-    # Check if target is a git repo
-    if [[ ! -d "$target_dir/.git" ]]; then
-        error "Target directory is not a git repository: $target_dir"
-        exit 1
-    fi
-
-    local git_image="${IMAGE_NAME:-$DEFAULT_IMAGE}"
-
-    # Handle target branch
-    if [[ -n "$target_branch" ]]; then
-        info "Merging session '$name' into branch: $target_branch"
-        cd "$target_dir"
-        # Create branch if it doesn't exist, or switch to it
-        if git show-ref --verify --quiet "refs/heads/$target_branch"; then
-            info "Switching to existing branch: $target_branch"
-            git checkout "$target_branch"
-        else
-            info "Creating new branch: $target_branch"
-            git checkout -b "$target_branch"
-        fi
-    else
-        info "Merging session '$name' into: $target_dir (current branch)"
-    fi
-    echo ""
-
-    # Show what will be merged
-    echo "=== Commits to merge ==="
-    docker run --rm \
-        -v "$volume:/session:ro" \
-        "$git_image" \
-        sh -c '
-            git config --global --add safe.directory "*"
-            cd /session
-            initial=$(git rev-list --max-parents=0 HEAD 2>/dev/null | tail -1)
-            git log --oneline "$initial"..HEAD 2>/dev/null || git log --oneline -10
-        '
-
-    echo ""
-
-    if [[ "$auto_mode" == "true" ]]; then
-        choice="y"
-    else
-        read -p "Merge all commits? [y/n/select] " choice
-    fi
-
-    case "$choice" in
-        y|Y)
-            info "Exporting and applying patches..."
-
-            # Create temp directory for patches
-            # Use Docker-accessible path (mktemp -d creates /var/folders/... on macOS which Docker can't mount)
-            local patch_cache="$CACHE_DIR"
-            mkdir -p "$patch_cache"
-            local patch_dir="$patch_cache/merge-$$-$(date +%s)"
-            mkdir -p "$patch_dir"
-            trap "rm -rf $patch_dir" RETURN
-
-            # Export patches from session
-            docker run --rm \
-                -v "$volume:/session:ro" \
-                -v "$patch_dir:/patches" \
-                "$git_image" \
-                sh -c '
-                    git config --global --add safe.directory "*"
-                    cd /session
-                    initial=$(git rev-list --max-parents=0 HEAD 2>/dev/null | tail -1)
-                    git format-patch -o /patches "$initial"..HEAD 2>/dev/null || \
-                        git format-patch -o /patches -10
-                '
-
-            # Apply patches to target
-            cd "$target_dir"
-            local patch_count
-            patch_count=$(ls -1 "$patch_dir"/*.patch 2>/dev/null | wc -l | tr -d ' ')
-
-            if [[ "$patch_count" -eq 0 ]]; then
-                warn "No patches to apply"
-                return 0
-            fi
-
-            for patch in "$patch_dir"/*.patch; do
-                if git am "$patch"; then
-                    success "Applied: $(basename "$patch")"
-                else
-                    error "Failed to apply: $(basename "$patch")"
-                    echo "Run 'git am --abort' to cancel or 'git am --skip' to skip this patch"
-                    return 1
-                fi
-            done
-
-            success "Successfully merged $patch_count commit(s)"
-
-            # In auto mode, don't prompt to delete (preserve session for --continue)
-            if [[ "$auto_mode" != "true" ]]; then
-                echo ""
-                read -p "Delete session '$name'? [y/n] " delete_choice
-                if [[ "$delete_choice" == "y" ]]; then
-                    docker volume rm "$volume" >/dev/null
-                    success "Session deleted: $name"
-                fi
-            fi
-            ;;
-        n|N)
-            echo "Cancelled"
-            ;;
-        select|s|S)
-            warn "Interactive selection not yet implemented"
-            echo "Use 'git cherry-pick' manually after inspecting the session"
-            ;;
-        *)
-            echo "Invalid choice"
-            ;;
-    esac
-}
+# Docker args accumulator
+declare -a DOCKER_ARGS
 
 # Handle cleanup commands (before main argument parsing)
 case "${1:-}" in
     --cleanup)
-        echo "Cleaning up claude-container resources..."
-
-        # List volumes
-        volumes=$(docker volume ls -q | grep -E "^(claude-session-|claude-state-|claude-cargo-|claude-npm-|claude-pip-|session-data-)" || true)
-
-        if [[ -z "$volumes" ]]; then
-            echo "No volumes to clean up"
-            exit 0
-        fi
-
-        echo "Found volumes:"
-        echo "$volumes" | sed 's/^/  /'
-        echo ""
-
-        read -p "Delete all? [y/n] " confirm
-        if [[ "$confirm" == "y" ]]; then
-            echo "$volumes" | xargs docker volume rm
-            echo "Done"
-        else
-            echo "Cancelled"
-        fi
+        session_cleanup
         exit 0
         ;;
 
     --list-sessions|--sessions)
-        # Get all claude volumes
-        all_volumes=$(docker volume ls -q | grep -E "^(claude-session-|claude-state-|claude-cargo-|claude-npm-|claude-pip-)" || true)
-
-        if [[ -z "$all_volumes" ]]; then
-            echo "No claude-container sessions found."
-            exit 0
-        fi
-
-        # Extract unique session names
-        declare -A sessions
-        while read -r vol; do
-            [[ -z "$vol" ]] && continue
-            session_name=""
-            case "$vol" in
-                claude-session-*) session_name="${vol#claude-session-}" ;;
-                claude-state-*)   session_name="${vol#claude-state-}" ;;
-                claude-cargo-*)   session_name="${vol#claude-cargo-}" ;;
-                claude-npm-*)     session_name="${vol#claude-npm-}" ;;
-                claude-pip-*)     session_name="${vol#claude-pip-}" ;;
-            esac
-            [[ -n "$session_name" ]] && sessions[$session_name]=1
-        done <<< "$all_volumes"
-
-        # Build mount arguments for all volumes at once
-        echo "Scanning $(echo "$all_volumes" | wc -l | tr -d ' ') volumes..."
-        mount_args=""
-        vol_list=""
-        while read -r vol; do
-            [[ -z "$vol" ]] && continue
-            mount_args="$mount_args -v $vol:/$vol:ro"
-            vol_list="$vol_list $vol"
-        done <<< "$all_volumes"
-
-        # Get all sizes in one container run (much faster!)
-        sizes=$(docker run --rm $mount_args alpine sh -c '
-            for dir in /claude-*/; do
-                [ -d "$dir" ] || continue
-                name=$(basename "$dir")
-                size=$(du -sh "$dir" 2>/dev/null | cut -f1)
-                echo "$name $size"
-            done
-        ' 2>/dev/null || echo "")
-
-        # Parse sizes into associative array
-        declare -A vol_sizes
-        while read -r vol size; do
-            [[ -z "$vol" ]] && continue
-            vol_sizes[$vol]="$size"
-        done <<< "$sizes"
-
-        # Display table
-        echo ""
-        printf "%-30s %10s %10s %10s %10s %10s\n" "SESSION" "WORKSPACE" "STATE" "CARGO" "NPM" "PIP"
-        printf "%-30s %10s %10s %10s %10s %10s\n" "-------" "---------" "-----" "-----" "---" "---"
-
-        for session in $(echo "${!sessions[@]}" | tr ' ' '\n' | sort); do
-            ws="${vol_sizes[claude-session-$session]:-"-"}"
-            st="${vol_sizes[claude-state-$session]:-"-"}"
-            ca="${vol_sizes[claude-cargo-$session]:-"-"}"
-            np="${vol_sizes[claude-npm-$session]:-"-"}"
-            pi="${vol_sizes[claude-pip-$session]:-"-"}"
-            printf "%-30s %10s %10s %10s %10s %10s\n" "$session" "$ws" "$st" "$ca" "$np" "$pi"
-        done
-
-        # Calculate total size across all volumes
-        total=$(docker run --rm $mount_args alpine sh -c '
-            du -sh /claude-*/ 2>/dev/null | awk "{sum+=\$1} END {print sum}"
-        ' 2>/dev/null || echo "?")
-        total_human=$(docker run --rm $mount_args alpine sh -c 'du -sch /claude-*/ 2>/dev/null | tail -1 | cut -f1' 2>/dev/null || echo "?")
-
-        echo ""
-        echo "Total disk usage: $total_human"
-        echo ""
-        echo "Commands:"
-        echo "  Delete session:  ./claude-container --delete-session <name>"
-        echo "  Delete all:      ./claude-container --cleanup"
+        session_list
         exit 0
         ;;
 
     --delete-session)
-        if [[ -z "${2:-}" ]]; then
-            echo "Error: --delete-session requires a session name"
-            echo "Usage: claude-container --delete-session <name>"
-            exit 1
-        fi
-        session="$2"
-        deleted=false
-
-        # Try to delete all possible volume patterns for this session
-        for pattern in "claude-session-${session}" "claude-state-${session}" "claude-cargo-${session}" "claude-npm-${session}" "claude-pip-${session}" "session-data-${session}"; do
-            if docker volume inspect "$pattern" &>/dev/null; then
-                docker volume rm "$pattern"
-                echo "Deleted: $pattern"
-                deleted=true
-            fi
-        done
-
-        if ! $deleted; then
-            echo "No volumes found for session: $session"
-            exit 1
-        fi
-        echo "Done"
+        session_delete "$2"
         exit 0
         ;;
 
     --restart-session)
-        if [[ -z "${2:-}" ]]; then
-            echo "Error: --restart-session requires a session name"
-            echo "Usage: claude-container --restart-session <name> [options]"
-            exit 1
-        fi
-        session="$2"
-        shift 2
-        extra_args=("$@")  # Capture remaining args (e.g., --as-rootish)
-
-        # Find and stop any running container for this session
-        running=$(docker ps -q --filter "name=claude-dev-" 2>/dev/null || true)
-        if [[ -n "$running" ]]; then
-            info "Stopping running container..."
-            docker stop $running >/dev/null 2>&1 || true
-        fi
-
-        # Fix permissions on existing volumes before restart
-        info "Fixing volume permissions..."
-        docker run --rm \
-            -v "claude-cargo-${session}:/cargo" \
-            -v "claude-npm-${session}:/npm" \
-            -v "claude-pip-${session}:/pip" \
-            -v "claude-state-${session}:/state" \
-            alpine sh -c 'chown -R 1000:1000 /cargo /npm /pip /state 2>/dev/null || true'
-
-        # Re-exec with same session + continue + any extra args
-        info "Restarting session: $session"
-        exec "$0" --git-session "$session" --continue "${extra_args[@]}"
+        shift
+        session_restart "$@"
+        exit 0
         ;;
 
     --diff-session)
-        if [[ -z "${2:-}" ]]; then
-            echo "Error: --diff-session requires a session name"
-            echo "Usage: claude-container --diff-session <name> [project-name]"
-            exit 1
-        fi
-        session_name="$2"
-        project_filter="${3:-}"
-        diff_git_session "$session_name" "$(pwd)" "$project_filter"
+        session_diff "$2" "$(pwd)" "${3:-}"
         exit 0
         ;;
 
     --merge-session)
-        if [[ -z "${2:-}" ]]; then
-            echo "Error: --merge-session requires a session name"
-            echo "Usage: claude-container --merge-session <name> [--into <branch>] [--auto]"
-            exit 1
-        fi
-        session_name="$2"
-        target_branch=""
-        auto_mode=false
-        shift 2
-        # Parse options
-        while [[ $# -gt 0 ]]; do
-            case $1 in
-                --into)
-                    target_branch="$2"
-                    shift 2
-                    ;;
-                --auto)
-                    auto_mode=true
-                    shift
-                    ;;
-                *)
-                    shift
-                    ;;
-            esac
-        done
-        merge_git_session "$session_name" "$(pwd)" "$target_branch" "$auto_mode"
+        shift
+        session_merge "$@"
         exit 0
         ;;
-
 esac
 
 # Parse arguments
@@ -1437,79 +157,33 @@ Options:
   --dir, -d <path>         Directory to use with overlay (changes persist in session volume)
                            DEPRECATED: Use --git-session instead (requires --privileged)
   --git-session, -g <name> Create/resume a git-based isolated session (recommended)
-                           Clones repo into a volume, strips remotes for safety
-                           Claude can commit changes without affecting your working copy
-                           Also uses <name> for state/cache persistence
   --session, -s <name>     Override session name for state persistence (default: "default")
-                           Use this to share state across git sessions or customize naming
   --continue, -c           Continue the most recent Claude conversation
   --as-user                Run as non-root developer user (default: run as root)
   --as-rootish             Run as developer user who owns install dirs (recommended)
   --auto-sync <branch>     Auto-merge session commits to branch on exit
-  --discover-repos <dir>   Auto-discover all git repos in directory and create multi-project session
-                           Example: --discover-repos ~/dev/myprojects
+  --discover-repos <dir>   Auto-discover all git repos in directory
   --config, -C <path>      Explicit path to .claude-projects.yml config file
   --verify, -v             Verify container setup works (run checks and exit)
   --version, -V            Show version
   --help, -h               Show this help
 
-Git Session Management:
-  --git-session, -g <name> Create or resume a git-based session (uses <name> for all volumes)
-                           Auto-detects .claude-projects.yml for multi-project mode
-  --restart-session <name> Restart a session (fixes permissions, continues conversation)
-  --diff-session <name> [project]
-                           Show changes made in a git session vs original repo
-                           For multi-project sessions: omit project for summary,
-                           or specify project name for detailed diff
-  --merge-session <name> [--into <branch>] [--auto]
-                           Merge session commits back to repo
-                           Multi-project: merges all projects with commits
-                           With --into: creates/switches to branch before applying
-                           With --auto: skip interactive prompts
-
-Multi-Project Sessions:
-  Config file: .claude-projects.yml (auto-detected or use --config)
-  Format:
-    version: "1"
-    projects:
-      frontend:
-        path: ./frontend
-      backend:
-        path: /absolute/path/to/backend
-
-  When config exists, all projects are cloned into /workspace/{name}/
-  Diff and merge commands work across all projects automatically
-
 Session Management:
   --cleanup                List and optionally delete all claude-related volumes
   --list-sessions, --sessions  List all sessions with disk usage per volume
   --delete-session <name>  Delete a specific session and all its volumes
+  --restart-session <name> Restart a session (fixes permissions, continues conversation)
+  --diff-session <name>    Show changes made in a git session vs original repo
+  --merge-session <name>   Merge session commits back to repo
 
 Environment:
   CLAUDE_CODE_OAUTH_TOKEN   OAuth token for authentication (required)
                             Get one with: claude setup-token
 
-Dockerfile search order:
-  1. Explicit path argument
-  2. ./Dockerfile
-  3. ./.devcontainer/Dockerfile
-  4. ./docker/Dockerfile
-  5. Default image: $DEFAULT_IMAGE (if no Dockerfile found)
-
-The container will have:
-  - Current directory mounted at /workspace (or git clone if --git-session used)
-  - Claude Code CLI available
-  - Git configured from host
-  - SSH agent forwarded
-
 Examples:
   claude-container                        # Start with current dir mounted
-  claude-container --git-session feature  # Start git session "feature" (uses "feature" for all state)
+  claude-container --git-session feature  # Start git session "feature"
   claude-container -g feature --continue  # Resume session AND continue conversation
-  claude-container -g feat1 --session shared  # Git session "feat1" but share state with "shared"
-  claude-container --restart-session feature  # Restart session, fix perms, continue
-  claude-container --diff-session feature # See what changed in the session
-  claude-container --merge-session feature # Apply session commits to repo
 EOF
             exit 0
             ;;
@@ -1525,92 +199,15 @@ if $USE_GIT_SESSION && ! $SESSION_NAME_SET; then
     SESSION_NAME="$GIT_SESSION"
 fi
 
-# Check for token - try multiple sources
-TOKEN_FILE="$CONFIG_DIR/token"
-if [[ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]]; then
-    # Try config file first
-    if [[ -f "$TOKEN_FILE" ]]; then
-        CLAUDE_CODE_OAUTH_TOKEN=$(cat "$TOKEN_FILE")
-        info "Using token from config file"
-    else
-        # Try macOS Keychain (where Claude Code stores its OAuth token)
-        info "No token found, attempting to fetch from keychain..."
-        if [[ "$PLATFORM" == "macos" ]] && command -v security &>/dev/null; then
-            # Claude Code stores token with service "claude.ai"
-            FETCHED_TOKEN=$(security find-generic-password -s "claude.ai" -w 2>/dev/null || true)
-            if [[ -n "$FETCHED_TOKEN" ]]; then
-                CLAUDE_CODE_OAUTH_TOKEN="$FETCHED_TOKEN"
-                # Store for future use
-                echo -n "$FETCHED_TOKEN" > "$TOKEN_FILE"
-                chmod 600 "$TOKEN_FILE"
-                success "Token fetched from Keychain and stored in $TOKEN_FILE"
-            fi
-        fi
-    fi
-
-    # Final check - still no token? Start auth flow
-    if [[ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]]; then
-        warn "No token found in keychain or config"
-        echo ""
-
-        if ! command -v claude &>/dev/null; then
-            error "claude CLI not found"
-            echo ""
-            echo "Install Claude Code first, then run: claude setup-token"
-            exit 1
-        fi
-
-        echo "Starting authentication flow..."
-        echo ""
-
-        # Capture output to extract token
-        AUTH_OUTPUT_FILE="$CACHE_DIR/auth-output-$$"
-
-        # Use script command to provide a proper PTY for claude setup-token
-        if [[ "$PLATFORM" == "macos" ]]; then
-            script -q "$AUTH_OUTPUT_FILE" claude setup-token
-        else
-            script -qc "claude setup-token" "$AUTH_OUTPUT_FILE"
-        fi
-
-        # Extract token from output (sk-ant-oat... pattern ending in AA)
-        # Token may span multiple lines due to terminal wrapping with ANSI codes
-        if [[ -f "$AUTH_OUTPUT_FILE" ]]; then
-            # Strip ANSI codes, join lines, then extract token (ends with AA)
-            FETCHED_TOKEN=$(cat "$AUTH_OUTPUT_FILE" | \
-                sed 's/\x1b\[[0-9;]*[a-zA-Z]//g' | \
-                tr -d '\n\r' | \
-                grep -oE 'sk-ant-oat[A-Za-z0-9_-]+AA' | \
-                head -1 || true)
-            rm -f "$AUTH_OUTPUT_FILE"
-
-            if [[ -n "$FETCHED_TOKEN" ]]; then
-                CLAUDE_CODE_OAUTH_TOKEN="$FETCHED_TOKEN"
-                echo -n "$FETCHED_TOKEN" > "$TOKEN_FILE"
-                chmod 600 "$TOKEN_FILE"
-                success "Token saved to $TOKEN_FILE"
-            else
-                error "Could not extract token from auth output"
-                echo "You may need to manually run: claude setup-token"
-                echo "Then store the token in: $TOKEN_FILE"
-                exit 1
-            fi
-        else
-            error "Auth output file not created"
-            exit 1
-        fi
-    fi
-fi
-export CLAUDE_CODE_OAUTH_TOKEN
+# Ensure token is available (from config, keychain, or interactive auth)
+ensure_token
 
 # Check for YAML parser if we'll need it (multi-project mode)
 if $USE_GIT_SESSION || [[ -n "$CONFIG_FILE" ]]; then
-    # Check if config file exists or will be auto-detected
     will_use_config=false
     if [[ -n "$CONFIG_FILE" ]]; then
         will_use_config=true
     elif $USE_GIT_SESSION; then
-        # Check if config exists in workspace
         workspace="${WORKSPACE_DIR:-$(pwd)}"
         for candidate in \
             "$workspace/.claude-projects.yml" \
@@ -1623,7 +220,6 @@ if $USE_GIT_SESSION || [[ -n "$CONFIG_FILE" ]]; then
         done
     fi
 
-    # If config will be used, verify YAML parser is available
     if $will_use_config && ! check_yaml_parser_available; then
         echo ""
         warn "Multi-project config detected but YAML parser not available"
@@ -1654,7 +250,6 @@ elif [[ ! -f "$DOCKERFILE" ]]; then
 fi
 
 if $USE_DEFAULT_IMAGE; then
-    # Pull default image if not present locally
     IMAGE_EXISTS=$(docker images -q "$IMAGE_NAME" 2>/dev/null)
     if [[ -z "$IMAGE_EXISTS" ]] || $FORCE_BUILD; then
         info "Pulling image: $IMAGE_NAME"
@@ -1666,20 +261,14 @@ if $USE_DEFAULT_IMAGE; then
     fi
 else
     info "Using Dockerfile: $DOCKERFILE"
-
-    # Determine context directory (parent of Dockerfile)
     CONTEXT_DIR="$(dirname "$DOCKERFILE")"
     if [[ "$CONTEXT_DIR" == "." ]]; then
         CONTEXT_DIR="$(pwd)"
     fi
-
-    # Generate image name from current directory
     PROJECT_NAME="$(basename "$(pwd)" | tr '[:upper:]' '[:lower:]' | tr -cd '[:alnum:]-')"
     IMAGE_NAME="claude-dev-${PROJECT_NAME}"
 
-    # Check if image exists or needs rebuild
     IMAGE_EXISTS=$(docker images -q "$IMAGE_NAME" 2>/dev/null)
-
     if [[ -z "$IMAGE_EXISTS" ]] || $FORCE_BUILD; then
         info "Building image: $IMAGE_NAME"
         docker build -t "$IMAGE_NAME" -f "$DOCKERFILE" "$CONTEXT_DIR" &
@@ -1692,7 +281,6 @@ fi
 
 # Prepare mount points
 WORKSPACE_DIR="$(pwd)"
-SSH_AUTH_SOCK="${SSH_AUTH_SOCK:-}"
 USE_OVERLAY=false
 
 # Handle session directory with overlay (deprecated)
@@ -1714,7 +302,6 @@ if $USE_GIT_SESSION; then
     GIT_SESSION_VOLUME="claude-session-${GIT_SESSION}"
     create_git_session "$GIT_SESSION" "$WORKSPACE_DIR"
 
-    # Exit early if --no-run specified (session created, don't launch container)
     if $NO_RUN; then
         success "Session ready: $GIT_SESSION"
         exit 0
@@ -1730,7 +317,6 @@ DOCKER_ARGS=(
 
 # Add TTY based on CI detection and terminal availability
 if $IS_CI; then
-    # No TTY in CI environments
     :
 elif ! $VERIFY_MODE && [[ -t 0 ]]; then
     DOCKER_ARGS+=("-it")
@@ -1738,10 +324,8 @@ fi
 
 # Mount workspace
 if $USE_GIT_SESSION; then
-    # Git session: mount the cloned volume directly at /workspace
     DOCKER_ARGS+=("-v" "$GIT_SESSION_VOLUME:/workspace")
 elif $USE_OVERLAY; then
-    # Legacy overlay mode (deprecated, requires privileged)
     DOCKER_ARGS+=(
         "--privileged"
         "--device" "/dev/fuse"
@@ -1751,7 +335,6 @@ elif $USE_OVERLAY; then
         "-e" "SESSION_VOLUME=$SESSION_VOLUME"
     )
 else
-    # Direct mount (default)
     DOCKER_ARGS+=("-v" "$WORKSPACE_DIR:/workspace")
 fi
 
@@ -1761,14 +344,14 @@ DOCKER_ARGS+=(
     "-v" "$HOME/.ssh:/root/.ssh:ro"
 )
 
-# Forward SSH agent if available (cross-platform)
+# Forward SSH agent if available
 SSH_SOCKET_ARGS=$(get_ssh_socket_args)
 if [[ -n "$SSH_SOCKET_ARGS" ]]; then
     # shellcheck disable=SC2086
     DOCKER_ARGS+=($SSH_SOCKET_ARGS)
 fi
 
-# Add environment variables (using dynamic UID/GID for cross-platform support)
+# Add environment variables
 DOCKER_ARGS+=(
     "-e" "TERM=${TERM:-xterm-256color}"
     "-e" "HOST_UID=$(get_host_uid)"
@@ -1777,13 +360,11 @@ DOCKER_ARGS+=(
     "-e" "IS_CI=$IS_CI"
 )
 
-# Inject token securely via file mount (not env var - prevents exposure in docker inspect)
+# Inject token securely
 inject_token_securely "${CLAUDE_CODE_OAUTH_TOKEN}"
 
-# Set up session state persistence (conversation history, settings)
+# Set up session state and dev caches
 setup_session_state "$SESSION_NAME"
-
-# Set up dev tool caches (cargo, npm, pip)
 setup_dev_caches "$SESSION_NAME"
 
 if $VERIFY_MODE; then
@@ -1800,7 +381,6 @@ fi
 
 if $RUN_AS_ROOTISH; then
     DOCKER_ARGS+=("-e" "RUN_AS_ROOTISH=1")
-    # Allow user namespace creation for rootish wrappers
     DOCKER_ARGS+=("--security-opt" "seccomp=unconfined")
 fi
 
@@ -1824,14 +404,13 @@ if $USE_GIT_SESSION; then
 fi
 echo ""
 
-# Run container
+# Run container with entrypoint script
 docker run "${DOCKER_ARGS[@]}" "$IMAGE_NAME" /bin/bash -c '
     set -e
 
-    # Read token from securely mounted file (not passed via env var)
+    # Read token from securely mounted file
     export CLAUDE_CODE_OAUTH_TOKEN=$(cat /run/secrets/claude_token)
 
-    # Create non-root user matching host UID
     HOST_UID=${HOST_UID:-1000}
     DEV_GID=61000
 
@@ -1839,7 +418,6 @@ docker run "${DOCKER_ARGS[@]}" "$IMAGE_NAME" /bin/bash -c '
     if [[ "${USE_OVERLAY:-}" == "1" ]]; then
         echo "Setting up overlay filesystem..."
         mkdir -p /session-data/upper /session-data/work
-        # Remove existing /workspace if present from Dockerfile WORKDIR
         rmdir /workspace 2>/dev/null || rm -f /workspace 2>/dev/null || true
         mkdir -p /workspace
         if fuse-overlayfs \
@@ -1847,19 +425,17 @@ docker run "${DOCKER_ARGS[@]}" "$IMAGE_NAME" /bin/bash -c '
             /workspace 2>&1; then
             echo "  Overlay mounted at /workspace"
         else
-            # Fallback to bind mount or symlink
             mount --bind /workspace-lower /workspace 2>/dev/null || ln -sf /workspace-lower /workspace
             echo "  Fallback: direct mount, read-only"
         fi
-        # Re-enter workspace after mount to fix cwd
         cd /workspace
         echo ""
     fi
 
-    # Set up home directory (volumes mount at /home/developer regardless of user)
+    # Set up home directory
     mkdir -p /home/developer/.claude /home/developer/.cargo /home/developer/.npm /home/developer/.cache/pip
 
-    # Create .claude.json with theme + bypass acceptance to skip all onboarding
+    # Create .claude.json with settings
     cat > /home/developer/.claude.json << EOF
 {"theme":"dark-ansi","hasCompletedOnboarding":true,"bypassPermissionsModeAccepted":true}
 EOF
@@ -1870,23 +446,16 @@ EOF
     fi
 
     if [[ "${RUN_AS_USER:-}" == "1" ]] || [[ "${RUN_AS_ROOTISH:-}" == "1" ]]; then
-        # Create non-root developer user matching host UID
         groupadd -g $DEV_GID developer 2>/dev/null || true
         useradd -u $HOST_UID -g $DEV_GID -m -s /bin/bash developer 2>/dev/null || true
-
-        # Fix ownership for developer user
         chown -R developer:developer /home/developer
         chown developer:developer /workspace 2>/dev/null || true
 
         if [[ "${RUN_AS_ROOTISH:-}" == "1" ]]; then
-            # Create a universal "rootish" wrapper that runs ANY command in a user namespace
-            # This makes the process appear as root without actual root privileges
-            cat > /usr/local/bin/rootish << 'WRAPPER'
+            cat > /usr/local/bin/rootish << '\''WRAPPER'\''
 #!/bin/bash
-# If called as a symlink (e.g., apt-get-rootish), extract the real command
 cmd=$(basename "$0")
 if [[ "$cmd" != "rootish" ]]; then
-    # Strip -rootish suffix to get real command (apt-get-rootish -> apt-get)
     realcmd="${cmd%-rootish}"
     exec unshare --user --map-root-user -- "$realcmd" "$@"
 else
@@ -1894,103 +463,37 @@ else
 fi
 WRAPPER
             chmod +x /usr/local/bin/rootish
-
-            # Convenience symlinks for common commands
             for cmd in apt apt-get dpkg; do
                 ln -sf rootish /usr/local/bin/${cmd}-rootish
             done
-
-            echo "rootish wrapper installed (use: rootish <cmd> or apt-get-rootish, etc.)"
+            echo "rootish wrapper installed"
         fi
     fi
 
     # Verify mode
     if [[ "${VERIFY_MODE:-}" == "1" ]]; then
-        VERIFY_FAILED=false
-
         echo "=== Verification ==="
         echo "Run as: $(if [[ "${RUN_AS_ROOTISH:-}" == "1" ]]; then echo "developer (sudo)"; elif [[ "${RUN_AS_USER:-}" == "1" ]]; then echo "developer"; else echo "root"; fi)"
         echo "Claude: $(which claude 2>&1)"
         echo "Platform: ${PLATFORM:-unknown}"
-        echo "CI Mode: ${IS_CI:-false}"
-
-        echo ""
-        echo "=== Multi-Project Prerequisites ==="
-        if command -v yq &>/dev/null; then
-            echo "  yq: $(which yq) ($(yq --version 2>&1 | head -1))"
-        else
-            echo "  yq: not found"
-        fi
-        if command -v python3 &>/dev/null; then
-            echo "  python3: $(which python3) ($(python3 --version 2>&1))"
-            if python3 -c "import yaml" &>/dev/null; then
-                echo "  PyYAML: installed"
-            else
-                echo "  PyYAML: not found"
-            fi
-        else
-            echo "  python3: not found"
-        fi
-        if command -v yq &>/dev/null || (command -v python3 &>/dev/null && python3 -c "import yaml" &>/dev/null); then
-            echo "  ✓ YAML parser available (multi-project support enabled)"
-        else
-            echo "  ✗ No YAML parser (multi-project support disabled)"
-            echo "    Install: yq or python3 with PyYAML"
-        fi
 
         echo ""
         echo "=== Token Check ==="
         if [[ -f /run/secrets/claude_token ]]; then
             echo "  Token file: OK"
             echo "  Token: ${CLAUDE_CODE_OAUTH_TOKEN:0:20}..."
-        elif [[ -d /run/secrets/claude_token ]]; then
-            echo "  ✗ Token is a DIRECTORY (mount failed)"
-            VERIFY_FAILED=true
         else
-            echo "  ✗ Token file missing"
-            VERIFY_FAILED=true
-        fi
-
-        echo ""
-        echo "=== .claude Directory Check ==="
-        if touch /home/developer/.claude/.verify-test 2>/dev/null; then
-            echo "  .claude writable: OK"
-            rm -f /home/developer/.claude/.verify-test
-        else
-            echo "  ✗ Cannot write to .claude directory"
-            ls -la /home/developer/.claude 2>&1 | head -3
-            VERIFY_FAILED=true
-        fi
-
-        if [[ "${USE_OVERLAY:-}" == "1" ]]; then
-            echo ""
-            echo "=== Overlay Test ==="
-            echo "Mount info:"
-            mount | grep workspace || echo "  No workspace mount found"
-            echo ""
-            echo "Creating test file in overlay..."
-            touch /workspace/.overlay-test-file 2>&1 && echo "  Write succeeded" || echo "  Write failed"
-            echo ""
-            echo "Checking session data (upper dir):"
-            ls -la /session-data/upper/ 2>&1 | head -5
-            echo ""
-            echo "Checking source (lower dir):"
-            ls /workspace-lower/.overlay-test-file 2>&1 || echo "  Source unchanged - OVERLAY WORKING!"
-            rm -f /workspace/.overlay-test-file 2>/dev/null
+            echo "  Token file missing"
+            exit 1
         fi
 
         echo ""
         echo "=== Claude Test ==="
-        if $VERIFY_FAILED; then
-            echo "  Skipping (prerequisites failed)"
-            exit 1
-        fi
         HOME=/home/developer claude --print "test" 2>&1 | head -5
         exit 0
     fi
 
     # Run claude
-    # --dangerously-skip-permissions only works for non-privileged users (no root/sudo)
     if [[ "${RUN_AS_USER:-}" == "1" ]] || [[ "${RUN_AS_ROOTISH:-}" == "1" ]]; then
         CLAUDE_ARGS="--dangerously-skip-permissions"
     else
@@ -2012,7 +515,5 @@ WRAPPER
 if [[ -n "$AUTO_SYNC_BRANCH" ]] && $USE_GIT_SESSION; then
     echo ""
     info "Auto-syncing session to branch: $AUTO_SYNC_BRANCH"
-
-    # Run merge-session non-interactively
     "$0" --merge-session "$GIT_SESSION" --into "$AUTO_SYNC_BRANCH" --auto
 fi

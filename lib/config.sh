@@ -1,0 +1,274 @@
+#!/usr/bin/env bash
+# claude-container config module - YAML parsing and multi-project configuration
+# Source this file after utils.sh and platform.sh
+#
+# Dependencies:
+#   - utils.sh must be sourced first (provides: info, success, warn, error)
+#   - platform.sh must be sourced first (provides: PLATFORM)
+#
+# Required globals:
+#   - CACHE_DIR: directory for caching temporary files
+#   - PLATFORM: detected platform (macos, linux, wsl, windows)
+#
+# Optional globals:
+#   - CONFIG_FILE: path to config file (set via --config flag)
+
+# Check if YAML parser is available (yq or python3 with yaml)
+check_yaml_parser_available() {
+    if command -v yq &>/dev/null; then
+        return 0
+    elif command -v python3 &>/dev/null && python3 -c "import yaml" &>/dev/null; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+# Show helpful message for installing YAML parser
+show_yaml_parser_install_help() {
+    error "No YAML parser found. Multi-project sessions require 'yq' or 'python3' with PyYAML."
+    echo ""
+    echo "Installation options:"
+    echo ""
+    echo "Option 1: Install yq (recommended)"
+    case "$PLATFORM" in
+        macos)
+            echo "  brew install yq"
+            ;;
+        linux|wsl)
+            echo "  # Ubuntu/Debian:"
+            echo "  sudo apt-get install yq"
+            echo ""
+            echo "  # Or using snap:"
+            echo "  sudo snap install yq"
+            ;;
+        *)
+            echo "  See: https://github.com/mikefarah/yq#install"
+            ;;
+    esac
+    echo ""
+    echo "Option 2: Install Python PyYAML"
+    echo "  pip3 install pyyaml"
+    echo "  # or: python3 -m pip install pyyaml"
+    echo ""
+}
+
+# Discover all git repositories in a directory and generate config
+# Arguments:
+#   $1 - search directory to scan for git repos
+# Returns:
+#   Path to temporary config file (stdout)
+discover_repos_in_dir() {
+    local search_dir="$1"
+    local temp_config="$CACHE_DIR/discovered-config-$$.yml"
+
+    mkdir -p "$CACHE_DIR"
+
+    # Redirect output to stderr to avoid interfering with return value
+    info "Discovering git repositories in: $search_dir" >&2
+
+    # Find all git repos (only direct subdirectories, not nested)
+    local found_count=0
+    local projects=""
+
+    for dir in "$search_dir"/*/; do
+        if [[ -d "$dir/.git" ]]; then
+            local repo_name
+            repo_name=$(basename "$dir")
+            info "  Found: $repo_name" >&2
+            projects+="$repo_name|$dir"$'\n'
+            found_count=$((found_count + 1))
+        fi
+    done
+
+    if [[ $found_count -eq 0 ]]; then
+        error "No git repositories found in: $search_dir" >&2
+        exit 1
+    fi
+
+    # Generate temporary config file
+    cat > "$temp_config" << 'EOF'
+version: "1"
+projects:
+EOF
+
+    while IFS='|' read -r name path; do
+        [[ -z "$name" ]] && continue
+        echo "  $name:" >> "$temp_config"
+        echo "    path: $path" >> "$temp_config"
+    done <<< "$projects"
+
+    success "Discovered $found_count repositories" >&2
+
+    # Return path to temp config (only thing on stdout)
+    echo "$temp_config"
+}
+
+# Find .claude-projects.yml config file
+# Search order: --config flag > ./.claude-projects.yml > ./.devcontainer/claude-projects.yml
+# Arguments:
+#   $1 - search directory (optional, defaults to current directory)
+# Returns:
+#   Path to config file (stdout) or exits with error
+find_config_file() {
+    local search_dir="${1:-.}"
+    local config_file=""
+
+    # If CONFIG_FILE is set via --config flag, use it directly
+    if [[ -n "${CONFIG_FILE:-}" ]]; then
+        if [[ -f "$CONFIG_FILE" ]]; then
+            echo "$CONFIG_FILE"
+            return 0
+        else
+            error "Config file not found: $CONFIG_FILE"
+            exit 1
+        fi
+    fi
+
+    # Search in standard locations
+    for candidate in \
+        "$search_dir/.claude-projects.yml" \
+        "$search_dir/.devcontainer/claude-projects.yml" \
+        "$search_dir/claude-projects.yml"; do
+        if [[ -f "$candidate" ]]; then
+            echo "$candidate"
+            return 0
+        fi
+    done
+
+    # Not found - return empty (will fall back to single-repo mode)
+    return 1
+}
+
+# Parse YAML config file and extract project mappings
+# Returns newline-delimited format: "project_name|absolute_path"
+# Arguments:
+#   $1 - path to config file
+# Returns:
+#   Project mappings (stdout), one per line: "name|path"
+parse_config_file() {
+    local config_file="$1"
+    local config_dir
+    config_dir="$(cd "$(dirname "$config_file")" && pwd)"
+
+    # Try yq first (most robust), fall back to Python
+    if command -v yq &>/dev/null; then
+        # Parse with yq: extract project names and paths
+        local yq_output
+        yq_output=$(yq eval '.projects | to_entries | .[] | .key + "|" + .value.path' "$config_file" 2>/dev/null) || {
+            error "Failed to parse config file with yq"
+            exit 1
+        }
+
+        # Resolve relative paths to absolute
+        while IFS='|' read -r proj_name proj_path; do
+            if [[ "$proj_path" != /* ]]; then
+                proj_path="$(cd "$config_dir" && cd "$proj_path" && pwd)"
+            fi
+            echo "$proj_name|$proj_path"
+        done <<< "$yq_output"
+    elif command -v python3 &>/dev/null; then
+        # Fallback to Python
+        python3 -c "
+import sys, yaml, os
+
+try:
+    with open('$config_file', 'r') as f:
+        config = yaml.safe_load(f)
+
+    if not config or 'projects' not in config:
+        print('Error: Config must have \"projects\" key', file=sys.stderr)
+        sys.exit(1)
+
+    for name, info in config['projects'].items():
+        if not isinstance(info, dict) or 'path' not in info:
+            print(f'Error: Project \"{name}\" missing \"path\" field', file=sys.stderr)
+            sys.exit(1)
+
+        path = info['path']
+        # Resolve relative paths
+        if not os.path.isabs(path):
+            path = os.path.abspath(os.path.join('$config_dir', path))
+
+        print(f'{name}|{path}')
+except yaml.YAMLError as e:
+    print(f'Error: Invalid YAML: {e}', file=sys.stderr)
+    sys.exit(1)
+except Exception as e:
+    print(f'Error: {e}', file=sys.stderr)
+    sys.exit(1)
+" || {
+            error "Failed to parse config file with Python"
+            exit 1
+        }
+    else
+        show_yaml_parser_install_help
+        exit 1
+    fi
+}
+
+# Validate config file and all project paths
+# Arguments:
+#   $1 - path to config file
+# Returns:
+#   Success message or exits with error
+validate_config() {
+    local config_file="$1"
+    local projects
+
+    # Check for YAML parser before proceeding
+    if ! check_yaml_parser_available; then
+        show_yaml_parser_install_help
+        exit 1
+    fi
+
+    info "Validating multi-project config..."
+
+    # Parse projects
+    if ! projects=$(parse_config_file "$config_file"); then
+        error "Failed to parse config file"
+        exit 1
+    fi
+
+    if [[ -z "$projects" ]]; then
+        error "No projects defined in config file"
+        exit 1
+    fi
+
+    # Track project names to check for duplicates
+    declare -A seen_names
+
+    # Validate each project
+    while IFS='|' read -r proj_name proj_path; do
+        # Check for duplicate names
+        if [[ -n "${seen_names[$proj_name]:-}" ]]; then
+            error "Duplicate project name: $proj_name"
+            exit 1
+        fi
+        seen_names[$proj_name]=1
+
+        # Check for reserved names
+        case "$proj_name" in
+            .git|.claude|.devcontainer|workspace|session)
+                error "Reserved project name: $proj_name"
+                exit 1
+                ;;
+        esac
+
+        # Validate path exists
+        if [[ ! -d "$proj_path" ]]; then
+            error "Project '$proj_name': path does not exist: $proj_path"
+            exit 1
+        fi
+
+        # Validate it's a git repo
+        if [[ ! -d "$proj_path/.git" ]]; then
+            error "Project '$proj_name': not a git repository: $proj_path"
+            exit 1
+        fi
+
+        info "  Validated: $proj_name: $proj_path"
+    done <<< "$projects"
+
+    success "Config validation passed"
+}
