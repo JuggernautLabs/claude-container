@@ -63,6 +63,12 @@ case "${1:-}" in
         exit 0
         ;;
 
+    --cleanup-unused)
+        shift
+        session_cleanup_unused "$@"
+        exit 0
+        ;;
+
     --list-sessions|--sessions)
         session_list
         exit 0
@@ -196,6 +202,7 @@ Options:
 
 Session Management:
   --cleanup                List and optionally delete all claude-related volumes
+  --cleanup-unused [--yes] Delete volumes not used by running containers
   --list-sessions, --sessions  List all sessions with disk usage per volume
   --delete-session <name> [--regex] [--yes]  Delete session(s) with confirmation
   --restart-session <name> Restart a session (fixes permissions, continues conversation)

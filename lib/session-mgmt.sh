@@ -41,6 +41,77 @@ session_cleanup() {
     fi
 }
 
+# Clean up unused claude-container volumes (not mounted by any running container)
+# Usage: session_cleanup_unused [--yes]
+session_cleanup_unused() {
+    local skip_confirm=false
+    [[ "${1:-}" == "--yes" || "${1:-}" == "-y" ]] && skip_confirm=true
+
+    echo "Finding unused claude-container volumes..."
+
+    # Get all claude volumes
+    local all_volumes
+    all_volumes=$(docker volume ls -q | grep -E "^(claude-session-|claude-state-|claude-cargo-|claude-npm-|claude-pip-|session-data-)" || true)
+
+    if [[ -z "$all_volumes" ]]; then
+        echo "No claude-container volumes found"
+        return 0
+    fi
+
+    # Get volumes currently in use by running containers
+    local used_volumes
+    used_volumes=$(docker ps -q | xargs -r docker inspect 2>/dev/null | \
+        grep -oE '"Name": "claude-[^"]+"|"Name": "session-data-[^"]+"' | \
+        cut -d'"' -f4 | sort -u || true)
+
+    # Find unused volumes
+    local unused_volumes=()
+    while read -r vol; do
+        [[ -z "$vol" ]] && continue
+        if ! echo "$used_volumes" | grep -q "^${vol}$"; then
+            unused_volumes+=("$vol")
+        fi
+    done <<< "$all_volumes"
+
+    if [[ ${#unused_volumes[@]} -eq 0 ]]; then
+        echo "No unused volumes found (all volumes are currently in use)"
+        return 0
+    fi
+
+    # Show what will be deleted
+    local total_count=$(echo "$all_volumes" | wc -l | tr -d ' ')
+    local used_count=$(echo "$used_volumes" | grep -c . || echo 0)
+    echo ""
+    echo "Total volumes: $total_count"
+    echo "In use: $used_count"
+    echo "Unused: ${#unused_volumes[@]}"
+    echo ""
+    echo "Volumes to delete:"
+    for vol in "${unused_volumes[@]}"; do
+        echo "  - $vol"
+    done
+    echo ""
+
+    # Confirm unless --yes
+    if ! $skip_confirm; then
+        read -p "Delete ${#unused_volumes[@]} unused volume(s)? [y/N] " confirm
+        if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
+            echo "Cancelled"
+            return 0
+        fi
+    fi
+
+    # Delete unused volumes
+    for vol in "${unused_volumes[@]}"; do
+        if docker volume rm "$vol" 2>/dev/null; then
+            echo "Deleted: $vol"
+        else
+            echo "Failed to delete: $vol (may still be in use)"
+        fi
+    done
+    echo "Done"
+}
+
 # List all sessions with disk usage
 # Usage: session_list
 session_list() {
