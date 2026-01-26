@@ -24,8 +24,8 @@ CACHE_DIR="$CONFIG_DIR/cache"
 mkdir -p "$CONFIG_DIR" "$CACHE_DIR"
 chmod 700 "$CONFIG_DIR"
 
-# Source library modules
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# Source library modules (resolve symlinks to find actual script location)
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null || echo "$0")")" && pwd)"
 source "$SCRIPT_DIR/lib/utils.sh"
 source "$SCRIPT_DIR/lib/platform.sh"
 source "$SCRIPT_DIR/lib/config.sh"
@@ -46,7 +46,7 @@ GIT_SESSION=""
 USE_GIT_SESSION=false
 CONTINUE_SESSION=false
 RUN_AS_USER=false
-RUN_AS_ROOTISH=false
+RUN_AS_ROOTISH=true  # Default: run as user with fake-root for package installs
 AUTO_SYNC_BRANCH=""
 NO_RUN=false
 DISCOVER_REPOS_DIR=""
@@ -126,6 +126,11 @@ while [[ $# -gt 0 ]]; do
             RUN_AS_ROOTISH=true
             shift
             ;;
+        --as-root|--no-rootish)
+            RUN_AS_ROOTISH=false
+            RUN_AS_USER=false
+            shift
+            ;;
         --auto-sync)
             AUTO_SYNC_BRANCH="$2"
             shift 2
@@ -159,8 +164,9 @@ Options:
   --git-session, -g <name> Create/resume a git-based isolated session (recommended)
   --session, -s <name>     Override session name for state persistence (default: "default")
   --continue, -c           Continue the most recent Claude conversation
-  --as-user                Run as non-root developer user (default: run as root)
-  --as-rootish             Run as developer user who owns install dirs (recommended)
+  --as-user                Run as non-root developer user (no fake-root)
+  --as-rootish             Run as developer with fake-root for installs (default)
+  --as-root, --no-rootish  Run as actual root user
   --auto-sync <branch>     Auto-merge session commits to branch on exit
   --discover-repos <dir>   Auto-discover all git repos in directory
   --config, -C <path>      Explicit path to .claude-projects.yml config file

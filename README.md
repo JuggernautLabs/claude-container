@@ -103,7 +103,8 @@ This:
 | `--config, -C <path>` | Explicit path to `.claude-projects.yml` config file |
 | `--session, -s <name>` | Override state volume name (for sharing state) |
 | `--continue, -c` | Continue the most recent Claude conversation |
-| `--as-rootish` | Run as user with fake-root capabilities (recommended) |
+| `--as-rootish` | Run as user with fake-root capabilities (default) |
+| `--as-root` | Run as actual root user (disables rootish) |
 | `--build, -b` | Force rebuild the container image |
 | `--sessions` | List all sessions with disk usage |
 | `--delete-session <name>` | Delete a session and all its volumes |
@@ -128,14 +129,13 @@ Claude: I'll install the dependencies for this Node.js project.
 > npm run build
 ```
 
-For system packages, use `--as-rootish`:
+System packages work out of the box (rootish mode is the default):
 
 ```bash
-# Start with rootish mode
-./claude-container --git-session my-feature --as-rootish
+./claude-container --git-session my-feature
 ```
 
-Then inside the container:
+Inside the container, Claude can install packages:
 ```
 You: Install postgresql client tools
 
@@ -968,8 +968,7 @@ Lists all claude-container volumes and prompts before deleting.
 
 ```bash
 # 1. Start isolated session
-./claude-container --git-session new-feature --as-rootish
-
+./claude-container --git-session new-feature 
 # 2. Work with Claude to implement the feature
 #    Claude commits changes as it works
 
@@ -1026,15 +1025,14 @@ claude
 # Claude asks:
 # - What should the session be named?
 # - Where are your repositories?
-# - Do you need rootish mode for package installation?
 
 # 3. Claude validates with --no-run, outputs:
 #    Session ready: my-feature
-#    Run: claude-container --git-session my-feature --as-rootish
+#    Run: claude-container --git-session my-feature
 #    (copied to clipboard)
 
 # 4. Exit Claude Code and run the command
-claude-container --git-session my-feature --as-rootish
+claude-container --git-session my-feature
 ```
 
 Since `--no-run` already clones all repos and sets up the session, the final command just resumes the existing session and starts the container.
