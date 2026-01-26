@@ -123,31 +123,80 @@ session_list() {
 }
 
 # Delete a specific session and all its volumes
-# Usage: session_delete <session_name>
+# Usage: session_delete <session_name> [--regex] [--yes]
 session_delete() {
     local session="$1"
+    local use_regex=false
+    local skip_confirm=false
+
+    # Parse flags
+    shift
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --regex|-r) use_regex=true; shift ;;
+            --yes|-y) skip_confirm=true; shift ;;
+            *) shift ;;
+        esac
+    done
 
     if [[ -z "$session" ]]; then
         echo "Error: session_delete requires a session name"
-        echo "Usage: session_delete <name>"
+        echo "Usage: session_delete <name> [--regex] [--yes]"
         return 1
     fi
 
-    local deleted=false
+    local volumes_to_delete=()
 
-    # Try to delete all possible volume patterns for this session
-    for pattern in "claude-session-${session}" "claude-state-${session}" "claude-cargo-${session}" "claude-npm-${session}" "claude-pip-${session}" "session-data-${session}"; do
-        if docker volume inspect "$pattern" &>/dev/null; then
-            docker volume rm "$pattern"
-            echo "Deleted: $pattern"
-            deleted=true
+    if $use_regex; then
+        # Regex mode: find all matching volumes
+        while IFS= read -r vol; do
+            [[ -n "$vol" ]] && volumes_to_delete+=("$vol")
+        done < <(docker volume ls -q | grep -E "$session")
+    else
+        # Strict mode: exact session name match
+        for pattern in "claude-session-${session}" "claude-state-${session}" "claude-cargo-${session}" "claude-npm-${session}" "claude-pip-${session}" "session-data-${session}"; do
+            if docker volume inspect "$pattern" &>/dev/null; then
+                volumes_to_delete+=("$pattern")
+            fi
+        done
+    fi
+
+    if [[ ${#volumes_to_delete[@]} -eq 0 ]]; then
+        echo "No volumes found for session: $session (already deleted)"
+        return 0
+    fi
+
+    # Show what will be deleted
+    echo "Volumes to delete:"
+    for vol in "${volumes_to_delete[@]}"; do
+        echo "  - $vol"
+    done
+    echo ""
+
+    # Confirm unless --yes
+    if ! $skip_confirm; then
+        read -p "Delete these ${#volumes_to_delete[@]} volume(s)? [y/N] " confirm
+        if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
+            echo "Cancelled"
+            return 0
+        fi
+    fi
+
+    # Stop any containers using these volumes
+    for vol in "${volumes_to_delete[@]}"; do
+        local containers
+        containers=$(docker ps -aq --filter "volume=$vol" 2>/dev/null || true)
+        if [[ -n "$containers" ]]; then
+            echo "Stopping containers using $vol..."
+            echo "$containers" | xargs docker rm -f 2>/dev/null || true
         fi
     done
 
-    if ! $deleted; then
-        echo "No volumes found for session: $session"
-        return 1
-    fi
+    # Delete
+    for vol in "${volumes_to_delete[@]}"; do
+        docker volume rm "$vol"
+        echo "Deleted: $vol"
+    done
     echo "Done"
 }
 
@@ -208,6 +257,99 @@ session_diff() {
     fi
 
     diff_git_session "$session_name" "$source_dir" "$project_filter"
+}
+
+# Add a new repo to an existing session
+# Usage: session_add_repo <session_name> <repo_path> [workspace_path]
+# Arguments:
+#   $1 - session name
+#   $2 - path to git repository to add
+#   $3 - optional workspace path (defaults to repo basename)
+session_add_repo() {
+    local session="$1"
+    local repo_path="$2"
+    local workspace_path="${3:-}"
+    local volume="claude-session-${session}"
+
+    if [[ -z "$session" ]] || [[ -z "$repo_path" ]]; then
+        error "Usage: session_add_repo <session_name> <repo_path> [workspace_path]"
+        return 1
+    fi
+
+    # Verify session exists
+    if ! docker volume inspect "$volume" &>/dev/null; then
+        error "Session not found: $session"
+        return 1
+    fi
+
+    # Verify repo exists and is a git repo
+    if [[ ! -d "$repo_path/.git" ]]; then
+        error "Not a git repository: $repo_path"
+        return 1
+    fi
+
+    # Get absolute path
+    local abs_repo_path
+    abs_repo_path=$(cd "$repo_path" && pwd)
+
+    # Default workspace path to repo basename
+    if [[ -z "$workspace_path" ]]; then
+        workspace_path=$(basename "$abs_repo_path")
+    fi
+
+    local git_image="${IMAGE_NAME:-$DEFAULT_IMAGE}"
+    local host_uid
+    host_uid=$(get_host_uid)
+
+    # Check if path already exists in session
+    local exists
+    exists=$(docker run --rm \
+        -v "$volume:/session:ro" \
+        "$git_image" \
+        sh -c "test -d '/session/$workspace_path' && echo 'yes' || echo 'no'")
+
+    if [[ "$exists" == "yes" ]]; then
+        error "Path already exists in session: $workspace_path"
+        return 1
+    fi
+
+    info "Adding repo to session: $workspace_path"
+
+    # Clone the repo into the session
+    local clone_output
+    if ! clone_output=$(docker run --rm \
+        --user "$host_uid:$host_uid" \
+        -v "$abs_repo_path:/source:ro" \
+        -v "$volume:/session" \
+        "$git_image" \
+        sh -c "
+            mkdir -p /session/$(dirname "$workspace_path") && \
+            git -c safe.directory='*' clone --depth 1 /source '/session/$workspace_path' && \
+            cd '/session/$workspace_path' && \
+            git remote remove origin 2>/dev/null || true && \
+            git config user.email 'claude@container' && \
+            git config user.name 'Claude' && \
+            du -sh '/session/$workspace_path' | cut -f1
+        " 2>&1); then
+        error "Failed to clone repo:"
+        echo "$clone_output" >&2
+        return 1
+    fi
+
+    local size=$(echo "$clone_output" | tail -1)
+    success "Added: $workspace_path ($size)"
+
+    # Update .claude-projects.yml if it exists
+    docker run --rm \
+        --user "$host_uid:$host_uid" \
+        -v "$volume:/session" \
+        "$git_image" \
+        sh -c "
+            if [[ -f /session/.claude-projects.yml ]]; then
+                echo '  \"$workspace_path\":' >> /session/.claude-projects.yml
+                echo '    path: $abs_repo_path' >> /session/.claude-projects.yml
+            fi
+        " 2>/dev/null || true
 }
 
 # Merge session commits back to original repo

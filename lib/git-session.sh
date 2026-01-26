@@ -16,7 +16,7 @@
 #   - IMAGE_NAME or DEFAULT_IMAGE: Docker image to use for git operations
 #
 # Optional globals:
-#   - DISCOVER_REPOS_DIR: directory to scan for repos (set via --discover-repos flag)
+#   - DISCOVER_REPOS_DIRS: array of directories to scan for repos (set via --discover-repos flags)
 #   - CONFIG_FILE: path to config file (set via --config flag)
 
 # Check if a volume contains multi-project config
@@ -67,6 +67,12 @@ create_multi_project_session() {
     local host_uid
     host_uid=$(get_host_uid)
 
+    # Initialize volume with correct ownership (volumes are created as root)
+    docker run --rm \
+        -v "$volume:/session" \
+        "$git_image" \
+        chown "$host_uid:$host_uid" /session
+
     # Verify projects variable is populated
     if [[ -z "$projects" ]]; then
         error "No projects to clone (parse result was empty)"
@@ -90,8 +96,9 @@ create_multi_project_session() {
         done <<< "$projects"
     } > "$temp_config"
 
-    # Copy via mounted temp file (works for any size)
+    # Copy via mounted temp file (works for any size), run as target UID
     if ! docker run --rm \
+        --user "$host_uid:$host_uid" \
         -v "$temp_config:/tmp/config.yml:ro" \
         -v "$volume:/session" \
         "$git_image" \
@@ -105,50 +112,83 @@ create_multi_project_session() {
 
     info "Config stored successfully"
 
-    # Clone each project into its subdirectory
+    # Clone all projects in parallel, running as target UID (no chown needed)
     local project_count=0
+    local pids=()
+    local project_names=()
+    local log_dir="$CACHE_DIR/clone-logs-$$"
+    mkdir -p "$log_dir"
+
     while IFS='|' read -r project_name source_path; do
-        [[ -z "$project_name" ]] && continue  # Skip empty lines
+        [[ -z "$project_name" ]] && continue
         project_count=$((project_count + 1))
+        project_names+=("$project_name")
 
-        info "Cloning project '$project_name' from $source_path..."
+        info "Cloning '$project_name'..."
 
-        # Clone repo into /session/{project_name}/
-        local clone_output
-        if ! clone_output=$(docker run --rm \
-            -v "$source_path:/source:ro" \
-            -v "$volume:/session" \
-            "$git_image" \
-            sh -c "git config --global --add safe.directory '*' && \
-                   git clone /source /session/$project_name" 2>&1); then
-            error "Failed to clone project '$project_name':"
-            echo "$clone_output" >&2
-            docker volume rm "$volume" >/dev/null 2>&1
-            exit 1
-        fi
-
-        # Configure the cloned repo
-        docker run --rm \
-            -v "$volume:/session" \
-            "$git_image" \
-            sh -c "
-                cd /session/$project_name
-                git config --global --add safe.directory '*'
-                git remote remove origin 2>/dev/null || true
-                git config user.email 'claude@container'
-                git config user.name 'Claude'
-            "
-
-        success "  Cloned: $project_name"
+        # Clone and configure in one docker run, in background
+        # Run as target UID so files are created with correct ownership (no chown needed)
+        # Use git -c flags instead of --global config (no home dir for arbitrary UID)
+        local safe_log_name="${project_name//\//_}"  # Replace / with _ for log filename
+        (
+            docker run --rm \
+                --user "$host_uid:$host_uid" \
+                -v "$source_path:/source:ro" \
+                -v "$volume:/session" \
+                "$git_image" \
+                sh -c "
+                    mkdir -p /session/$(dirname "$project_name") && \
+                    git -c safe.directory='*' clone --depth 1 /source '/session/$project_name' && \
+                    cd '/session/$project_name' && \
+                    git remote remove origin 2>/dev/null || true && \
+                    git config user.email 'claude@container' && \
+                    git config user.name 'Claude' && \
+                    du -sh '/session/$project_name' | cut -f1
+                " > "$log_dir/$safe_log_name.log" 2>&1
+            echo $? > "$log_dir/$safe_log_name.status"
+        ) &
+        pids+=($!)
     done <<< "$projects"
 
-    # Fix ownership for all projects in one batch operation
-    info "Fixing ownership..."
-    docker run --rm \
-        -v "$volume:/session" \
-        -e "HOST_UID=$host_uid" \
-        "$git_image" \
-        sh -c 'chown -R ${HOST_UID:-1000}:${HOST_UID:-1000} /session'
+    # Wait for all clones to complete (report as they finish, not in order)
+    local failed=0
+    local start_time=$SECONDS
+    local remaining=${#pids[@]}
+
+    while [[ $remaining -gt 0 ]]; do
+        # Wait for any one process to complete
+        wait -n "${pids[@]}" 2>/dev/null || true
+
+        # Check which ones finished
+        for i in "${!pids[@]}"; do
+            [[ -z "${pids[$i]}" ]] && continue  # Already processed
+            local safe_log_name="${project_names[$i]//\//_}"
+            local status_file="$log_dir/$safe_log_name.status"
+
+            if [[ -f "$status_file" ]]; then
+                local elapsed=$((SECONDS - start_time))
+                local status=$(cat "$status_file")
+                if [[ "$status" == "0" ]]; then
+                    local size=$(tail -1 "$log_dir/$safe_log_name.log")
+                    success "  ✓ ${project_names[$i]} (${elapsed}s, ${size})"
+                else
+                    error "  ✗ ${project_names[$i]} failed (${elapsed}s)"
+                    cat "$log_dir/$safe_log_name.log" >&2
+                    failed=1
+                fi
+                pids[$i]=""  # Mark as processed
+                remaining=$((remaining - 1))
+            fi
+        done
+    done
+
+    rm -rf "$log_dir"
+
+    if [[ "$failed" == "1" ]]; then
+        error "Some projects failed to clone"
+        docker volume rm "$volume" >/dev/null 2>&1
+        exit 1
+    fi
 
     success "Multi-project session created: $name ($project_count projects)"
 }
@@ -165,10 +205,10 @@ create_git_session() {
     local source_dir="$2"
     local volume="claude-session-${name}"
 
-    # Check for --discover-repos flag (highest priority)
-    if [[ -n "${DISCOVER_REPOS_DIR:-}" ]]; then
+    # Check for --discover-repos flags (highest priority)
+    if [[ ${#DISCOVER_REPOS_DIRS[@]} -gt 0 ]]; then
         local discovered_config
-        discovered_config=$(discover_repos_in_dir "$DISCOVER_REPOS_DIR")
+        discovered_config=$(discover_repos_multi "${DISCOVER_REPOS_DIRS[@]}")
         create_multi_project_session "$name" "$discovered_config"
         rm -f "$discovered_config"  # Clean up temp file
         return $?
@@ -204,37 +244,37 @@ create_git_session() {
     # Clone repo into volume, strip remotes for safety
     # Use main image (has git) instead of pulling alpine/git
     local git_image="${IMAGE_NAME:-$DEFAULT_IMAGE}"
-    info "Cloning repository into session volume..."
-
-    # Run clone and capture exit status
-    # Mark /source as safe to avoid "dubious ownership" errors (container user != host user)
     local host_uid
     host_uid=$(get_host_uid)
+
+    # Initialize volume with correct ownership (volumes are created as root)
+    docker run --rm \
+        -v "$volume:/session" \
+        "$git_image" \
+        chown "$host_uid:$host_uid" /session
+
+    info "Cloning repository into session volume..."
+
+    # Run clone as target UID so files have correct ownership (no chown needed)
+    # Use git -c flags instead of --global config (no home dir for arbitrary UID)
     local clone_output
     if ! clone_output=$(docker run --rm \
+        --user "$host_uid:$host_uid" \
         -v "$source_dir:/source:ro" \
         -v "$volume:/session" \
         "$git_image" \
-        sh -c 'git config --global --add safe.directory "*" && git clone /source /session' 2>&1); then
+        sh -c '
+            git -c safe.directory="*" clone --depth 1 /source /session &&
+            cd /session &&
+            git remote remove origin 2>/dev/null || true &&
+            git config user.email "claude@container" &&
+            git config user.name "Claude"
+        ' 2>&1); then
         error "Git clone failed:"
         echo "$clone_output" >&2
         docker volume rm "$volume" >/dev/null 2>&1
         exit 1
     fi
-
-    # Configure the cloned repo and fix ownership for developer user
-    docker run --rm \
-        -v "$volume:/session" \
-        -e "HOST_UID=$host_uid" \
-        "$git_image" \
-        sh -c '
-            cd /session
-            git config --global --add safe.directory "*"
-            git remote remove origin 2>/dev/null || true
-            git config user.email "claude@container"
-            git config user.name "Claude"
-            chown -R ${HOST_UID:-1000}:${HOST_UID:-1000} /session
-        '
 
     success "Git session created: $name"
 }

@@ -53,38 +53,110 @@ show_yaml_parser_install_help() {
     echo ""
 }
 
-# Discover all git repositories in a directory and generate config
+# Get human-readable size of a directory
 # Arguments:
-#   $1 - search directory to scan for git repos
+#   $1 - directory path
+# Returns:
+#   Size string (e.g., "4.5M", "1.2G")
+get_dir_size() {
+    du -sh "$1" 2>/dev/null | cut -f1
+}
+
+# Convert size string to bytes for comparison
+# Arguments:
+#   $1 - size string (e.g., "4.5M", "1.2G")
+# Returns:
+#   Size in bytes (approximate)
+size_to_bytes() {
+    local size="$1"
+    local num="${size%[KMGTP]*}"
+    local unit="${size##*[0-9.]}"
+
+    # Remove any trailing 'B' or 'i' (e.g., "MiB" -> "M")
+    unit="${unit%%[Bi]*}"
+
+    case "$unit" in
+        K) echo "$num * 1024" | bc 2>/dev/null || echo "0" ;;
+        M) echo "$num * 1024 * 1024" | bc 2>/dev/null || echo "0" ;;
+        G) echo "$num * 1024 * 1024 * 1024" | bc 2>/dev/null || echo "0" ;;
+        T) echo "$num * 1024 * 1024 * 1024 * 1024" | bc 2>/dev/null || echo "0" ;;
+        *) echo "${num%.*}" 2>/dev/null || echo "0" ;;  # Assume bytes
+    esac
+}
+
+# Size threshold for warnings (10MB in bytes)
+SIZE_WARN_THRESHOLD=$((10 * 1024 * 1024))
+
+# Discover all git repositories in multiple directories
+# Uses each directory's basename as prefix for its repos
+# Arguments:
+#   $@ - directories to scan for git repos
 # Returns:
 #   Path to temporary config file (stdout)
-discover_repos_in_dir() {
-    local search_dir="$1"
+#   Projects output format: prefix/repo_name|absolute_source_path
+discover_repos_multi() {
+    local search_dirs=("$@")
     local temp_config="$CACHE_DIR/discovered-config-$$.yml"
 
     mkdir -p "$CACHE_DIR"
 
-    # Redirect output to stderr to avoid interfering with return value
-    info "Discovering git repositories in: $search_dir" >&2
-
-    # Find all git repos (only direct subdirectories, not nested)
     local found_count=0
     local projects=""
+    local large_repos=()
 
-    for dir in "$search_dir"/*/; do
-        if [[ -d "$dir/.git" ]]; then
-            local repo_name
-            repo_name=$(basename "$dir")
-            info "  Found: $repo_name" >&2
-            projects+="$repo_name|$dir"$'\n'
-            found_count=$((found_count + 1))
-        fi
+    for search_dir in "${search_dirs[@]}"; do
+        # Use basename of search dir as prefix
+        local prefix
+        prefix=$(basename "$(cd "$search_dir" && pwd)")
+
+        info "Discovering in: $search_dir → $prefix/" >&2
+
+        for dir in "$search_dir"/*/; do
+            if [[ -d "$dir/.git" ]]; then
+                local repo_name
+                repo_name=$(basename "$dir")
+                local abs_repo_path
+                abs_repo_path=$(cd "$dir" && pwd)
+
+                # Workspace path: prefix/repo_name
+                local workspace_path="$prefix/$repo_name"
+
+                # Check .git size
+                local git_size
+                git_size=$(get_dir_size "$dir/.git")
+                local git_bytes
+                git_bytes=$(size_to_bytes "$git_size")
+
+                if [[ "$git_bytes" -gt "$SIZE_WARN_THRESHOLD" ]]; then
+                    warn "  ⚠ $workspace_path (.git: $git_size)" >&2
+                    large_repos+=("$workspace_path: .git=$git_size")
+                else
+                    info "  ✓ $workspace_path ($git_size)" >&2
+                fi
+
+                projects+="$workspace_path|$abs_repo_path"$'\n'
+                found_count=$((found_count + 1))
+            fi
+        done
     done
 
     if [[ $found_count -eq 0 ]]; then
-        error "No git repositories found in: $search_dir" >&2
+        error "No git repositories found" >&2
         exit 1
     fi
+
+    # Warn about large repos
+    if [[ ${#large_repos[@]} -gt 0 ]]; then
+        echo "" >&2
+        warn "Found ${#large_repos[@]} repo(s) with .git > 10MB (may slow cloning):" >&2
+        for repo in "${large_repos[@]}"; do
+            warn "  $repo" >&2
+        done
+        warn "Consider: git filter-repo --path target/ --invert-paths --force" >&2
+        echo "" >&2
+    fi
+
+    success "Discovered $found_count repositories" >&2
 
     # Generate temporary config file
     cat > "$temp_config" << 'EOF'
@@ -92,16 +164,23 @@ version: "1"
 projects:
 EOF
 
-    while IFS='|' read -r name path; do
-        [[ -z "$name" ]] && continue
-        echo "  $name:" >> "$temp_config"
-        echo "    path: $path" >> "$temp_config"
+    while IFS='|' read -r rel_path abs_path; do
+        [[ -z "$rel_path" ]] && continue
+        echo "  \"$rel_path\":" >> "$temp_config"
+        echo "    path: $abs_path" >> "$temp_config"
     done <<< "$projects"
 
-    success "Discovered $found_count repositories" >&2
-
-    # Return path to temp config (only thing on stdout)
     echo "$temp_config"
+}
+
+# Discover all git repositories in a directory and generate config
+# (Legacy single-directory version, calls discover_repos_multi)
+# Arguments:
+#   $1 - search directory to scan for git repos
+# Returns:
+#   Path to temporary config file (stdout)
+discover_repos_in_dir() {
+    discover_repos_multi "$1"
 }
 
 # Find .claude-projects.yml config file

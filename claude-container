@@ -49,7 +49,8 @@ RUN_AS_USER=false
 RUN_AS_ROOTISH=true  # Default: run as user with fake-root for package installs
 AUTO_SYNC_BRANCH=""
 NO_RUN=false
-DISCOVER_REPOS_DIR=""
+SHELL_ONLY=false
+DISCOVER_REPOS_DIRS=()  # Array for multiple --discover-repos
 
 # Docker args accumulator
 declare -a DOCKER_ARGS
@@ -67,7 +68,8 @@ case "${1:-}" in
         ;;
 
     --delete-session)
-        session_delete "$2"
+        shift
+        session_delete "$@"
         exit 0
         ;;
 
@@ -85,6 +87,13 @@ case "${1:-}" in
     --merge-session)
         shift
         session_merge "$@"
+        exit 0
+        ;;
+
+    --add-repo)
+        # Usage: --add-repo <session> <repo-path> [workspace-path]
+        shift
+        session_add_repo "$@"
         exit 0
         ;;
 esac
@@ -136,7 +145,7 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
         --discover-repos)
-            DISCOVER_REPOS_DIR="$2"
+            DISCOVER_REPOS_DIRS+=("$2")
             shift 2
             ;;
         --config|-C)
@@ -145,6 +154,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --no-run)
             NO_RUN=true
+            shift
+            ;;
+        --shell|--bash)
+            SHELL_ONLY=true
             shift
             ;;
         --version|-V)
@@ -171,16 +184,18 @@ Options:
   --discover-repos <dir>   Auto-discover all git repos in directory
   --config, -C <path>      Explicit path to .claude-projects.yml config file
   --verify, -v             Verify container setup works (run checks and exit)
+  --shell, --bash          Start bash shell instead of claude
   --version, -V            Show version
   --help, -h               Show this help
 
 Session Management:
   --cleanup                List and optionally delete all claude-related volumes
   --list-sessions, --sessions  List all sessions with disk usage per volume
-  --delete-session <name>  Delete a specific session and all its volumes
+  --delete-session <name> [--regex] [--yes]  Delete session(s) with confirmation
   --restart-session <name> Restart a session (fixes permissions, continues conversation)
   --diff-session <name>    Show changes made in a git session vs original repo
   --merge-session <name>   Merge session commits back to repo
+  --add-repo <session> <path> [name]  Add a repo to an existing session
 
 Environment:
   CLAUDE_CODE_OAUTH_TOKEN   OAuth token for authentication (required)
@@ -390,6 +405,10 @@ if $RUN_AS_ROOTISH; then
     DOCKER_ARGS+=("--security-opt" "seccomp=unconfined")
 fi
 
+if $SHELL_ONLY; then
+    DOCKER_ARGS+=("-e" "SHELL_ONLY=1")
+fi
+
 info "Starting container..."
 echo "  Image: $IMAGE_NAME"
 if $USE_GIT_SESSION; then
@@ -499,6 +518,15 @@ WRAPPER
         exit 0
     fi
 
+    # Shell-only mode - just run bash in /workspace
+    if [[ "${SHELL_ONLY:-}" == "1" ]]; then
+        if [[ "${RUN_AS_USER:-}" == "1" ]] || [[ "${RUN_AS_ROOTISH:-}" == "1" ]]; then
+            exec gosu developer bash -c "cd /workspace && exec bash"
+        else
+            exec bash -c "cd /workspace && exec bash"
+        fi
+    fi
+
     # Run claude
     if [[ "${RUN_AS_USER:-}" == "1" ]] || [[ "${RUN_AS_ROOTISH:-}" == "1" ]]; then
         CLAUDE_ARGS="--dangerously-skip-permissions"
@@ -510,6 +538,7 @@ WRAPPER
         CLAUDE_ARGS="--continue $CLAUDE_ARGS"
     fi
 
+    cd /workspace
     if [[ "${RUN_AS_USER:-}" == "1" ]] || [[ "${RUN_AS_ROOTISH:-}" == "1" ]]; then
         exec gosu developer claude $CLAUDE_ARGS
     else
