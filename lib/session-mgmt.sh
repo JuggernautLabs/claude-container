@@ -68,7 +68,10 @@ session_cleanup_unused() {
     local unused_volumes=()
     while read -r vol; do
         [[ -z "$vol" ]] && continue
-        if ! echo "$used_volumes" | grep -q "^${vol}$"; then
+        # Check if volume is NOT in used list (avoid ! for zsh compatibility)
+        if echo "$used_volumes" | grep -q "^${vol}$"; then
+            : # Volume is in use, skip
+        else
             unused_volumes+=("$vol")
         fi
     done <<< "$all_volumes"
@@ -88,41 +91,49 @@ session_cleanup_unused() {
     echo ""
     echo "Calculating sizes..."
 
-    # Get size of each volume
-    local total_bytes=0
-    local vol_sizes=()
+    # Build mount arguments for all unused volumes at once (much faster!)
+    local mount_args=""
     for vol in "${unused_volumes[@]}"; do
-        local size_info
-        size_info=$(docker run --rm -v "$vol:/data:ro" alpine sh -c '
-            bytes=$(du -sb /data 2>/dev/null | cut -f1)
-            human=$(du -sh /data 2>/dev/null | cut -f1)
-            echo "$human|$bytes"
-        ' 2>/dev/null || echo "?|0")
-        local size_human="${size_info%|*}"
-        local size_bytes="${size_info#*|}"
-        vol_sizes+=("$vol|$size_human")
-        total_bytes=$((total_bytes + size_bytes))
+        mount_args="$mount_args -v $vol:/$vol"
     done
 
-    # Convert total to human readable
-    local total_human
-    if [[ $total_bytes -gt 1073741824 ]]; then
-        total_human="$(echo "scale=1; $total_bytes/1073741824" | bc)G"
-    elif [[ $total_bytes -gt 1048576 ]]; then
-        total_human="$(echo "scale=1; $total_bytes/1048576" | bc)M"
-    elif [[ $total_bytes -gt 1024 ]]; then
-        total_human="$(echo "scale=1; $total_bytes/1024" | bc)K"
-    else
-        total_human="${total_bytes}B"
-    fi
+    # Get all sizes in one container run
+    local sizes
+    sizes=$(docker run --rm $mount_args alpine sh -c '
+        total=0
+        for dir in /claude-* /session-data-*; do
+            [ -d "$dir" ] || continue
+            name=$(basename "$dir")
+            bytes=$(du -sb "$dir" 2>/dev/null | cut -f1)
+            bytes=${bytes:-0}
+            human=$(du -sh "$dir" 2>/dev/null | cut -f1)
+            human=${human:-?}
+            total=$((total + bytes))
+            echo "$name|$human"
+        done
+        # Output total in human readable
+        if [ $total -gt 1073741824 ]; then
+            echo "TOTAL|$((total / 1073741824))G"
+        elif [ $total -gt 1048576 ]; then
+            echo "TOTAL|$((total / 1048576))M"
+        elif [ $total -gt 1024 ]; then
+            echo "TOTAL|$((total / 1024))K"
+        else
+            echo "TOTAL|${total}B"
+        fi
+    ' 2>/dev/null || echo "")
 
     echo ""
     echo "Volumes to delete:"
-    for entry in "${vol_sizes[@]}"; do
-        local vol_name="${entry%|*}"
-        local vol_size="${entry#*|}"
-        printf "  %-50s %10s\n" "$vol_name" "$vol_size"
-    done
+    local total_human="unknown"
+    while IFS='|' read -r name size; do
+        [[ -z "$name" ]] && continue
+        if [[ "$name" == "TOTAL" ]]; then
+            total_human="$size"
+        else
+            printf "  %-50s %10s\n" "$name" "$size"
+        fi
+    done <<< "$sizes"
     echo ""
     echo "Total size to free: $total_human"
     echo ""
