@@ -53,7 +53,7 @@ diff_multi_project_session() {
     # If project filter specified, show detailed diff for that project only
     if [[ -n "$project_filter" ]]; then
         local found=false
-        while IFS='|' read -r project_name source_path; do
+        while IFS='|' read -r project_name source_path _branch; do
             if [[ "$project_name" == "$project_filter" ]]; then
                 found=true
                 info "Comparing project '$project_name' with source: $source_path"
@@ -92,7 +92,7 @@ diff_multi_project_session() {
         if ! $found; then
             error "Project not found in session: $project_filter"
             echo "Available projects:"
-            while IFS='|' read -r project_name source_path; do
+            while IFS='|' read -r project_name _path _branch; do
                 echo "  - $project_name"
             done <<< "$projects"
             exit 1
@@ -104,7 +104,7 @@ diff_multi_project_session() {
     info "Multi-project session: $name"
     echo ""
 
-    while IFS='|' read -r project_name source_path; do
+    while IFS='|' read -r project_name source_path _branch; do
         # Count commits in this project
         local commit_count
         commit_count=$(docker run --rm \
@@ -231,8 +231,10 @@ merge_multi_project_session() {
     local has_changes=false
 
     echo "Projects to merge:"
-    while IFS='|' read -r project_name source_path; do
+    declare -A project_branches
+    while IFS='|' read -r project_name source_path source_branch; do
         project_paths[$project_name]="$source_path"
+        project_branches[$project_name]="$source_branch"
 
         # Count commits
         local commit_count
@@ -293,25 +295,29 @@ merge_multi_project_session() {
         fi
 
         local source_path="${project_paths[$project_name]}"
+        local config_branch="${project_branches[$project_name]}"
         echo ""
         info "Merging project: $project_name"
 
         # Verify source path is a git repo
-        if [[ ! -d "$source_path/.git" ]]; then
+        if ! is_git_repo "$source_path"; then
             error "  Source is not a git repo: $source_path"
             fail_count=$((fail_count + 1))
             continue
         fi
 
+        # Determine which branch to use: command-line --into takes priority, then config branch
+        local merge_branch="${target_branch:-$config_branch}"
+
         # Handle branch switching if specified
-        if [[ -n "$target_branch" ]]; then
+        if [[ -n "$merge_branch" ]]; then
             cd "$source_path"
-            if git show-ref --verify --quiet "refs/heads/$target_branch"; then
-                info "  Switching to existing branch: $target_branch"
-                git checkout "$target_branch"
+            if git show-ref --verify --quiet "refs/heads/$merge_branch"; then
+                info "  Switching to existing branch: $merge_branch"
+                git checkout "$merge_branch"
             else
-                info "  Creating new branch: $target_branch"
-                git checkout -b "$target_branch"
+                info "  Creating new branch: $merge_branch"
+                git checkout -b "$merge_branch"
             fi
         fi
 
@@ -401,7 +407,7 @@ merge_git_session() {
     fi
 
     # Check if target is a git repo
-    if [[ ! -d "$target_dir/.git" ]]; then
+    if ! is_git_repo "$target_dir"; then
         error "Target directory is not a git repository: $target_dir"
         exit 1
     fi

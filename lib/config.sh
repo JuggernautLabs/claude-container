@@ -112,7 +112,13 @@ discover_repos_multi() {
         info "Discovering in: $search_dir → $prefix/" >&2
 
         for dir in "$search_dir"/*/; do
-            if [[ -d "$dir/.git" ]]; then
+            if is_git_repo "$dir"; then
+                # Skip worktrees by default (only add them explicitly via --add-repo)
+                if is_git_worktree "$dir"; then
+                    info "  ⊘ $(basename "$dir") (worktree, skipped)" >&2
+                    continue
+                fi
+
                 local repo_name
                 repo_name=$(basename "$dir")
                 local abs_repo_path
@@ -220,11 +226,11 @@ find_config_file() {
 }
 
 # Parse YAML config file and extract project mappings
-# Returns newline-delimited format: "project_name|absolute_path"
+# Returns newline-delimited format: "project_name|absolute_path|branch"
 # Arguments:
 #   $1 - path to config file
 # Returns:
-#   Project mappings (stdout), one per line: "name|path"
+#   Project mappings (stdout), one per line: "name|path|branch" (branch may be empty)
 parse_config_file() {
     local config_file="$1"
     local config_dir
@@ -232,19 +238,19 @@ parse_config_file() {
 
     # Try yq first (most robust), fall back to Python
     if command -v yq &>/dev/null; then
-        # Parse with yq: extract project names and paths
+        # Parse with yq: extract project names, paths, and optional branch
         local yq_output
-        yq_output=$(yq eval '.projects | to_entries | .[] | .key + "|" + .value.path' "$config_file" 2>/dev/null) || {
+        yq_output=$(yq eval '.projects | to_entries | .[] | .key + "|" + .value.path + "|" + (.value.branch // "")' "$config_file" 2>/dev/null) || {
             error "Failed to parse config file with yq"
             exit 1
         }
 
         # Resolve relative paths to absolute
-        while IFS='|' read -r proj_name proj_path; do
+        while IFS='|' read -r proj_name proj_path proj_branch; do
             if [[ "$proj_path" != /* ]]; then
                 proj_path="$(cd "$config_dir" && cd "$proj_path" && pwd)"
             fi
-            echo "$proj_name|$proj_path"
+            echo "$proj_name|$proj_path|$proj_branch"
         done <<< "$yq_output"
     elif command -v python3 &>/dev/null; then
         # Fallback to Python
@@ -265,11 +271,12 @@ try:
             sys.exit(1)
 
         path = info['path']
+        branch = info.get('branch', '')
         # Resolve relative paths
         if not os.path.isabs(path):
             path = os.path.abspath(os.path.join('$config_dir', path))
 
-        print(f'{name}|{path}')
+        print(f'{name}|{path}|{branch}')
 except yaml.YAMLError as e:
     print(f'Error: Invalid YAML: {e}', file=sys.stderr)
     sys.exit(1)
@@ -341,7 +348,7 @@ validate_config() {
         fi
 
         # Validate it's a git repo
-        if [[ ! -d "$proj_path/.git" ]]; then
+        if ! is_git_repo "$proj_path"; then
             error "Project '$proj_name': not a git repository: $proj_path"
             exit 1
         fi

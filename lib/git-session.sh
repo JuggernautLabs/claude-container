@@ -119,17 +119,21 @@ create_multi_project_session() {
     local log_dir="$CACHE_DIR/clone-logs-$$"
     mkdir -p "$log_dir"
 
-    while IFS='|' read -r project_name source_path; do
+    while IFS='|' read -r project_name source_path source_branch; do
         [[ -z "$project_name" ]] && continue
         project_count=$((project_count + 1))
         project_names+=("$project_name")
 
-        info "Cloning '$project_name'..."
+        local branch_info=""
+        [[ -n "$source_branch" ]] && branch_info=" (branch: $source_branch)"
+        info "Cloning '$project_name'$branch_info..."
 
         # Clone and configure in one docker run, in background
         # Run as target UID so files are created with correct ownership (no chown needed)
         # Use git -c flags instead of --global config (no home dir for arbitrary UID)
         local safe_log_name="${project_name//\//_}"  # Replace / with _ for log filename
+        local branch_flag=""
+        [[ -n "$source_branch" ]] && branch_flag="--branch $source_branch"
         (
             docker run --rm \
                 --user "$host_uid:$host_uid" \
@@ -138,7 +142,7 @@ create_multi_project_session() {
                 "$git_image" \
                 sh -c "
                     mkdir -p /session/$(dirname "$project_name") && \
-                    git -c safe.directory='*' clone --depth 1 /source '/session/$project_name' && \
+                    git -c safe.directory='*' clone --depth 1 $branch_flag /source '/session/$project_name' && \
                     cd '/session/$project_name' && \
                     git remote remove origin 2>/dev/null || true && \
                     git config user.email 'claude@container' && \
@@ -233,7 +237,7 @@ create_git_session() {
         error "Source directory does not exist: $source_dir"
         exit 1
     fi
-    if [[ ! -d "$source_dir/.git" ]]; then
+    if ! is_git_repo "$source_dir"; then
         error "Source directory is not a git repository: $source_dir"
         exit 1
     fi

@@ -14,6 +14,54 @@ success() { echo -e "${GREEN}✓${NC} $*"; }
 warn() { echo -e "${YELLOW}⚠${NC} $*"; }
 error() { echo -e "${RED}✗${NC} $*" >&2; }
 
+# Check if a directory is a git repository (handles both regular repos and worktrees)
+# Regular repo: .git is a directory
+# Worktree: .git is a file containing "gitdir: /path/to/main/.git/worktrees/name"
+is_git_repo() {
+    local path="$1"
+    [[ -d "$path/.git" ]] || [[ -f "$path/.git" ]]
+}
+
+# Check if a git repo is a worktree
+# Returns 0 if worktree, 1 if regular repo
+is_git_worktree() {
+    local path="$1"
+    [[ -f "$path/.git" ]]
+}
+
+# Get the main repo path for a worktree
+# For worktrees, parses .git file to find main repo
+# For regular repos, returns the path as-is
+# Arguments:
+#   $1 - path to repo or worktree
+# Returns:
+#   Main repo path (stdout)
+get_main_repo_path() {
+    local path="$1"
+
+    if [[ -f "$path/.git" ]]; then
+        # Worktree: parse gitdir line to find main repo
+        # Format: gitdir: /path/to/main/.git/worktrees/name
+        local gitdir
+        gitdir=$(grep "^gitdir:" "$path/.git" | cut -d' ' -f2)
+        # Remove /worktrees/name suffix to get main .git, then remove /.git
+        echo "${gitdir%/.git/worktrees/*}"
+    else
+        # Regular repo
+        echo "$path"
+    fi
+}
+
+# Get the current branch of a git repo or worktree
+# Arguments:
+#   $1 - path to repo or worktree
+# Returns:
+#   Branch name (stdout)
+get_git_branch() {
+    local path="$1"
+    git -C "$path" rev-parse --abbrev-ref HEAD 2>/dev/null
+}
+
 # Spinner for long operations
 spin() {
     local pid=$1

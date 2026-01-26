@@ -282,8 +282,8 @@ session_add_repo() {
         return 1
     fi
 
-    # Verify repo exists and is a git repo
-    if [[ ! -d "$repo_path/.git" ]]; then
+    # Verify repo exists and is a git repo (handles worktrees too)
+    if ! is_git_repo "$repo_path"; then
         error "Not a git repository: $repo_path"
         return 1
     fi
@@ -291,6 +291,16 @@ session_add_repo() {
     # Get absolute path
     local abs_repo_path
     abs_repo_path=$(cd "$repo_path" && pwd)
+
+    # Handle worktrees: clone from main repo and checkout the branch
+    local source_repo_path="$abs_repo_path"
+    local branch_to_checkout=""
+
+    if is_git_worktree "$abs_repo_path"; then
+        source_repo_path=$(get_main_repo_path "$abs_repo_path")
+        branch_to_checkout=$(get_git_branch "$abs_repo_path")
+        info "Detected worktree, using main repo: $source_repo_path (branch: $branch_to_checkout)"
+    fi
 
     # Default workspace path to repo basename
     if [[ -z "$workspace_path" ]]; then
@@ -315,22 +325,32 @@ session_add_repo() {
 
     info "Adding repo to session: $workspace_path"
 
+    # Build clone command - with optional branch checkout for worktrees
+    local clone_cmd="
+        mkdir -p /session/$(dirname "$workspace_path") && \
+        git -c safe.directory='*' clone --depth 1 /source '/session/$workspace_path'"
+
+    if [[ -n "$branch_to_checkout" ]]; then
+        clone_cmd="
+            mkdir -p /session/$(dirname "$workspace_path") && \
+            git -c safe.directory='*' clone --depth 1 --branch '$branch_to_checkout' /source '/session/$workspace_path'"
+    fi
+
+    clone_cmd="$clone_cmd && \
+        cd '/session/$workspace_path' && \
+        git remote remove origin 2>/dev/null || true && \
+        git config user.email 'claude@container' && \
+        git config user.name 'Claude' && \
+        du -sh '/session/$workspace_path' | cut -f1"
+
     # Clone the repo into the session
     local clone_output
     if ! clone_output=$(docker run --rm \
         --user "$host_uid:$host_uid" \
-        -v "$abs_repo_path:/source:ro" \
+        -v "$source_repo_path:/source:ro" \
         -v "$volume:/session" \
         "$git_image" \
-        sh -c "
-            mkdir -p /session/$(dirname "$workspace_path") && \
-            git -c safe.directory='*' clone --depth 1 /source '/session/$workspace_path' && \
-            cd '/session/$workspace_path' && \
-            git remote remove origin 2>/dev/null || true && \
-            git config user.email 'claude@container' && \
-            git config user.name 'Claude' && \
-            du -sh '/session/$workspace_path' | cut -f1
-        " 2>&1); then
+        sh -c "$clone_cmd" 2>&1); then
         error "Failed to clone repo:"
         echo "$clone_output" >&2
         return 1
@@ -340,6 +360,10 @@ session_add_repo() {
     success "Added: $workspace_path ($size)"
 
     # Update .claude-projects.yml if it exists
+    # For worktrees, store main repo path + branch so merge works correctly
+    local config_path="$source_repo_path"
+    local config_branch="$branch_to_checkout"
+
     docker run --rm \
         --user "$host_uid:$host_uid" \
         -v "$volume:/session" \
@@ -347,7 +371,10 @@ session_add_repo() {
         sh -c "
             if [[ -f /session/.claude-projects.yml ]]; then
                 echo '  \"$workspace_path\":' >> /session/.claude-projects.yml
-                echo '    path: $abs_repo_path' >> /session/.claude-projects.yml
+                echo '    path: $config_path' >> /session/.claude-projects.yml
+                if [[ -n '$config_branch' ]]; then
+                    echo '    branch: $config_branch' >> /session/.claude-projects.yml
+                fi
             fi
         " 2>/dev/null || true
 }
