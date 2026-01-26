@@ -112,6 +112,15 @@ Generated command:
 Execute this command? [Y/n] y
 ```
 
+**What context does the wizard have?**
+
+The wizard gathers information before starting to help Claude make better suggestions:
+- **Existing sessions** - Can offer to resume previous work
+- **Current directory** - Understands where you are
+- **Git repos found** - Detects repos in current directory
+- **Full command reference** - Knows all available options
+- **Best practices** - Recommends `--as-rootish` and other settings
+
 The wizard requires Claude Code CLI to be installed (`claude` command).
 
 ## Starting a Session
