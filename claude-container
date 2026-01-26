@@ -1358,6 +1358,100 @@ case "${1:-}" in
         merge_git_session "$session_name" "$(pwd)" "$target_branch" "$auto_mode"
         exit 0
         ;;
+
+    --wizard)
+        # Interactive wizard using Claude Code to configure and launch a session
+        WIZARD_DIR="$HOME/.cache/claude-container/wizard-$$"
+        WIZARD_CMD_FILE="$WIZARD_DIR/command.sh"
+        SCRIPT_PATH="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+
+        mkdir -p "$WIZARD_DIR"
+        trap "rm -rf '$WIZARD_DIR'" EXIT
+
+        echo ""
+        echo "╔════════════════════════════════════════════════════════════════╗"
+        echo "║              Claude Container Setup Wizard                      ║"
+        echo "╠════════════════════════════════════════════════════════════════╣"
+        echo "║  Claude will help you configure your container session.        ║"
+        echo "║  Answer a few questions and it will set everything up.         ║"
+        echo "║                                                                 ║"
+        echo "║  When done, Claude will write the command to:                   ║"
+        echo "║  $WIZARD_CMD_FILE"
+        echo "║                                                                 ║"
+        echo "║  Type 'exit' or Ctrl+D when finished.                          ║"
+        echo "╚════════════════════════════════════════════════════════════════╝"
+        echo ""
+
+        # Check for Claude Code
+        if ! command -v claude &>/dev/null; then
+            error "Claude Code CLI not found. Please install it first:"
+            echo "  npm install -g @anthropic-ai/claude-code"
+            exit 1
+        fi
+
+        # Create the wizard system prompt
+        WIZARD_SYSTEM_PROMPT="You are the claude-container setup wizard. Help the user configure a claude-container session.
+
+YOUR TASK:
+1. Ask the user about their project(s) - single repo or multiple repos?
+2. Get the path(s) to their project(s)
+3. Suggest a session name
+4. Ask if they want --as-rootish (recommended for installing packages)
+5. Generate the final command and write it to: $WIZARD_CMD_FILE
+
+AVAILABLE COMMANDS:
+- Single repo: claude-container --git-session NAME
+- Multiple repos (auto-discover): claude-container --git-session NAME --discover-repos /path/to/dir
+- With rootish: add --as-rootish (recommended)
+- Continue conversation: add --continue
+
+WHEN READY:
+Write the final command to $WIZARD_CMD_FILE using the Write tool. Example:
+  Write to $WIZARD_CMD_FILE:
+  $SCRIPT_PATH --git-session my-project --discover-repos ~/dev/projects --as-rootish
+
+After writing, tell the user: 'Command saved! Exit the wizard (Ctrl+D) to run it.'
+
+Be friendly, ask one question at a time, and suggest sensible defaults. Most users want --as-rootish."
+
+        # Launch Claude Code interactively
+        claude -p "$WIZARD_SYSTEM_PROMPT
+
+Start by greeting the user and asking: Do you want to work with a single repository or multiple repositories in one session?"
+
+        # After Claude exits, check for the command file
+        if [[ -f "$WIZARD_CMD_FILE" ]]; then
+            echo ""
+            echo "════════════════════════════════════════════════════════════════"
+            WIZARD_CMD=$(cat "$WIZARD_CMD_FILE")
+            echo "Generated command:"
+            echo "  $WIZARD_CMD"
+            echo "════════════════════════════════════════════════════════════════"
+            echo ""
+            read -p "Execute this command? [Y/n] " confirm
+            if [[ "$confirm" != "n" && "$confirm" != "N" ]]; then
+                echo ""
+                eval "$WIZARD_CMD"
+            else
+                echo ""
+                echo "Command saved to: $WIZARD_CMD_FILE"
+                echo "Run manually with: bash $WIZARD_CMD_FILE"
+                # Don't delete the file if user wants to run manually
+                trap - EXIT
+            fi
+        else
+            echo ""
+            warn "No command was generated."
+            echo ""
+            echo "Quick start examples:"
+            echo "  # Single repo (current directory)"
+            echo "  $SCRIPT_PATH --git-session my-project --as-rootish"
+            echo ""
+            echo "  # Multiple repos (auto-discover)"
+            echo "  $SCRIPT_PATH --git-session my-project --discover-repos ~/dev/myprojects --as-rootish"
+        fi
+        exit 0
+        ;;
 esac
 
 # Parse arguments
@@ -1442,6 +1536,7 @@ Options:
   --config, -C <path>      Explicit path to .claude-projects.yml config file
   --verify, -v             Verify container setup works (run checks and exit)
   --version, -V            Show version
+  --wizard                 Interactive setup wizard - Claude helps you configure your session
   --help, -h               Show this help
 
 Git Session Management:
