@@ -62,6 +62,38 @@ get_git_branch() {
     git -C "$path" rev-parse --abbrev-ref HEAD 2>/dev/null
 }
 
+# Find worktree path for a given branch
+# Arguments:
+#   $1 - path to main repo
+#   $2 - branch name
+# Returns:
+#   Worktree path (stdout) if found, empty otherwise
+find_worktree_for_branch() {
+    local repo_path="$1"
+    local branch="$2"
+
+    # Get the main repo path (in case we're given a worktree)
+    local main_repo
+    main_repo=$(get_main_repo_path "$repo_path")
+
+    # List worktrees and find one on the target branch
+    git -C "$main_repo" worktree list --porcelain 2>/dev/null | while read -r line; do
+        if [[ "$line" =~ ^worktree\ (.+)$ ]]; then
+            local wt_path="${BASH_REMATCH[1]}"
+            # Read next lines for branch info
+            read -r head_line || true
+            read -r branch_line || true
+            if [[ "$branch_line" =~ ^branch\ refs/heads/(.+)$ ]]; then
+                local wt_branch="${BASH_REMATCH[1]}"
+                if [[ "$wt_branch" == "$branch" ]]; then
+                    echo "$wt_path"
+                    return 0
+                fi
+            fi
+        fi
+    done
+}
+
 # Spinner for long operations
 spin() {
     local pid=$1

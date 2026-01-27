@@ -250,6 +250,7 @@ merge_multi_project_session() {
     # Analyze each project to see which have commits
     declare -A project_commits
     declare -A project_paths
+    declare -A project_host_heads
     local has_changes=false
 
     echo "Projects to merge:"
@@ -299,6 +300,7 @@ merge_multi_project_session() {
         fi
 
         project_commits[$project_name]=$commit_count
+        project_host_heads[$project_name]="$host_head"
 
         if [[ "$commit_count" -gt 0 ]]; then
             echo "  [x] $project_name ($commit_count commits)"
@@ -365,16 +367,26 @@ merge_multi_project_session() {
 
         # Determine which branch to use: command-line --into takes priority, then config branch
         local merge_branch="${target_branch:-$config_branch}"
+        local merge_path="$source_path"
 
         # Handle branch switching if specified
         if [[ -n "$merge_branch" ]]; then
-            cd "$source_path"
-            if git show-ref --verify --quiet "refs/heads/$merge_branch"; then
-                info "  Switching to existing branch: $merge_branch"
-                git checkout "$merge_branch"
+            # Check if a worktree exists for this branch
+            local worktree_path
+            worktree_path=$(find_worktree_for_branch "$source_path" "$merge_branch")
+
+            if [[ -n "$worktree_path" && -d "$worktree_path" ]]; then
+                info "  Using worktree: $worktree_path (branch: $merge_branch)"
+                merge_path="$worktree_path"
             else
-                info "  Creating new branch: $merge_branch"
-                git checkout -b "$merge_branch"
+                cd "$source_path"
+                if git show-ref --verify --quiet "refs/heads/$merge_branch"; then
+                    info "  Switching to existing branch: $merge_branch"
+                    git checkout "$merge_branch"
+                else
+                    info "  Creating new branch: $merge_branch"
+                    git checkout -b "$merge_branch"
+                fi
             fi
         fi
 
@@ -382,21 +394,32 @@ merge_multi_project_session() {
         local project_patch_dir="$patch_dir/$project_name"
         mkdir -p "$project_patch_dir"
 
-        # Export patches from session
+        # Get the host HEAD for this project (to generate patches only for new commits)
+        local project_host_head="${project_host_heads[$project_name]}"
+
+        # Export patches from session (only commits after host HEAD)
         docker run --rm \
             -v "$volume:/session:ro" \
             -v "$project_patch_dir:/patches" \
+            -e "HOST_HEAD=$project_host_head" \
             "$git_image" \
-            sh -c "
-                git config --global --add safe.directory '*'
-                cd /session/$project_name
-                initial=\$(git rev-list --max-parents=0 HEAD 2>/dev/null | tail -1)
-                git format-patch -o /patches \"\$initial\"..HEAD 2>/dev/null || \
-                    git format-patch -o /patches -10
-            "
+            sh -c '
+                git config --global --add safe.directory "*"
+                cd /session/'"$project_name"'
+                # Use host HEAD as base if available, otherwise fall back to initial commit
+                if [ -n "$HOST_HEAD" ] && git cat-file -e "$HOST_HEAD" 2>/dev/null; then
+                    echo "Generating patches from $HOST_HEAD..HEAD"
+                    git format-patch -o /patches "$HOST_HEAD..HEAD" 2>/dev/null
+                else
+                    echo "No host HEAD, generating all patches"
+                    initial=$(git rev-list --max-parents=0 HEAD 2>/dev/null | tail -1)
+                    git format-patch -o /patches "$initial..HEAD" 2>/dev/null || \
+                        git format-patch -o /patches -10
+                fi
+            '
 
         # Apply patches
-        cd "$source_path"
+        cd "$merge_path"
         local patch_count
         patch_count=$(ls -1 "$project_patch_dir"/*.patch 2>/dev/null | wc -l | tr -d ' ')
 
@@ -411,7 +434,7 @@ merge_multi_project_session() {
                 success "  Applied: $(basename "$patch")"
             else
                 error "  Failed to apply: $(basename "$patch")"
-                echo "  Run 'git am --abort' to cancel in: $source_path"
+                echo "  Run 'git am --abort' to cancel in: $merge_path"
                 project_success=false
                 break
             fi
