@@ -221,6 +221,7 @@ merge_multi_project_session() {
     local target_dir="$2"
     local target_branch="${3:-}"
     local auto_mode="${4:-false}"
+    local no_run="${5:-false}"
     local volume="claude-session-${name}"
     local git_image="${IMAGE_NAME:-$DEFAULT_IMAGE}"
 
@@ -309,6 +310,13 @@ merge_multi_project_session() {
 
     if ! $has_changes; then
         warn "No changes to merge in any project"
+        return 0
+    fi
+
+    # --no-run mode: just show summary and exit
+    if [[ "$no_run" == "true" ]]; then
+        echo ""
+        info "Dry run complete. Use without --no-run to merge."
         return 0
     fi
 
@@ -441,6 +449,7 @@ merge_git_session() {
     local target_dir="$2"
     local target_branch="${3:-}"
     local auto_mode="${4:-false}"
+    local no_run="${5:-false}"
     local volume="claude-session-${name}"
 
     # Check if session exists
@@ -451,7 +460,7 @@ merge_git_session() {
 
     # Check if this is a multi-project session
     if has_multi_project_config "$volume"; then
-        merge_multi_project_session "$name" "$target_dir" "$target_branch" "$auto_mode"
+        merge_multi_project_session "$name" "$target_dir" "$target_branch" "$auto_mode" "$no_run"
         return $?
     fi
 

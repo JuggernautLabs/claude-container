@@ -497,7 +497,7 @@ session_add_repo() {
 }
 
 # Merge session commits back to original repo
-# Usage: session_merge <session_name> [source_dir] [--into <branch>] [--auto]
+# Usage: session_merge <session_name> [source_dir] [--into <branch>] [--auto] [--no-run]
 # Note: Calls merge_git_session from git-ops.sh
 session_merge() {
     local session_name="$1"
@@ -505,13 +505,14 @@ session_merge() {
 
     if [[ -z "$session_name" ]]; then
         echo "Error: session_merge requires a session name"
-        echo "Usage: session_merge <name> [--into <branch>] [--auto]"
+        echo "Usage: session_merge <name> [--into <branch>] [--auto] [--no-run]"
         return 1
     fi
 
     local source_dir="$(pwd)"
     local target_branch=""
     local auto_mode=false
+    local no_run=false
 
     # Parse options
     while [[ $# -gt 0 ]]; do
@@ -524,6 +525,10 @@ session_merge() {
                 auto_mode=true
                 shift
                 ;;
+            --no-run|--dry-run)
+                no_run=true
+                shift
+                ;;
             *)
                 # Assume it's the source directory if not an option
                 if [[ ! "$1" =~ ^-- ]]; then
@@ -534,5 +539,5 @@ session_merge() {
         esac
     done
 
-    merge_git_session "$session_name" "$source_dir" "$target_branch" "$auto_mode"
+    merge_git_session "$session_name" "$source_dir" "$target_branch" "$auto_mode" "$no_run"
 }
