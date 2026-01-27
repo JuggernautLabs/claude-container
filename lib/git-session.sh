@@ -218,6 +218,19 @@ create_multi_project_session() {
         exit 1
     fi
 
+    # Record initial merge points for each project (so we only track NEW commits)
+    info "Recording initial merge points..."
+    for pname in "${project_names[@]}"; do
+        docker run --rm \
+            --user "$host_uid:$host_uid" \
+            -v "$volume:/session" \
+            "$git_image" \
+            sh -c "
+                cd '/session/$pname' && \
+                git rev-parse HEAD > '/session/.last-merge-$pname'
+            " 2>/dev/null || warn "  Could not record merge point for $pname"
+    done
+
     success "Multi-project session created: $name ($project_count projects)"
 }
 

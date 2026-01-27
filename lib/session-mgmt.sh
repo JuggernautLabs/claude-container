@@ -521,7 +521,7 @@ session_merge() {
                 target_branch="$2"
                 shift 2
                 ;;
-            --auto)
+            --auto|--yes|-y)
                 auto_mode=true
                 shift
                 ;;

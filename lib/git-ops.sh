@@ -3,12 +3,138 @@
 # Source this file after utils.sh and config.sh
 #
 # Dependencies:
-#   - utils.sh must be sourced first (provides: info, success, warn, error)
+#   - utils.sh must be sourced first (provides: info, success, warn, error, get_main_repo_path)
 #   - config.sh must be sourced first (provides: parse_config_file)
 #
 # Required globals:
 #   - CACHE_DIR: directory for caching temporary files
 #   - IMAGE_NAME or DEFAULT_IMAGE: Docker image for git operations
+
+# Direct merge from volume repo to target path
+# This mounts both in a single container and performs the merge directly
+merge_volume_to_target() {
+    local volume="$1"
+    local project_name="$2"
+    local target_path="$3"
+    local git_image="${IMAGE_NAME:-$DEFAULT_IMAGE}"
+
+    info "Merging $project_name from container to $target_path"
+
+    # Create temp file for patches
+    local patch_file
+    patch_file=$(mktemp)
+    trap "rm -f '$patch_file'" RETURN
+
+    # Generate patches from container
+    local result
+    result=$(docker run --rm \
+        -v "$volume:/session:ro" \
+        --entrypoint sh \
+        "$git_image" \
+        -c '
+            git config --global --add safe.directory "*"
+            cd /session/'"$project_name"'
+            SESSION_HEAD=$(git rev-parse HEAD)
+
+            # Check for merge point marker
+            MERGE_POINT=""
+            if [ -f /session/.last-merge-'"$project_name"' ]; then
+                MERGE_POINT=$(cat /session/.last-merge-'"$project_name"')
+            fi
+
+            # Check if anything to merge
+            if [ -n "$MERGE_POINT" ] && [ "$SESSION_HEAD" = "$MERGE_POINT" ]; then
+                echo "NO_CHANGES:0"
+                exit 0
+            fi
+
+            # Generate patches
+            if [ -n "$MERGE_POINT" ]; then
+                PATCH_COUNT=$(git rev-list --count "$MERGE_POINT..HEAD" 2>/dev/null || echo 0)
+                if [ "$PATCH_COUNT" = "0" ]; then
+                    echo "NO_CHANGES:0"
+                    exit 0
+                fi
+                echo "PATCHES:$PATCH_COUNT"
+                git format-patch --stdout "$MERGE_POINT..HEAD"
+            else
+                INITIAL=$(git rev-list --max-parents=0 HEAD 2>/dev/null | tail -1)
+                PATCH_COUNT=$(git rev-list --count "$INITIAL..HEAD" 2>/dev/null || echo 0)
+                echo "PATCHES:$PATCH_COUNT"
+                git format-patch --stdout "$INITIAL..HEAD"
+            fi
+        ' 2>/dev/null > "$patch_file")
+
+    # Check first line for status
+    local first_line
+    first_line=$(head -1 "$patch_file")
+
+    if [[ "$first_line" == "NO_CHANGES:"* ]]; then
+        echo "  (no new commits)"
+        return 0
+    fi
+
+    if [[ "$first_line" != "PATCHES:"* ]]; then
+        error "  Unexpected response from container"
+        return 1
+    fi
+
+    local patch_count="${first_line#PATCHES:}"
+    info "  Applying $patch_count patch(es)..."
+
+    # Remove the status line and apply patches
+    cd "$target_path"
+    if tail -n +2 "$patch_file" | git am --3way; then
+        success "  Merged $patch_count commit(s)"
+
+        # Record the merge point
+        docker run --rm \
+            -v "$volume:/session" \
+            --entrypoint sh \
+            "$git_image" \
+            -c '
+                git config --global --add safe.directory "*"
+                cd /session/'"$project_name"'
+                git rev-parse HEAD > /session/.last-merge-'"$project_name"'
+            ' 2>/dev/null
+        return 0
+    else
+        error "  Merge failed - resolve conflicts and run: git am --continue"
+        return 1
+    fi
+}
+
+# Get session project status (commits pending merge)
+get_session_status() {
+    local volume="$1"
+    local project_name="$2"
+    local git_image="${IMAGE_NAME:-$DEFAULT_IMAGE}"
+
+    docker run --rm \
+        -v "$volume:/session:ro" \
+        --entrypoint sh \
+        "$git_image" \
+        -c '
+            git config --global --add safe.directory "*"
+            cd /session/'"$project_name"' 2>/dev/null || exit 1
+
+            SESSION_HEAD=$(git rev-parse HEAD)
+
+            # Check for merge point marker
+            if [ -f /session/.last-merge-'"$project_name"' ]; then
+                MERGE_POINT=$(cat /session/.last-merge-'"$project_name"')
+                if [ "$SESSION_HEAD" = "$MERGE_POINT" ]; then
+                    echo "0"
+                else
+                    git rev-list --count "$MERGE_POINT..HEAD" 2>/dev/null || echo "0"
+                fi
+            else
+                # No merge point - count from initial commit
+                INITIAL=$(git rev-list --max-parents=0 HEAD 2>/dev/null | tail -1)
+                git rev-list --count "$INITIAL..HEAD" 2>/dev/null || echo "0"
+            fi
+        ' 2>/dev/null || echo "0"
+}
 
 # Check if a volume contains multi-project config
 has_multi_project_config() {
@@ -34,8 +160,9 @@ diff_multi_project_session() {
     local config_data
     config_data=$(docker run --rm \
         -v "$volume:/session:ro" \
+        --entrypoint sh \
         "$git_image" \
-        cat /session/.claude-projects.yml 2>/dev/null) || {
+        -c 'cat /session/.claude-projects.yml' 2>/dev/null) || {
         error "Failed to read config from session volume"
         exit 1
     }
@@ -105,52 +232,61 @@ diff_multi_project_session() {
     echo ""
 
     while IFS='|' read -r project_name source_path _branch; do
-        # Get host repo's HEAD SHA for comparison
-        local host_head=""
-        if [[ -d "$source_path/.git" ]] || [[ -f "$source_path/.git" ]]; then
-            host_head=$(git -C "$source_path" rev-parse HEAD 2>/dev/null) || host_head=""
-        fi
+        # First check for a recorded merge point (from previous merges)
+        local merge_point
+        merge_point=$(get_last_merge_point "$volume" "$project_name")
 
-        # Count NEW commits (commits in container that aren't in host)
+        # Count NEW commits since last merge point
         local commit_count
         local commit_range=""
-        if [[ -n "$host_head" ]]; then
+        if [[ -n "$merge_point" ]]; then
+            # Use recorded merge point - this is the most reliable
+            commit_count=$(docker run --rm \
+                -v "$volume:/session:ro" \
+                -e "MERGE_POINT=$merge_point" \
+                "$git_image" \
+                sh -c '
+                    git config --global --add safe.directory "*"
+                    cd /session/'"$project_name"' 2>/dev/null || exit 0
+                    container_head=$(git rev-parse HEAD 2>/dev/null)
+                    if [ "$container_head" = "$MERGE_POINT" ]; then
+                        echo 0
+                    else
+                        git rev-list --count "$MERGE_POINT..HEAD" 2>/dev/null || echo 0
+                    fi
+                ' < /dev/null) || echo "0"
+            commit_range="$merge_point..HEAD"
+        else
+            # No merge point - fall back to counting all commits (first merge)
             commit_count=$(docker run --rm \
                 -v "$volume:/session:ro" \
                 "$git_image" \
-                sh -c "
-                    git config --global --add safe.directory '*'
-                    cd /session/$project_name 2>/dev/null || exit 0
-                    container_head=\$(git rev-parse HEAD 2>/dev/null)
-                    if [[ \"\$container_head\" == '$host_head' ]]; then
-                        echo 0
-                    elif git cat-file -e '$host_head' 2>/dev/null; then
-                        git rev-list --count '$host_head'..HEAD 2>/dev/null || echo 0
-                    else
-                        git rev-list --count HEAD 2>/dev/null || echo 0
-                    fi
-                ") || echo "0"
-            commit_range="$host_head..HEAD"
-        else
-            commit_count="0"
+                sh -c '
+                    git config --global --add safe.directory "*"
+                    cd /session/'"$project_name"' 2>/dev/null || exit 0
+                    initial=$(git rev-list --max-parents=0 HEAD 2>/dev/null | tail -1)
+                    git rev-list --count "$initial..HEAD" 2>/dev/null || echo 0
+                ' < /dev/null) || echo "0"
         fi
 
         echo "Project: $project_name ($commit_count new commits)"
 
         if [[ "$commit_count" -gt 0 ]]; then
-            # Show commit messages
+            # Show commit messages since merge point (or all if no merge point)
             docker run --rm \
                 -v "$volume:/session:ro" \
+                -e "MERGE_POINT=$merge_point" \
                 "$git_image" \
-                sh -c "
-                    git config --global --add safe.directory '*'
-                    cd /session/$project_name
-                    if git cat-file -e '$host_head' 2>/dev/null; then
-                        git log --oneline '$host_head'..HEAD 2>/dev/null | sed 's/^/  /'
+                sh -c '
+                    git config --global --add safe.directory "*"
+                    cd /session/'"$project_name"'
+                    if [ -n "$MERGE_POINT" ]; then
+                        git log --oneline "$MERGE_POINT..HEAD" 2>/dev/null | sed "s/^/  /"
                     else
-                        git log --oneline HEAD 2>/dev/null | sed 's/^/  /'
+                        initial=$(git rev-list --max-parents=0 HEAD 2>/dev/null | tail -1)
+                        git log --oneline "$initial..HEAD" 2>/dev/null | sed "s/^/  /"
                     fi
-                "
+                ' < /dev/null
         else
             echo "  (no new commits)"
         fi
@@ -228,12 +364,13 @@ merge_multi_project_session() {
     info "Merging multi-project session: $name"
     echo ""
 
-    # Extract config from volume
+    # Extract config from volume (single docker call)
     local config_data
     config_data=$(docker run --rm \
         -v "$volume:/session:ro" \
+        --entrypoint sh \
         "$git_image" \
-        cat /session/.claude-projects.yml 2>/dev/null) || {
+        -c 'cat /session/.claude-projects.yml' 2>/dev/null) || {
         error "Failed to read config from session volume"
         exit 1
     }
@@ -242,73 +379,40 @@ merge_multi_project_session() {
     local temp_config="$CACHE_DIR/temp-config-$$.yml"
     mkdir -p "$CACHE_DIR"
     echo "$config_data" > "$temp_config"
-    trap "rm -f '$temp_config'" RETURN
 
     local projects
     projects=$(parse_config_file "$temp_config")
+    rm -f "$temp_config"
 
-    # Analyze each project to see which have commits
-    declare -A project_commits
-    declare -A project_paths
-    declare -A project_host_heads
+    # Collect project info into arrays (avoiding docker calls in read loop)
+    local -a project_names=()
+    local -a project_paths=()
+    local -a project_branches=()
+
+    while IFS='|' read -r pname ppath pbranch; do
+        project_names+=("$pname")
+        project_paths+=("$ppath")
+        project_branches+=("$pbranch")
+    done <<< "$projects"
+
+    # Now get status for each project (docker calls outside the read loop)
+    local -a project_commits=()
     local has_changes=false
 
     echo "Projects to merge:"
-    declare -A project_branches
-    while IFS='|' read -r project_name source_path source_branch; do
-        project_paths[$project_name]="$source_path"
-        project_branches[$project_name]="$source_branch"
-
-        # Get host repo's HEAD SHA for comparison
-        # Use configured branch if specified, otherwise current HEAD
-        local host_head=""
-        if [[ -d "$source_path/.git" ]] || [[ -f "$source_path/.git" ]]; then
-            if [[ -n "$source_branch" ]]; then
-                # Use the configured branch's HEAD
-                host_head=$(git -C "$source_path" rev-parse "refs/heads/$source_branch" 2>/dev/null) || \
-                host_head=$(git -C "$source_path" rev-parse HEAD 2>/dev/null) || host_head=""
-            else
-                host_head=$(git -C "$source_path" rev-parse HEAD 2>/dev/null) || host_head=""
-            fi
-        fi
-
-        # Count NEW commits (commits in container that aren't in host)
+    for i in "${!project_names[@]}"; do
+        local pname="${project_names[$i]}"
         local commit_count
-        if [[ -n "$host_head" ]]; then
-            commit_count=$(docker run --rm \
-                -v "$volume:/session:ro" \
-                "$git_image" \
-                sh -c "
-                    git config --global --add safe.directory '*'
-                    cd /session/$project_name 2>/dev/null || exit 0
-                    # Count commits from host HEAD to container HEAD
-                    # If host_head doesn't exist in container (shallow), count all commits
-                    if git cat-file -e '$host_head' 2>/dev/null; then
-                        git rev-list --count '$host_head'..HEAD 2>/dev/null || echo 0
-                    else
-                        # Shallow clone - compare SHAs directly
-                        container_head=\$(git rev-parse HEAD 2>/dev/null)
-                        if [[ \"\$container_head\" == '$host_head' ]]; then
-                            echo 0
-                        else
-                            git rev-list --count HEAD 2>/dev/null || echo 0
-                        fi
-                    fi
-                ") || echo "0"
-        else
-            commit_count="0"
-        fi
-
-        project_commits[$project_name]=$commit_count
-        project_host_heads[$project_name]="$host_head"
+        commit_count=$(get_session_status "$volume" "$pname")
+        project_commits+=("$commit_count")
 
         if [[ "$commit_count" -gt 0 ]]; then
-            echo "  [x] $project_name ($commit_count commits)"
+            echo "  [x] $pname ($commit_count commits)"
             has_changes=true
         else
-            echo "  [ ] $project_name (no new commits)"
+            echo "  [ ] $pname (no new commits)"
         fi
-    done <<< "$projects"
+    done
 
     if ! $has_changes; then
         warn "No changes to merge in any project"
@@ -336,112 +440,54 @@ merge_multi_project_session() {
         return 0
     fi
 
-    # Prepare patch directory
-    local patch_cache="$CACHE_DIR"
-    mkdir -p "$patch_cache"
-    local patch_dir="$patch_cache/merge-multi-$$-$(date +%s)"
-    mkdir -p "$patch_dir"
-    trap "rm -rf $patch_dir $temp_config" RETURN
-
     # Merge each project with commits
     local success_count=0
     local fail_count=0
 
-    for project_name in "${!project_commits[@]}"; do
-        local commit_count="${project_commits[$project_name]}"
+    for i in "${!project_names[@]}"; do
+        local pname="${project_names[$i]}"
+        local ppath="${project_paths[$i]}"
+        local pbranch="${project_branches[$i]}"
+        local commit_count="${project_commits[$i]}"
+
         if [[ "$commit_count" -eq 0 ]]; then
             continue
         fi
 
-        local source_path="${project_paths[$project_name]}"
-        local config_branch="${project_branches[$project_name]}"
         echo ""
-        info "Merging project: $project_name"
 
         # Verify source path is a git repo
-        if ! is_git_repo "$source_path"; then
-            error "  Source is not a git repo: $source_path"
+        if ! is_git_repo "$ppath"; then
+            error "Source is not a git repo: $ppath"
             fail_count=$((fail_count + 1))
             continue
         fi
 
-        # Determine which branch to use: command-line --into takes priority, then config branch
-        local merge_branch="${target_branch:-$config_branch}"
-        local merge_path="$source_path"
+        # Determine merge target path (handle worktrees)
+        local merge_branch="${target_branch:-$pbranch}"
+        local merge_path="$ppath"
 
-        # Handle branch switching if specified
         if [[ -n "$merge_branch" ]]; then
-            # Check if a worktree exists for this branch
             local worktree_path
-            worktree_path=$(find_worktree_for_branch "$source_path" "$merge_branch")
+            worktree_path=$(find_worktree_for_branch "$ppath" "$merge_branch")
 
             if [[ -n "$worktree_path" && -d "$worktree_path" ]]; then
-                info "  Using worktree: $worktree_path (branch: $merge_branch)"
+                info "Using worktree: $worktree_path (branch: $merge_branch)"
                 merge_path="$worktree_path"
             else
-                cd "$source_path"
+                cd "$ppath"
                 if git show-ref --verify --quiet "refs/heads/$merge_branch"; then
-                    info "  Switching to existing branch: $merge_branch"
+                    info "Switching to branch: $merge_branch"
                     git checkout "$merge_branch"
                 else
-                    info "  Creating new branch: $merge_branch"
+                    info "Creating branch: $merge_branch"
                     git checkout -b "$merge_branch"
                 fi
             fi
         fi
 
-        # Create project-specific patch directory
-        local project_patch_dir="$patch_dir/$project_name"
-        mkdir -p "$project_patch_dir"
-
-        # Get the host HEAD for this project (to generate patches only for new commits)
-        local project_host_head="${project_host_heads[$project_name]}"
-
-        # Export patches from session (only commits after host HEAD)
-        docker run --rm \
-            -v "$volume:/session:ro" \
-            -v "$project_patch_dir:/patches" \
-            -e "HOST_HEAD=$project_host_head" \
-            "$git_image" \
-            sh -c '
-                git config --global --add safe.directory "*"
-                cd /session/'"$project_name"'
-                # Use host HEAD as base if available, otherwise fall back to initial commit
-                if [ -n "$HOST_HEAD" ] && git cat-file -e "$HOST_HEAD" 2>/dev/null; then
-                    echo "Generating patches from $HOST_HEAD..HEAD"
-                    git format-patch -o /patches "$HOST_HEAD..HEAD" 2>/dev/null
-                else
-                    echo "No host HEAD, generating all patches"
-                    initial=$(git rev-list --max-parents=0 HEAD 2>/dev/null | tail -1)
-                    git format-patch -o /patches "$initial..HEAD" 2>/dev/null || \
-                        git format-patch -o /patches -10
-                fi
-            '
-
-        # Apply patches
-        cd "$merge_path"
-        local patch_count
-        patch_count=$(ls -1 "$project_patch_dir"/*.patch 2>/dev/null | wc -l | tr -d ' ')
-
-        if [[ "$patch_count" -eq 0 ]]; then
-            warn "  No patches to apply for $project_name"
-            continue
-        fi
-
-        local project_success=true
-        for patch in "$project_patch_dir"/*.patch; do
-            if git am "$patch"; then
-                success "  Applied: $(basename "$patch")"
-            else
-                error "  Failed to apply: $(basename "$patch")"
-                echo "  Run 'git am --abort' to cancel in: $merge_path"
-                project_success=false
-                break
-            fi
-        done
-
-        if $project_success; then
-            success "  Merged $patch_count commit(s) to $project_name"
+        # Perform the merge
+        if merge_volume_to_target "$volume" "$pname" "$merge_path"; then
             success_count=$((success_count + 1))
         else
             fail_count=$((fail_count + 1))
