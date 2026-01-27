@@ -105,19 +105,37 @@ diff_multi_project_session() {
     echo ""
 
     while IFS='|' read -r project_name source_path _branch; do
-        # Count commits in this project
-        local commit_count
-        commit_count=$(docker run --rm \
-            -v "$volume:/session:ro" \
-            "$git_image" \
-            sh -c "
-                git config --global --add safe.directory '*'
-                cd /session/$project_name 2>/dev/null || exit 0
-                initial=\$(git rev-list --max-parents=0 HEAD 2>/dev/null | tail -1)
-                git rev-list --count \"\$initial\"..HEAD 2>/dev/null || echo 0
-            ") || echo "0"
+        # Get host repo's HEAD SHA for comparison
+        local host_head=""
+        if [[ -d "$source_path/.git" ]] || [[ -f "$source_path/.git" ]]; then
+            host_head=$(git -C "$source_path" rev-parse HEAD 2>/dev/null) || host_head=""
+        fi
 
-        echo "Project: $project_name ($commit_count commits)"
+        # Count NEW commits (commits in container that aren't in host)
+        local commit_count
+        local commit_range=""
+        if [[ -n "$host_head" ]]; then
+            commit_count=$(docker run --rm \
+                -v "$volume:/session:ro" \
+                "$git_image" \
+                sh -c "
+                    git config --global --add safe.directory '*'
+                    cd /session/$project_name 2>/dev/null || exit 0
+                    container_head=\$(git rev-parse HEAD 2>/dev/null)
+                    if [[ \"\$container_head\" == '$host_head' ]]; then
+                        echo 0
+                    elif git cat-file -e '$host_head' 2>/dev/null; then
+                        git rev-list --count '$host_head'..HEAD 2>/dev/null || echo 0
+                    else
+                        git rev-list --count HEAD 2>/dev/null || echo 0
+                    fi
+                ") || echo "0"
+            commit_range="$host_head..HEAD"
+        else
+            commit_count="0"
+        fi
+
+        echo "Project: $project_name ($commit_count new commits)"
 
         if [[ "$commit_count" -gt 0 ]]; then
             # Show commit messages
@@ -127,11 +145,14 @@ diff_multi_project_session() {
                 sh -c "
                     git config --global --add safe.directory '*'
                     cd /session/$project_name
-                    initial=\$(git rev-list --max-parents=0 HEAD 2>/dev/null | tail -1)
-                    git log --oneline \"\$initial\"..HEAD 2>/dev/null | sed 's/^/  /'
+                    if git cat-file -e '$host_head' 2>/dev/null; then
+                        git log --oneline '$host_head'..HEAD 2>/dev/null | sed 's/^/  /'
+                    else
+                        git log --oneline HEAD 2>/dev/null | sed 's/^/  /'
+                    fi
                 "
         else
-            echo "  (no changes)"
+            echo "  (no new commits)"
         fi
         echo ""
     done <<< "$projects"
@@ -236,17 +257,45 @@ merge_multi_project_session() {
         project_paths[$project_name]="$source_path"
         project_branches[$project_name]="$source_branch"
 
-        # Count commits
+        # Get host repo's HEAD SHA for comparison
+        # Use configured branch if specified, otherwise current HEAD
+        local host_head=""
+        if [[ -d "$source_path/.git" ]] || [[ -f "$source_path/.git" ]]; then
+            if [[ -n "$source_branch" ]]; then
+                # Use the configured branch's HEAD
+                host_head=$(git -C "$source_path" rev-parse "refs/heads/$source_branch" 2>/dev/null) || \
+                host_head=$(git -C "$source_path" rev-parse HEAD 2>/dev/null) || host_head=""
+            else
+                host_head=$(git -C "$source_path" rev-parse HEAD 2>/dev/null) || host_head=""
+            fi
+        fi
+
+        # Count NEW commits (commits in container that aren't in host)
         local commit_count
-        commit_count=$(docker run --rm \
-            -v "$volume:/session:ro" \
-            "$git_image" \
-            sh -c "
-                git config --global --add safe.directory '*'
-                cd /session/$project_name 2>/dev/null || exit 0
-                initial=\$(git rev-list --max-parents=0 HEAD 2>/dev/null | tail -1)
-                git rev-list --count \"\$initial\"..HEAD 2>/dev/null || echo 0
-            ") || echo "0"
+        if [[ -n "$host_head" ]]; then
+            commit_count=$(docker run --rm \
+                -v "$volume:/session:ro" \
+                "$git_image" \
+                sh -c "
+                    git config --global --add safe.directory '*'
+                    cd /session/$project_name 2>/dev/null || exit 0
+                    # Count commits from host HEAD to container HEAD
+                    # If host_head doesn't exist in container (shallow), count all commits
+                    if git cat-file -e '$host_head' 2>/dev/null; then
+                        git rev-list --count '$host_head'..HEAD 2>/dev/null || echo 0
+                    else
+                        # Shallow clone - compare SHAs directly
+                        container_head=\$(git rev-parse HEAD 2>/dev/null)
+                        if [[ \"\$container_head\" == '$host_head' ]]; then
+                            echo 0
+                        else
+                            git rev-list --count HEAD 2>/dev/null || echo 0
+                        fi
+                    fi
+                ") || echo "0"
+        else
+            commit_count="0"
+        fi
 
         project_commits[$project_name]=$commit_count
 
@@ -254,7 +303,7 @@ merge_multi_project_session() {
             echo "  [x] $project_name ($commit_count commits)"
             has_changes=true
         else
-            echo "  [ ] $project_name (0 commits - skipped)"
+            echo "  [ ] $project_name (no new commits)"
         fi
     done <<< "$projects"
 
