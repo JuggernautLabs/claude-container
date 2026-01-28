@@ -128,13 +128,15 @@ create_multi_project_session() {
     local project_count=0
     local pids=()
     local project_names=()
+    local project_track=()
     local log_dir="$CACHE_DIR/clone-logs-$$"
     mkdir -p "$log_dir"
 
-    while IFS='|' read -r project_name source_path source_branch; do
+    while IFS='|' read -r project_name source_path source_branch source_track; do
         [[ -z "$project_name" ]] && continue
         project_count=$((project_count + 1))
         project_names+=("$project_name")
+        project_track+=("${source_track:-true}")
 
         # Determine which branch to clone:
         # 1. If source_branch specified in config, use that
@@ -218,9 +220,18 @@ create_multi_project_session() {
         exit 1
     fi
 
-    # Record initial merge points for each project (so we only track NEW commits)
+    # Record initial merge points for tracked projects (so we only track NEW commits)
     info "Recording initial merge points..."
-    for pname in "${project_names[@]}"; do
+    for i in "${!project_names[@]}"; do
+        local pname="${project_names[$i]}"
+        local ptrack="${project_track[$i]}"
+
+        # Skip untracked projects
+        if [[ "$ptrack" != "true" ]]; then
+            info "  Skipping $pname (untracked)"
+            continue
+        fi
+
         docker run --rm \
             --user "$host_uid:$host_uid" \
             -v "$volume:/session" \

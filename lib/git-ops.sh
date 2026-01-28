@@ -231,7 +231,15 @@ diff_multi_project_session() {
     info "Multi-project session: $name"
     echo ""
 
-    while IFS='|' read -r project_name source_path _branch; do
+    while IFS='|' read -r project_name source_path _branch project_track; do
+        # Skip untracked projects
+        if [[ "${project_track:-true}" != "true" ]]; then
+            echo "Project: $project_name (untracked)"
+            echo "  (not tracked for merging)"
+            echo ""
+            continue
+        fi
+
         # First check for a recorded merge point (from previous merges)
         local merge_point
         merge_point=$(get_last_merge_point "$volume" "$project_name")
@@ -388,11 +396,13 @@ merge_multi_project_session() {
     local -a project_names=()
     local -a project_paths=()
     local -a project_branches=()
+    local -a project_track=()
 
-    while IFS='|' read -r pname ppath pbranch; do
+    while IFS='|' read -r pname ppath pbranch ptrack; do
         project_names+=("$pname")
         project_paths+=("$ppath")
         project_branches+=("$pbranch")
+        project_track+=("${ptrack:-true}")
     done <<< "$projects"
 
     # Now get status for each project (docker calls outside the read loop)
@@ -402,6 +412,15 @@ merge_multi_project_session() {
     echo "Projects to merge:"
     for i in "${!project_names[@]}"; do
         local pname="${project_names[$i]}"
+        local ptrack="${project_track[$i]}"
+
+        # Skip untracked projects
+        if [[ "$ptrack" != "true" ]]; then
+            echo "  [-] $pname (untracked)"
+            project_commits+=("0")
+            continue
+        fi
+
         local commit_count
         commit_count=$(get_session_status "$volume" "$pname")
         project_commits+=("$commit_count")
@@ -448,7 +467,13 @@ merge_multi_project_session() {
         local pname="${project_names[$i]}"
         local ppath="${project_paths[$i]}"
         local pbranch="${project_branches[$i]}"
+        local ptrack="${project_track[$i]}"
         local commit_count="${project_commits[$i]}"
+
+        # Skip untracked projects
+        if [[ "$ptrack" != "true" ]]; then
+            continue
+        fi
 
         if [[ "$commit_count" -eq 0 ]]; then
             continue

@@ -230,7 +230,8 @@ find_config_file() {
 # Arguments:
 #   $1 - path to config file
 # Returns:
-#   Project mappings (stdout), one per line: "name|path|branch" (branch may be empty)
+#   Project mappings (stdout), one per line: "name|path|branch|track"
+#   (branch may be empty, track is "true" or "false")
 parse_config_file() {
     local config_file="$1"
     local config_dir
@@ -238,19 +239,19 @@ parse_config_file() {
 
     # Try yq first (most robust), fall back to Python
     if command -v yq &>/dev/null; then
-        # Parse with yq: extract project names, paths, and optional branch
+        # Parse with yq: extract project names, paths, optional branch, and track flag
         local yq_output
-        yq_output=$(yq eval '.projects | to_entries | .[] | .key + "|" + .value.path + "|" + (.value.branch // "")' "$config_file" 2>/dev/null) || {
+        yq_output=$(yq eval '.projects | to_entries | .[] | .key + "|" + .value.path + "|" + (.value.branch // "") + "|" + ((.value.track // true) | tostring)' "$config_file" 2>/dev/null) || {
             error "Failed to parse config file with yq"
             exit 1
         }
 
         # Resolve relative paths to absolute
-        while IFS='|' read -r proj_name proj_path proj_branch; do
+        while IFS='|' read -r proj_name proj_path proj_branch proj_track; do
             if [[ "$proj_path" != /* ]]; then
                 proj_path="$(cd "$config_dir" && cd "$proj_path" && pwd)"
             fi
-            echo "$proj_name|$proj_path|$proj_branch"
+            echo "$proj_name|$proj_path|$proj_branch|$proj_track"
         done <<< "$yq_output"
     elif command -v python3 &>/dev/null; then
         # Fallback to Python
@@ -272,11 +273,12 @@ try:
 
         path = info['path']
         branch = info.get('branch', '')
+        track = str(info.get('track', True)).lower()
         # Resolve relative paths
         if not os.path.isabs(path):
             path = os.path.abspath(os.path.join('$config_dir', path))
 
-        print(f'{name}|{path}|{branch}')
+        print(f'{name}|{path}|{branch}|{track}')
 except yaml.YAMLError as e:
     print(f'Error: Invalid YAML: {e}', file=sys.stderr)
     sys.exit(1)
@@ -325,7 +327,7 @@ validate_config() {
     declare -A seen_names
 
     # Validate each project
-    while IFS='|' read -r proj_name proj_path _branch; do
+    while IFS='|' read -r proj_name proj_path _branch _track; do
         # Check for duplicate names
         if [[ -n "${seen_names[$proj_name]:-}" ]]; then
             error "Duplicate project name: $proj_name"
