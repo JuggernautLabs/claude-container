@@ -22,8 +22,9 @@ You are helping the user set up a claude-container session. This is an interacti
 
 - **claude-container** runs Claude Code in an isolated Docker container
 - The user is CURRENTLY inside Claude Code, so we cannot start the container from here
+- Git-based session isolation is the **default** - every session requires `--session <name>`
 - The `--no-run` flag does all the heavy lifting upfront (discovery, validation, cloning)
-- After setup, the user just needs `claude-container --git-session <name>` to start
+- After setup, the user just needs `claude-container -s <name>` to start
 
 ## Step 1: Gather Information
 
@@ -94,23 +95,24 @@ Untracked projects:
 Construct the claude-container command based on their answers:
 
 ```bash
-claude-container --git-session <session-name> [options]
+claude-container -s <session-name> [options]
 ```
 
 Options to include based on answers:
 - `--discover-repos <path>` - if they chose repo discovery
 - `--config <path>` - if they specified a config file
-- `--as-rootish` - if they chose rootish mode
+- `--as-rootish` - if they chose rootish mode (default)
 - `--as-user` - if they chose user mode
 - `--continue` - if they want to continue existing conversation
 - `--auto-sync <branch>` - if they specified an auto-sync branch
+- `--enable-docker` - if they need Docker access inside container
 
 ## Step 3: Validate with --no-run
 
 Run the command with `--no-run` appended to validate AND prepare the session:
 
 ```bash
-claude-container --git-session <name> [options] --no-run
+claude-container -s <name> [options] --no-run
 ```
 
 This does the heavy lifting upfront:
@@ -139,16 +141,16 @@ Session prepared successfully: <session-name>
 
 To start the container:
 1. Exit Claude Code (type 'exit' or press Ctrl+D)
-2. Run: claude-container --git-session <session-name>
+2. Run: claude-container -s <session-name>
 
 Full command (for reference):
-  claude-container --git-session <name> --discover-repos <path> --as-rootish
+  claude-container -s <name> --discover-repos <path>
 ```
 
 Then ask if they want the command copied to the clipboard:
 
 ```bash
-echo "claude-container --git-session <name>" | pbcopy
+echo "claude-container -s <name>" | pbcopy
 ```
 
 ## Example Interaction
@@ -174,7 +176,7 @@ User: Rootish (recommended)
 User: No
 
 Claude: Let me prepare this session...
-> claude-container --git-session feature-auth --discover-repos ~/dev/myapp --as-rootish --no-run
+> claude-container -s feature-auth --discover-repos ~/dev/myapp --no-run
 
 [Output shows successful setup - repos discovered, cloned, validated]
 
@@ -182,10 +184,10 @@ Session prepared successfully: feature-auth
 
 To start the container:
 1. Exit Claude Code (type 'exit' or press Ctrl+D)
-2. Run: claude-container --git-session feature-auth
+2. Run: claude-container -s feature-auth
 
 Full command (for reference):
-  claude-container --git-session feature-auth --discover-repos ~/dev/myapp --as-rootish
+  claude-container -s feature-auth --discover-repos ~/dev/myapp
 
 [Asks: Copy start command to clipboard?]
 User: Yes
@@ -196,15 +198,15 @@ Claude: Copied to clipboard. Exit and paste to start your session.
 ## Session Lifecycle
 
 ### Creating a Session
-Sessions are created with `--git-session <name>`. The `--no-run` flag prepares everything without starting:
+Sessions require `-s <name>`. The `--no-run` flag prepares everything without starting:
 ```bash
-claude-container --git-session myproject --no-run
+claude-container -s myproject --no-run
 ```
 
 ### Running a Session
 After creation (or to resume), just run:
 ```bash
-claude-container --git-session myproject
+claude-container -s myproject
 ```
 
 ### Checking for Changes
@@ -242,7 +244,7 @@ claude-container --delete-session myproject --yes
 If the user needs to run Docker commands inside the container (e.g., for building images, running tests):
 
 ```bash
-claude-container --git-session myproject --enable-docker
+claude-container -s myproject --enable-docker
 ```
 
 This mounts the host's Docker socket into the container.
@@ -295,10 +297,13 @@ Guide the user to:
 
 | Task | Command |
 |------|---------|
-| Create session | `claude-container --git-session NAME --no-run` |
-| Start session | `claude-container --git-session NAME` |
+| Create session | `claude-container -s NAME --no-run` |
+| Start session | `claude-container -s NAME` |
+| Resume + continue | `claude-container -s NAME --continue` |
 | Check changes | `claude-container --merge-session NAME --no-run` |
 | Merge changes | `claude-container --merge-session NAME --yes` |
-| With Docker | `claude-container --git-session NAME --enable-docker` |
+| With Docker | `claude-container -s NAME --enable-docker` |
+| Generate config | `claude-container -s NAME --discover-repos DIR --config-only` |
 | Delete session | `claude-container --delete-session NAME --yes` |
 | List sessions | `claude-container --list-sessions` |
+| Direct mount | `claude-container --no-git-session` |

@@ -75,13 +75,17 @@ size_to_bytes() {
     # Remove any trailing 'B' or 'i' (e.g., "MiB" -> "M")
     unit="${unit%%[Bi]*}"
 
+    # Compute and truncate to integer (bash doesn't handle decimals)
+    local result
     case "$unit" in
-        K) echo "$num * 1024" | bc 2>/dev/null || echo "0" ;;
-        M) echo "$num * 1024 * 1024" | bc 2>/dev/null || echo "0" ;;
-        G) echo "$num * 1024 * 1024 * 1024" | bc 2>/dev/null || echo "0" ;;
-        T) echo "$num * 1024 * 1024 * 1024 * 1024" | bc 2>/dev/null || echo "0" ;;
-        *) echo "${num%.*}" 2>/dev/null || echo "0" ;;  # Assume bytes
+        K) result=$(echo "$num * 1024" | bc 2>/dev/null) ;;
+        M) result=$(echo "$num * 1024 * 1024" | bc 2>/dev/null) ;;
+        G) result=$(echo "$num * 1024 * 1024 * 1024" | bc 2>/dev/null) ;;
+        T) result=$(echo "$num * 1024 * 1024 * 1024 * 1024" | bc 2>/dev/null) ;;
+        *) result="${num%.*}" ;;  # Assume bytes
     esac
+    # Truncate decimal portion for bash arithmetic
+    echo "${result%.*}"
 }
 
 # Size threshold for warnings (10MB in bytes)

@@ -41,10 +41,9 @@ FORCE_BUILD=false
 FORCE_DEFAULT_IMAGE=false
 SESSION_DIR=""
 VERIFY_MODE=false
-SESSION_NAME="default"
+SESSION_NAME=""
 SESSION_NAME_SET=false
-GIT_SESSION=""
-USE_GIT_SESSION=false
+USE_GIT_SESSION=true  # Default: use git-based session isolation
 CONTINUE_SESSION=false
 RUN_AS_USER=false
 RUN_AS_ROOTISH=true  # Default: run as user with fake-root for package installs
@@ -52,7 +51,9 @@ AUTO_SYNC_BRANCH=""
 NO_RUN=false
 SHELL_ONLY=false
 ENABLE_DOCKER=false  # Mount Docker socket for host Docker access
+CONFIG_ONLY=false    # Just generate config, don't create session
 DISCOVER_REPOS_DIRS=()  # Array for multiple --discover-repos
+SESSIONS_CONFIG_DIR="$CONFIG_DIR/sessions"  # Where session configs are stored
 
 # Docker args accumulator
 declare -a DOCKER_ARGS
@@ -130,10 +131,13 @@ while [[ $# -gt 0 ]]; do
             SESSION_NAME_SET=true
             shift 2
             ;;
-        --git-session|-g)
-            GIT_SESSION="$2"
-            USE_GIT_SESSION=true
-            shift 2
+        --no-git-session)
+            USE_GIT_SESSION=false
+            shift
+            ;;
+        --config-only)
+            CONFIG_ONLY=true
+            shift
             ;;
         --continue|-c)
             CONTINUE_SESSION=true
@@ -189,10 +193,10 @@ Spawn into a Docker container with Claude Code ready.
 Options:
   --build, -b              Force rebuild the image
   --default-image          Use default image (skip local Dockerfile)
-  --dir, -d <path>         Directory to use with overlay (changes persist in session volume)
-                           DEPRECATED: Use --git-session instead (requires --privileged)
-  --git-session, -g <name> Create/resume a git-based isolated session (recommended)
-  --session, -s <name>     Override session name for state persistence (default: "default")
+  --dir, -d <path>         Directory to use with overlay (DEPRECATED)
+  --session, -s <name>     Session name (required, identifies the session)
+  --no-git-session         Disable git-based isolation (mount cwd directly)
+  --config-only            Generate config file only, don't create session (outputs path)
   --continue, -c           Continue the most recent Claude conversation
   --as-user                Run as non-root developer user (no fake-root)
   --as-rootish             Run as developer with fake-root for installs (default)
@@ -221,9 +225,11 @@ Environment:
                             Get one with: claude setup-token
 
 Examples:
-  claude-container                        # Start with current dir mounted
-  claude-container --git-session feature  # Start git session "feature"
-  claude-container -g feature --continue  # Resume session AND continue conversation
+  claude-container -s myproj                           # Start git session "myproj"
+  claude-container -s myproj --discover-repos ~/dev    # Discover repos and start session
+  claude-container -s myproj --discover-repos ~/dev --config-only  # Just generate config
+  claude-container -s myproj --continue                # Resume session AND continue conversation
+  claude-container --no-git-session                    # Direct mount cwd (no isolation)
 EOF
             exit 0
             ;;
@@ -234,10 +240,14 @@ EOF
     esac
 done
 
-# If using git session and session name wasn't explicitly set, use git session name
-if $USE_GIT_SESSION && ! $SESSION_NAME_SET; then
-    SESSION_NAME="$GIT_SESSION"
+# Validate session name is provided when required
+if ($USE_GIT_SESSION || $CONFIG_ONLY) && [[ -z "$SESSION_NAME" ]]; then
+    error "Session name required: use --session <name>"
+    exit 1
 fi
+
+# Ensure session config directory exists
+mkdir -p "$SESSIONS_CONFIG_DIR"
 
 # Ensure token is available (from config, keychain, or interactive auth)
 ensure_token
@@ -341,14 +351,49 @@ if [[ -n "$SESSION_DIR" ]]; then
     WORKSPACE_DIR="$SESSION_DIR"
 fi
 
+# Handle --config-only: generate config and exit
+if $CONFIG_ONLY; then
+    if [[ ${#DISCOVER_REPOS_DIRS[@]} -gt 0 ]]; then
+        # Discover repos and write config to session config dir
+        discovered_config=$(discover_repos_multi "${DISCOVER_REPOS_DIRS[@]}")
+        session_config="$SESSIONS_CONFIG_DIR/${SESSION_NAME}.yml"
+        cp "$discovered_config" "$session_config"
+        rm -f "$discovered_config"
+        success "Config written to: $session_config"
+        echo "$session_config"
+        exit 0
+    elif [[ -n "${CONFIG_FILE:-}" ]]; then
+        # Copy provided config to session config dir
+        session_config="$SESSIONS_CONFIG_DIR/${SESSION_NAME}.yml"
+        cp "$CONFIG_FILE" "$session_config"
+        success "Config copied to: $session_config"
+        echo "$session_config"
+        exit 0
+    else
+        error "--config-only requires --discover-repos or --config"
+        exit 1
+    fi
+fi
+
 # Handle git-based session isolation (recommended)
 GIT_SESSION_VOLUME=""
 if $USE_GIT_SESSION; then
-    GIT_SESSION_VOLUME="claude-session-${GIT_SESSION}"
-    create_git_session "$GIT_SESSION" "$WORKSPACE_DIR"
+    GIT_SESSION_VOLUME="claude-session-${SESSION_NAME}"
+
+    # If --discover-repos was specified, write config to session config dir first
+    if [[ ${#DISCOVER_REPOS_DIRS[@]} -gt 0 ]]; then
+        discovered_config=$(discover_repos_multi "${DISCOVER_REPOS_DIRS[@]}")
+        session_config="$SESSIONS_CONFIG_DIR/${SESSION_NAME}.yml"
+        cp "$discovered_config" "$session_config"
+        rm -f "$discovered_config"
+        CONFIG_FILE="$session_config"
+        info "Session config: $session_config"
+    fi
+
+    create_git_session "$SESSION_NAME" "$WORKSPACE_DIR"
 
     if $NO_RUN; then
-        success "Session ready: $GIT_SESSION"
+        success "Session ready: $SESSION_NAME"
         exit 0
     fi
 fi
@@ -474,7 +519,7 @@ if $USE_OVERLAY; then
     echo "  Session: $SESSION_VOLUME (overlay mode - deprecated)"
 fi
 if $USE_GIT_SESSION; then
-    echo "  Git Session: $GIT_SESSION"
+    echo "  Git Session: $SESSION_NAME"
 fi
 if $ENABLE_DOCKER && [[ -n "${DOCKER_SOCKET:-}" ]]; then
     echo "  Docker: enabled ($DOCKER_SOCKET)"
@@ -611,5 +656,5 @@ WRAPPER
 if [[ -n "$AUTO_SYNC_BRANCH" ]] && $USE_GIT_SESSION; then
     echo ""
     info "Auto-syncing session to branch: $AUTO_SYNC_BRANCH"
-    "$0" --merge-session "$GIT_SESSION" --into "$AUTO_SYNC_BRANCH" --auto
+    "$0" --merge-session "$SESSION_NAME" --into "$AUTO_SYNC_BRANCH" --auto
 fi

@@ -18,8 +18,8 @@ Claude Code's `--dangerously-skip-permissions` flag lets Claude work autonomousl
 export CLAUDE_CODE_OAUTH_TOKEN=$(claude auth status | grep -o 'oauth:[^ ]*')
 # Or run: claude setup-token
 
-# 2. Start a session
-./claude-container --git-session my-feature
+# 2. Start a session (git-based isolation is the default)
+./claude-container -s my-feature
 
 # 3. Claude is now running in the container - work with it
 
@@ -64,47 +64,63 @@ This will check for all dependencies including YAML parser availability.
 
 ## Starting a Session
 
-### Basic Session (Direct Mount)
+Git-based session isolation is the **default**. Every session requires a name via `-s <name>`.
 
-```bash
-# Mount current directory directly - changes affect your files immediately
-./claude-container
-```
-
-### Git Session (Recommended)
+### Standard Session (Recommended)
 
 ```bash
 # Create an isolated session - changes stay in Docker volume
-./claude-container --git-session feature-name
+./claude-container -s feature-name
 ```
 
 This:
 1. Creates a Docker volume `claude-session-feature-name`
-2. Clones your current repo into it
+2. Clones your current repo into it (uses matching branch if exists)
 3. Strips git remotes (Claude can't push)
 4. Starts Claude with full permissions
+
+### Direct Mount (No Isolation)
+
+```bash
+# Mount current directory directly - changes affect your files immediately
+./claude-container --no-git-session
+```
 
 ### Resuming a Session
 
 ```bash
 # Resume the session and continue the conversation
-./claude-container --git-session feature-name --continue
+./claude-container -s feature-name --continue
 
 # If you hit permission issues, use restart
 ./claude-container --restart-session feature-name
+```
+
+### Branch Behavior
+
+When creating a session, the branch to clone is determined by:
+1. **Config `branch` field** - if specified in `.claude-projects.yml`
+2. **Session name matches branch** - if a branch matching the session name exists, it's used
+3. **Current HEAD** - otherwise, clone whatever is checked out
+
+```bash
+# If branch "my-feature" exists, it will be cloned
+./claude-container -s my-feature
 ```
 
 ### Session Options
 
 | Flag | Description |
 |------|-------------|
-| `--git-session, -g <name>` | Create/resume isolated git session |
-| `--discover-repos <dir>` | Auto-discover all git repos in directory (no config needed) |
+| `-s, --session <name>` | Session name (required) |
+| `--no-git-session` | Disable git isolation, mount cwd directly |
+| `--discover-repos <dir>` | Auto-discover all git repos in directory |
 | `--config, -C <path>` | Explicit path to `.claude-projects.yml` config file |
-| `--session, -s <name>` | Override state volume name (for sharing state) |
+| `--config-only` | Generate config file only, output path |
 | `--continue, -c` | Continue the most recent Claude conversation |
 | `--as-rootish` | Run as user with fake-root capabilities (default) |
 | `--as-root` | Run as actual root user (disables rootish) |
+| `--enable-docker` | Mount Docker socket for host Docker access |
 | `--build, -b` | Force rebuild the container image |
 | `--sessions` | List all sessions with disk usage |
 | `--delete-session <name>` | Delete a session and all its volumes |
@@ -132,7 +148,7 @@ Claude: I'll install the dependencies for this Node.js project.
 System packages work out of the box (rootish mode is the default):
 
 ```bash
-./claude-container --git-session my-feature
+./claude-container -s my-feature
 ```
 
 Inside the container, Claude can install packages:
@@ -226,7 +242,7 @@ Delete session 'feature-name'? [y/n]
 
 ```bash
 # Automatically merge to a branch when the container exits
-./claude-container --git-session feature-name --auto-sync claude/feature-name
+./claude-container -s feature-name --auto-sync claude/feature-name
 ```
 
 ## Multi-Project Sessions
@@ -265,7 +281,7 @@ projects:
 EOF
 
 # 2. Start multi-project session
-./claude-container --git-session fullstack-feature
+./claude-container -s fullstack-feature
 
 # 3. Claude can now see and modify all three repos
 # Inside container: /workspace/frontend/, /workspace/backend/, /workspace/shared/
@@ -347,7 +363,7 @@ Use `--discover-repos` to automatically find and clone all git repos in a direct
 
 ```bash
 # Single command - discovers all git repos automatically
-./claude-container --git-session my-feature --discover-repos ~/dev/hypermemetic
+./claude-container -s my-feature --discover-repos ~/dev/hypermemetic
 ```
 
 Output:
@@ -389,23 +405,23 @@ for dir in */; do
 done
 
 # Then start session (config auto-detected)
-./claude-container --git-session hypermemetic-all
+./claude-container -s hypermemetic-all
 ```
 
 ### Creating a Multi-Project Session
 
 ```bash
 # Auto-discover repos in a directory (no config needed!)
-./claude-container --git-session feature-name --discover-repos ~/dev/myprojects
+./claude-container -s feature-name --discover-repos ~/dev/myprojects
 
 # Auto-detect config in current directory
-./claude-container --git-session feature-name
+./claude-container -s feature-name
 
 # Explicit config path
-./claude-container --git-session feature-name --config ~/my-projects.yml
+./claude-container -s feature-name --config ~/my-projects.yml
 
 # Create session without starting container (for testing)
-./claude-container --git-session feature-name --no-run
+./claude-container -s feature-name --no-run
 ```
 
 **What happens during creation:**
@@ -659,7 +675,7 @@ projects:
 **Workflow:**
 ```bash
 # Start session
-./claude-container --git-session user-authentication
+./claude-container -s user-authentication
 
 # Inside container, ask Claude:
 "Implement user authentication with JWT tokens. Add the auth endpoints
@@ -698,7 +714,7 @@ projects:
 
 **Workflow:**
 ```bash
-./claude-container --git-session add-user-preferences
+./claude-container -s add-user-preferences
 
 # Ask Claude:
 "Add user preferences to the proto definitions, update the users service
@@ -729,7 +745,7 @@ projects:
 
 **Workflow:**
 ```bash
-./claude-container --git-session refactor-plugin-api
+./claude-container -s refactor-plugin-api
 
 # Ask Claude:
 "Refactor the plugin API in core to use async/await instead of callbacks.
@@ -752,10 +768,10 @@ Update all plugins and examples to use the new API."
 **Use descriptive session names:**
 ```bash
 # Good
-./claude-container --git-session add-graphql-api-and-client
+./claude-container -s add-graphql-api-and-client
 
 # Less helpful
-./claude-container --git-session test
+./claude-container -s test
 ```
 
 **Review before merging:**
@@ -793,7 +809,7 @@ git commit -m "Add multi-project config for claude-container"
 **Config not detected:**
 ```bash
 # Specify explicitly
-./claude-container --git-session my-feature --config ./.claude-projects.yml
+./claude-container -s my-feature --config ./.claude-projects.yml
 
 # Check file location and name
 ls -la .claude-projects.yml
@@ -868,16 +884,19 @@ projects:
 - Each project is cloned independently (disk space scales linearly)
 - Merge is sequential (not parallel)
 
-### Backward Compatibility
+### Single vs Multi-Project Mode
 
-Single-repo mode continues to work exactly as before when no config file exists:
+When no `.claude-projects.yml` config file exists, single-repo mode is used (clones current directory). When a config file exists, multi-project mode automatically enables.
 
 ```bash
-# No config file = single-repo mode (original behavior)
-./claude-container --git-session feature-name
+# No config file = clone current repo only
+./claude-container -s feature-name
+
+# With config file = clone all configured projects
+./claude-container -s feature-name
 ```
 
-The presence of a `.claude-projects.yml` file automatically enables multi-project mode. To temporarily disable, rename or remove the config file.
+To temporarily disable multi-project mode, rename or remove the config file, or use `--no-git-session` for direct mount.
 
 ## Copying Files
 
@@ -968,7 +987,7 @@ Lists all claude-container volumes and prompts before deleting.
 
 ```bash
 # 1. Start isolated session
-./claude-container --git-session new-feature 
+./claude-container -s new-feature 
 # 2. Work with Claude to implement the feature
 #    Claude commits changes as it works
 
@@ -989,7 +1008,7 @@ gh pr create
 
 ```bash
 # 1. Start session to investigate
-./claude-container --git-session debug-issue-123
+./claude-container -s debug-issue-123
 
 # 2. Have Claude investigate and fix
 #    "Investigate why users are getting 500 errors on /api/checkout"
@@ -1028,11 +1047,11 @@ claude
 
 # 3. Claude validates with --no-run, outputs:
 #    Session ready: my-feature
-#    Run: claude-container --git-session my-feature
+#    Run: claude-container -s my-feature
 #    (copied to clipboard)
 
 # 4. Exit Claude Code and run the command
-claude-container --git-session my-feature
+claude-container -s my-feature
 ```
 
 Since `--no-run` already clones all repos and sets up the session, the final command just resumes the existing session and starts the container.
@@ -1041,7 +1060,7 @@ Since `--no-run` already clones all repos and sets up the session, the final com
 
 ```bash
 # 1. Have Claude generate documentation, reports, etc.
-./claude-container --git-session docs
+./claude-container -s docs
 
 # 2. Copy out the generated files
 ./claude-container-cp docs:/workspace/generated-docs ./docs
@@ -1054,8 +1073,8 @@ Since `--no-run` already clones all repos and sets up the session, the final com
 
 ```bash
 # Multiple git sessions can share conversation history
-./claude-container --git-session experiment-1 --session shared-context
-./claude-container --git-session experiment-2 --session shared-context
+./claude-container -s experiment-1 --session shared-context
+./claude-container -s experiment-2 --session shared-context
 
 # Both sessions will have access to the same Claude conversation history
 ```
@@ -1078,7 +1097,7 @@ RUN npm install -g typescript ts-node
 
 Then:
 ```bash
-./claude-container --git-session my-feature
+./claude-container -s my-feature
 # Automatically uses ./Dockerfile if present
 ```
 
@@ -1125,7 +1144,7 @@ docker volume inspect claude-session-feature-name
 
 ```bash
 # Force rebuild the image
-./claude-container --build --git-session feature-name
+./claude-container --build -s feature-name
 
 # Check Docker is running
 docker ps
