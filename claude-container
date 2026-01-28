@@ -51,6 +51,7 @@ RUN_AS_ROOTISH=true  # Default: run as user with fake-root for package installs
 AUTO_SYNC_BRANCH=""
 NO_RUN=false
 SHELL_ONLY=false
+ENABLE_DOCKER=false  # Mount Docker socket for host Docker access
 DISCOVER_REPOS_DIRS=()  # Array for multiple --discover-repos
 
 # Docker args accumulator
@@ -171,6 +172,10 @@ while [[ $# -gt 0 ]]; do
             SHELL_ONLY=true
             shift
             ;;
+        --enable-docker|--docker)
+            ENABLE_DOCKER=true
+            shift
+            ;;
         --version|-V)
             echo "claude-container $VERSION"
             exit 0
@@ -197,6 +202,7 @@ Options:
   --config, -C <path>      Explicit path to .claude-projects.yml config file
   --verify, -v             Verify container setup works (run checks and exit)
   --shell, --bash          Start bash shell instead of claude
+  --enable-docker          Mount Docker socket for host Docker access (security risk on Linux)
   --version, -V            Show version
   --help, -h               Show this help
 
@@ -427,6 +433,31 @@ if $SHELL_ONLY; then
     DOCKER_ARGS+=("-e" "SHELL_ONLY=1")
 fi
 
+if $ENABLE_DOCKER; then
+    # Find Docker socket path (varies by platform/setup)
+    DOCKER_SOCKET=""
+    if [[ -S "/var/run/docker.sock" ]]; then
+        DOCKER_SOCKET="/var/run/docker.sock"
+    elif [[ -S "$HOME/.colima/default/docker.sock" ]]; then
+        DOCKER_SOCKET="$HOME/.colima/default/docker.sock"
+    elif [[ -S "$HOME/.docker/run/docker.sock" ]]; then
+        DOCKER_SOCKET="$HOME/.docker/run/docker.sock"
+    fi
+
+    if [[ -n "$DOCKER_SOCKET" ]]; then
+        DOCKER_ARGS+=("-v" "$DOCKER_SOCKET:/var/run/docker.sock")
+        DOCKER_ARGS+=("-e" "DOCKER_HOST=unix:///var/run/docker.sock")
+        if [[ "$PLATFORM" == "linux" ]]; then
+            warn "Docker socket mounted - this grants full Docker access"
+            warn "On Linux, this is equivalent to root access on the host"
+        else
+            info "Docker socket mounted ($DOCKER_SOCKET)"
+        fi
+    else
+        warn "Could not find Docker socket - --enable-docker will not work"
+    fi
+fi
+
 info "Starting container..."
 echo "  Image: $IMAGE_NAME"
 if $USE_GIT_SESSION; then
@@ -444,6 +475,9 @@ if $USE_OVERLAY; then
 fi
 if $USE_GIT_SESSION; then
     echo "  Git Session: $GIT_SESSION"
+fi
+if $ENABLE_DOCKER && [[ -n "${DOCKER_SOCKET:-}" ]]; then
+    echo "  Docker: enabled ($DOCKER_SOCKET)"
 fi
 echo ""
 
