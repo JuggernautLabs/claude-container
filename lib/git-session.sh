@@ -335,5 +335,16 @@ create_git_session() {
         exit 1
     fi
 
+    # Record initial merge point for single-repo session
+    # This ensures only NEW commits are merged, not the entire history
+    local repo_name
+    repo_name=$(basename "$source_dir")
+    docker run --rm \
+        --user "$host_uid:$host_uid" \
+        -v "$volume:/session" \
+        "$git_image" \
+        sh -c "cd /session && git rev-parse HEAD > '/session/.last-merge-${repo_name}'" 2>/dev/null \
+        || warn "Could not record initial merge point"
+
     success "Git session created: $name"
 }

@@ -541,3 +541,176 @@ session_merge() {
 
     merge_git_session "$session_name" "$source_dir" "$target_branch" "$auto_mode" "$no_run"
 }
+
+# Scan session for new repos not in config
+# Usage: session_scan <session_name>
+# Discovers git repos in session volume, compares against config,
+# prompts for destination paths for new repos, updates config
+session_scan() {
+    local session_name="$1"
+    local volume="claude-session-${session_name}"
+
+    if [[ -z "$session_name" ]]; then
+        error "session_scan requires a session name"
+        echo "Usage: session_scan <name>"
+        return 1
+    fi
+
+    # Verify session exists
+    if ! docker volume inspect "$volume" &>/dev/null; then
+        error "Session not found: $session_name"
+        return 1
+    fi
+
+    info "Scanning session: $session_name"
+
+    # Get list of all git repos in the session
+    local repos_in_session
+    repos_in_session=$(docker run --rm \
+        -v "$volume:/workspace:ro" \
+        alpine sh -c '
+            cd /workspace
+            for dir in */; do
+                [ -d "$dir/.git" ] && echo "${dir%/}"
+            done
+        ' 2>/dev/null | sort)
+
+    if [[ -z "$repos_in_session" ]]; then
+        warn "No git repositories found in session"
+        return 0
+    fi
+
+    # Get list of repos from session config
+    local config_repos=""
+    local config_file=""
+
+    # Check for config in session volume
+    local has_config
+    has_config=$(docker run --rm \
+        -v "$volume:/workspace:ro" \
+        alpine sh -c 'test -f /workspace/.claude-projects.yml && echo "yes" || echo "no"')
+
+    if [[ "$has_config" == "yes" ]]; then
+        # Extract repo names from config
+        config_repos=$(docker run --rm \
+            -v "$volume:/workspace:ro" \
+            alpine sh -c '
+                grep -E "^  [a-zA-Z0-9_/-]+:" /workspace/.claude-projects.yml 2>/dev/null | \
+                sed "s/://g" | sed "s/^ *//" | sort
+            ' 2>/dev/null || echo "")
+        config_file="/workspace/.claude-projects.yml"
+    fi
+
+    # Also check session config dir on host
+    local host_config="$SESSIONS_CONFIG_DIR/${session_name}.yml"
+    if [[ -f "$host_config" ]]; then
+        local host_repos
+        host_repos=$(grep -E "^  [a-zA-Z0-9_/-]+:" "$host_config" 2>/dev/null | \
+            sed 's/://g' | sed 's/^ *//' | sort || echo "")
+        if [[ -n "$host_repos" ]]; then
+            config_repos=$(echo -e "${config_repos}\n${host_repos}" | sort -u | grep -v '^$')
+            config_file="$host_config"
+        fi
+    fi
+
+    # Compare and categorize
+    local known_repos=()
+    local new_repos=()
+
+    while read -r repo; do
+        [[ -z "$repo" ]] && continue
+        if echo "$config_repos" | grep -q "^${repo}$"; then
+            known_repos+=("$repo")
+        else
+            new_repos+=("$repo")
+        fi
+    done <<< "$repos_in_session"
+
+    # Display results
+    echo ""
+    echo "=== Known repos (in config) ==="
+    if [[ ${#known_repos[@]} -eq 0 ]]; then
+        echo "  (none)"
+    else
+        for repo in "${known_repos[@]}"; do
+            echo "  ✓ $repo"
+        done
+    fi
+
+    echo ""
+    echo "=== New repos (not in config) ==="
+    if [[ ${#new_repos[@]} -eq 0 ]]; then
+        echo "  (none)"
+        return 0
+    fi
+
+    for repo in "${new_repos[@]}"; do
+        echo "  + $repo"
+    done
+
+    echo ""
+
+    # Prompt for each new repo
+    local updated_config=false
+    for repo in "${new_repos[@]}"; do
+        echo ""
+        echo "New repo: $repo"
+        read -p "  Destination path (empty to skip): " dest_path
+
+        if [[ -z "$dest_path" ]]; then
+            echo "  Skipped"
+            continue
+        fi
+
+        # Expand ~ to home directory
+        dest_path="${dest_path/#\~/$HOME}"
+
+        # Make absolute if relative
+        if [[ ! "$dest_path" = /* ]]; then
+            dest_path="$(pwd)/$dest_path"
+        fi
+
+        # Confirm
+        echo "  Will extract to: $dest_path"
+        read -p "  Confirm? [y/N] " confirm
+        if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
+            echo "  Skipped"
+            continue
+        fi
+
+        # Add to config file
+        if [[ -n "$host_config" ]]; then
+            # Append to host config
+            echo "" >> "$host_config"
+            echo "  # Discovered from session" >> "$host_config"
+            echo "  $repo:" >> "$host_config"
+            echo "    path: $dest_path" >> "$host_config"
+            echo "    source: discovered" >> "$host_config"
+            success "Added $repo -> $dest_path to config"
+            updated_config=true
+        else
+            # Create new config
+            host_config="$SESSIONS_CONFIG_DIR/${session_name}.yml"
+            mkdir -p "$SESSIONS_CONFIG_DIR"
+            cat > "$host_config" << EOF
+version: "1"
+projects:
+  # Discovered from session scan
+  $repo:
+    path: $dest_path
+    source: discovered
+EOF
+            success "Created config: $host_config"
+            success "Added $repo -> $dest_path"
+            updated_config=true
+        fi
+    done
+
+    if $updated_config; then
+        echo ""
+        success "Config updated: $host_config"
+        echo ""
+        echo "To extract new repos, run:"
+        echo "  claude-container --merge-session $session_name"
+    fi
+}

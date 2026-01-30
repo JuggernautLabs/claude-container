@@ -22,7 +22,7 @@ You are helping the user set up a claude-container session. This is an interacti
 
 - **claude-container** runs Claude Code in an isolated Docker container
 - The user is CURRENTLY inside Claude Code, so we cannot start the container from here
-- Git-based session isolation is the **default** - every session requires `--session <name>`
+- Git-based session isolation is the **default** - every session requires `-s <name>`
 - The `--no-run` flag does all the heavy lifting upfront (discovery, validation, cloning)
 - After setup, the user just needs `claude-container -s <name>` to start
 
@@ -34,6 +34,7 @@ Use `AskUserQuestion` to collect the following. If the user provided a session n
 Ask for a session name if not provided. This identifies the Docker volume and session.
 - Should be lowercase, alphanumeric with hyphens
 - Examples: `my-feature`, `bugfix-123`, `refactor-auth`
+- **Branch matching**: If the session name matches an existing git branch, that branch will be cloned
 
 ### Required: Repository Source
 Ask how they want to specify repositories:
@@ -45,12 +46,17 @@ Ask how they want to specify repositories:
 If they choose "Discover repos", ask for the directory path.
 If they choose "Config file", ask for the path (or use auto-detection).
 
-### Required: Runtime Mode
+### Optional: Tracked vs Untracked
+For multi-project setups, ask which repos should be tracked for merging:
+- **Tracked repos**: Changes will be merged back to source
+- **Untracked repos**: Cloned for reference but changes won't be merged (use `track: false` in config)
+
+### Optional: Runtime Mode
 Ask about runtime mode:
 
-1. **Rootish** (recommended) - Run with fake-root capabilities for installing system packages
+1. **Rootish** (default) - Run with fake-root capabilities for installing system packages
 2. **User mode** - Run as non-root developer user
-3. **Default** - No special mode
+3. **Root** - Run as actual root (not recommended)
 
 ### Optional: Continue Conversation
 Ask if they want to continue an existing conversation in this session (adds `--continue` flag).
@@ -63,32 +69,11 @@ Ask if they need to run Docker commands inside the container (for building image
 - If yes, add `--enable-docker` flag
 - Mention this mounts the host Docker socket
 
-## Untracked Dependencies
-
-For projects that should be cloned but NOT tracked for merging (libraries, reference repos), use `track: false` in the config:
-
-```yaml
-version: "1"
-projects:
-  my-app:
-    path: ./my-app
-    main: true
-
-  # These are cloned but changes won't be merged back
-  shared-lib:
-    path: ../shared-lib
-    track: false
-
-  reference-docs:
-    path: ../docs
-    track: false
-```
-
-Untracked projects:
-- Are cloned into the session like normal
-- Show as `[-] project-name (untracked)` in merge status
-- Are skipped during `--merge-session`
-- Don't have merge points recorded
+### Optional: Custom Dockerfile
+Ask if they want to use a custom Dockerfile instead of the default image.
+- Default: uses pre-built `ghcr.io/hypermemetic/claude-container:latest`
+- If yes, add `--dockerfile` flag (searches `./Dockerfile`, `./.devcontainer/Dockerfile`, `./docker/Dockerfile`)
+- Or `-f <path>` for a specific Dockerfile
 
 ## Step 2: Build the Command
 
@@ -101,11 +86,12 @@ claude-container -s <session-name> [options]
 Options to include based on answers:
 - `--discover-repos <path>` - if they chose repo discovery
 - `--config <path>` - if they specified a config file
-- `--as-rootish` - if they chose rootish mode (default)
+- `--as-rootish` - rootish mode (default, can omit)
 - `--as-user` - if they chose user mode
 - `--continue` - if they want to continue existing conversation
 - `--auto-sync <branch>` - if they specified an auto-sync branch
 - `--enable-docker` - if they need Docker access inside container
+- `--dockerfile [path]` - if they want to use a custom Dockerfile
 
 ## Step 3: Validate with --no-run
 
@@ -123,10 +109,7 @@ This does the heavy lifting upfront:
 - Clones repositories into the session
 - Configures git in each repo
 
-If validation fails, show the error and help the user fix it. Common issues:
-- Missing `CLAUDE_CODE_OAUTH_TOKEN` - guide them to run `claude setup-token`
-- Docker not running - ask them to start Docker
-- Invalid config file - help fix YAML syntax or paths
+If validation fails, show the error and help the user fix it.
 
 ## Step 4: Output Session Info
 
@@ -142,156 +125,252 @@ Session prepared successfully: <session-name>
 To start the container:
 1. Exit Claude Code (type 'exit' or press Ctrl+D)
 2. Run: claude-container -s <session-name>
-
-Full command (for reference):
-  claude-container -s <name> --discover-repos <path>
 ```
 
-Then ask if they want the command copied to the clipboard:
+---
+
+# All Workflows
+
+## Session Creation
+
+### Basic Session (current directory)
+```bash
+claude-container -s my-feature
+```
+
+### Multi-Project with Discovery
+```bash
+claude-container -s my-feature --discover-repos ~/dev/myproject
+```
+
+### Multi-Project with Config File
+```bash
+claude-container -s my-feature --config .claude-projects.yml
+```
+
+### Generate Config Only (no session)
+```bash
+claude-container -s my-feature --discover-repos ~/dev --config-only
+# Outputs: ~/.config/claude-container/sessions/my-feature.yml
+```
+
+### Prepare Without Starting
+```bash
+claude-container -s my-feature --no-run
+```
+
+## Config File Format
+
+```yaml
+version: "1"
+projects:
+  # Main project - tracked for merging
+  my-app:
+    path: ./my-app
+    main: true
+
+  # Dependency - tracked
+  shared-lib:
+    path: ../shared-lib
+
+  # Reference only - NOT tracked for merging
+  docs:
+    path: ../docs
+    track: false
+
+  # Specific branch
+  feature-branch:
+    path: ./other-repo
+    branch: develop
+```
+
+**Fields:**
+- `path` - Path to git repository (relative to config file or absolute)
+- `main` - Mark as main project (working directory inside container)
+- `track` - Set to `false` to exclude from merge operations
+- `branch` - Specific branch to clone (otherwise uses session name match or HEAD)
+
+## Running Sessions
+
+### Start/Resume Session
+```bash
+claude-container -s my-feature
+```
+
+### Resume and Continue Conversation
+```bash
+claude-container -s my-feature --continue
+```
+
+### Start with Docker Access
+```bash
+claude-container -s my-feature --enable-docker
+```
+
+### Start with Custom Dockerfile
+```bash
+claude-container -s my-feature --dockerfile
+claude-container -s my-feature -f ./custom/Dockerfile
+```
+
+### Shell Only (no Claude)
+```bash
+claude-container -s my-feature --shell
+```
+
+### Direct Mount (no git isolation)
+```bash
+claude-container --no-git-session
+```
+
+## Reviewing Changes
+
+### View Diff
+```bash
+claude-container --diff-session my-feature
+claude-container --diff-session my-feature specific-project
+```
+
+### Check What Would Be Merged (dry run)
+```bash
+claude-container --merge-session my-feature --no-run
+```
+
+## Merging Changes Back
+
+### Interactive Merge
+```bash
+claude-container --merge-session my-feature
+```
+
+### Auto-Merge (no prompts)
+```bash
+claude-container --merge-session my-feature --yes
+```
+
+### Merge to Specific Branch
+```bash
+claude-container --merge-session my-feature --into feature/my-feature
+```
+
+### Auto-Sync on Container Exit
+```bash
+claude-container -s my-feature --auto-sync main
+```
+
+**Merge behavior:**
+- Uses `git format-patch` + `git am` to preserve commit metadata
+- Tracks merge points - only merges new commits since last merge
+- Handles git worktrees automatically
+- Skips repos with `track: false`
+
+## Discovering New Repos
+
+If Claude creates new git repos inside the session, use `--scan` to discover them:
 
 ```bash
-echo "claude-container -s <name>" | pbcopy
-```
-
-## Example Interaction
-
-```
-User: /container-setup
-
-Claude: I'll help you set up a claude-container session.
-
-[Asks: What should the session be named?]
-User: feature-auth
-
-[Asks: How do you want to specify repositories?]
-User: Discover repos
-
-[Asks: What directory contains your repositories?]
-User: ~/dev/myapp
-
-[Asks: What runtime mode do you need?]
-User: Rootish (recommended)
-
-[Asks: Continue an existing conversation?]
-User: No
-
-Claude: Let me prepare this session...
-> claude-container -s feature-auth --discover-repos ~/dev/myapp --no-run
-
-[Output shows successful setup - repos discovered, cloned, validated]
-
-Session prepared successfully: feature-auth
-
-To start the container:
-1. Exit Claude Code (type 'exit' or press Ctrl+D)
-2. Run: claude-container -s feature-auth
-
-Full command (for reference):
-  claude-container -s feature-auth --discover-repos ~/dev/myapp
-
-[Asks: Copy start command to clipboard?]
-User: Yes
-
-Claude: Copied to clipboard. Exit and paste to start your session.
-```
-
-## Session Lifecycle
-
-### Creating a Session
-Sessions require `-s <name>`. The `--no-run` flag prepares everything without starting:
-```bash
-claude-container -s myproject --no-run
-```
-
-### Running a Session
-After creation (or to resume), just run:
-```bash
-claude-container -s myproject
-```
-
-### Checking for Changes
-To see what commits were made in a session:
-```bash
-claude-container --merge-session myproject --no-run
-```
-
-This shows commits pending merge for each project without actually merging.
-
-### Merging Changes Back
-When the user is done working in the container and wants to merge changes back:
-```bash
-claude-container --merge-session myproject --yes
+claude-container -s my-feature --scan
 ```
 
 This will:
-1. Show commits pending for each project
-2. Generate patches for new commits (since last merge)
-3. Apply patches to the source repos (handles worktrees automatically)
-4. Record merge points for future incremental merges
+1. List all git repos in the session
+2. Compare against the config
+3. Show known vs new repos
+4. Prompt for destination path for each new repo
+5. Update the session config
 
-Options:
-- `--no-run` - Dry run, just show what would be merged
-- `--yes` - Skip confirmation prompts
-- `--into <branch>` - Merge into a specific branch
+Then `--merge-session` will include the new repos.
 
-### Deleting a Session
-```bash
-claude-container --delete-session myproject --yes
-```
-
-## Docker Access
-
-If the user needs to run Docker commands inside the container (e.g., for building images, running tests):
+## Adding Repos to Existing Session
 
 ```bash
-claude-container -s myproject --enable-docker
+claude-container --add-repo my-feature /path/to/repo [workspace-name]
 ```
 
-This mounts the host's Docker socket into the container.
+## Session Management
 
-**Security notes:**
-- On **macOS** (Docker Desktop/Colima): Relatively safe - Docker runs in a VM
-- On **Linux**: Equivalent to root access on the host - use with caution
+### List All Sessions
+```bash
+claude-container --list-sessions
+claude-container --sessions
+```
 
-The flag auto-detects the socket location:
-- `/var/run/docker.sock` (standard)
-- `~/.colima/default/docker.sock` (Colima)
-- `~/.docker/run/docker.sock` (Docker Desktop)
+### Delete a Session
+```bash
+claude-container --delete-session my-feature
+claude-container --delete-session my-feature --yes  # Skip confirmation
+claude-container --delete-session "my-.*" --regex   # Pattern match
+```
+
+### Restart Session (fix permissions)
+```bash
+claude-container --restart-session my-feature
+```
+
+### Cleanup Unused Volumes
+```bash
+claude-container --cleanup-unused
+claude-container --cleanup-unused --yes
+```
+
+### Cleanup All Volumes
+```bash
+claude-container --cleanup
+```
+
+## Branch Behavior
+
+When creating a session, the branch to clone is determined by:
+
+1. **Config `branch` field** - highest priority
+2. **Session name matches branch** - if a branch with the session name exists, it's used
+3. **Current HEAD** - otherwise, clone whatever is checked out
+
+```bash
+# If branch "my-feature" exists in the repo, it will be cloned
+claude-container -s my-feature
+```
 
 ## Error Handling
 
 ### OAuth Token Missing
 ```
-The CLAUDE_CODE_OAUTH_TOKEN environment variable is not set.
-
-To fix this:
-1. Exit Claude Code
-2. Run: export CLAUDE_CODE_OAUTH_TOKEN=$(claude auth status | grep -o 'oauth:[^ ]*')
-   Or: claude setup-token
-3. Run this skill again
+export CLAUDE_CODE_OAUTH_TOKEN=$(claude auth status | grep -o 'oauth:[^ ]*')
+# Or: claude setup-token
 ```
 
 ### Docker Not Running
-```
-Docker doesn't appear to be running.
-
-Please start Docker Desktop (or your Docker daemon) and try again.
-```
-
-### Invalid Session Name
-If the user provides an invalid session name (spaces, special characters), suggest a corrected version.
+Start Docker Desktop or your Docker daemon.
 
 ### Merge Conflicts
-If `--merge-session` fails with patch conflicts:
-```
-Merge failed - resolve conflicts and run: git am --continue
+```bash
+cd /path/to/repo
+git am --show-current-patch  # See what failed
+# Fix conflicts
+git add .
+git am --continue
+# Or abort: git am --abort
 ```
 
-Guide the user to:
-1. Go to the affected repo directory
-2. Resolve conflicts in the affected files
-3. Run `git add <files>` and `git am --continue`
-4. Or abort with `git am --abort`
+### Permission Issues
+```bash
+claude-container --restart-session my-feature
+```
+
+## Docker Access
+
+```bash
+claude-container -s my-feature --enable-docker
+```
+
+**Security notes:**
+- **macOS** (Docker Desktop/Colima): Relatively safe - Docker runs in a VM
+- **Linux**: Equivalent to root access on the host - use with caution
+
+Socket auto-detection:
+- `/var/run/docker.sock` (standard)
+- `~/.colima/default/docker.sock` (Colima)
+- `~/.docker/run/docker.sock` (Docker Desktop)
 
 ## Quick Reference
 
@@ -300,10 +379,20 @@ Guide the user to:
 | Create session | `claude-container -s NAME --no-run` |
 | Start session | `claude-container -s NAME` |
 | Resume + continue | `claude-container -s NAME --continue` |
-| Check changes | `claude-container --merge-session NAME --no-run` |
+| Discover repos | `claude-container -s NAME --discover-repos DIR` |
+| Generate config only | `claude-container -s NAME --discover-repos DIR --config-only` |
+| Check changes | `claude-container --diff-session NAME` |
+| Dry-run merge | `claude-container --merge-session NAME --no-run` |
 | Merge changes | `claude-container --merge-session NAME --yes` |
+| Merge to branch | `claude-container --merge-session NAME --into BRANCH` |
+| Scan for new repos | `claude-container -s NAME --scan` |
+| Add repo to session | `claude-container --add-repo NAME /path/to/repo` |
 | With Docker | `claude-container -s NAME --enable-docker` |
-| Generate config | `claude-container -s NAME --discover-repos DIR --config-only` |
-| Delete session | `claude-container --delete-session NAME --yes` |
-| List sessions | `claude-container --list-sessions` |
+| Custom Dockerfile | `claude-container -s NAME --dockerfile` |
+| Specific Dockerfile | `claude-container -s NAME -f ./path/Dockerfile` |
+| Shell only | `claude-container -s NAME --shell` |
 | Direct mount | `claude-container --no-git-session` |
+| List sessions | `claude-container --list-sessions` |
+| Delete session | `claude-container --delete-session NAME --yes` |
+| Restart session | `claude-container --restart-session NAME` |
+| Cleanup unused | `claude-container --cleanup-unused --yes` |

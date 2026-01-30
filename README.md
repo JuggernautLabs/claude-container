@@ -2,6 +2,29 @@
 
 Run Claude Code in an isolated Docker container with full filesystem access, without risking your host system.
 
+---
+
+## WARNING: Don't Let Claude Delete Your Sessions
+
+If you're using claude-container to develop claude-container itself, **be very careful with session management commands**.
+
+Claude has access to `--delete-session`, `--cleanup`, and `--cleanup-unused` commands. If you ask Claude to "clean up" or it decides to tidy up test artifacts, it may delete your running sessions - including the one it's running in.
+
+**True story:** While developing this tool, we ran:
+```bash
+./claude-container --delete-session "test-" --regex --yes
+```
+
+This killed two running Claude containers that were using those volumes. All uncommitted work in those sessions was lost.
+
+**Safe practices:**
+- Don't ask Claude to clean up sessions without reviewing the command first
+- Use `--list-sessions` to see what's running before any delete operation
+- Name your important sessions distinctively (not `test`, `temp`, etc.)
+- Commit/merge work before running cleanup commands
+
+---
+
 ## Why?
 
 Claude Code's `--dangerously-skip-permissions` flag lets Claude work autonomously, but running it directly on your machine means Claude can modify any file. `claude-container` provides:
@@ -1081,7 +1104,9 @@ Since `--no-run` already clones all repos and sets up the session, the final com
 
 ## Using a Custom Dockerfile
 
-If your project has specific dependencies, create a Dockerfile:
+By default, claude-container uses the pre-built default image. To use a custom Dockerfile, use the `--dockerfile` flag.
+
+Create a Dockerfile with your project-specific dependencies:
 
 ```dockerfile
 FROM ghcr.io/hypermemetic/claude-container:latest
@@ -1097,16 +1122,15 @@ RUN npm install -g typescript ts-node
 
 Then:
 ```bash
-./claude-container -s my-feature
-# Automatically uses ./Dockerfile if present
-```
+# Use local Dockerfile (searches ./Dockerfile, ./.devcontainer/Dockerfile, ./docker/Dockerfile)
+./claude-container -s my-feature --dockerfile
 
-Search order for Dockerfiles:
-1. Explicit path argument
-2. `./Dockerfile`
-3. `./.devcontainer/Dockerfile`
-4. `./docker/Dockerfile`
-5. Default image (if none found)
+# Use a specific Dockerfile
+./claude-container -s my-feature -f ./custom/Dockerfile
+
+# Force rebuild
+./claude-container -s my-feature --dockerfile --build
+```
 
 ## Troubleshooting
 

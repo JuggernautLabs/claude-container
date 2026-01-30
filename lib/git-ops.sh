@@ -583,7 +583,11 @@ merge_git_session() {
     fi
     echo ""
 
-    # Show what will be merged
+    # Get repo name for merge point tracking
+    local repo_name
+    repo_name=$(basename "$target_dir")
+
+    # Show what will be merged (only commits since last merge point)
     echo "=== Commits to merge ==="
     docker run --rm \
         -v "$volume:/session:ro" \
@@ -591,11 +595,30 @@ merge_git_session() {
         sh -c '
             git config --global --add safe.directory "*"
             cd /session
-            initial=$(git rev-list --max-parents=0 HEAD 2>/dev/null | tail -1)
-            git log --oneline "$initial"..HEAD 2>/dev/null || git log --oneline -10
+            MERGE_POINT=""
+            if [ -f /session/.last-merge-'"$repo_name"' ]; then
+                MERGE_POINT=$(cat /session/.last-merge-'"$repo_name"')
+            fi
+            if [ -n "$MERGE_POINT" ]; then
+                COUNT=$(git rev-list --count "$MERGE_POINT"..HEAD 2>/dev/null || echo "0")
+                if [ "$COUNT" = "0" ]; then
+                    echo "(no new commits since last merge)"
+                else
+                    git log --oneline "$MERGE_POINT"..HEAD 2>/dev/null
+                fi
+            else
+                # No merge point - show recent commits as warning
+                echo "(WARNING: no merge point found, showing last 10 commits)"
+                git log --oneline -10
+            fi
         '
 
     echo ""
+
+    if $no_run; then
+        info "Dry run - not applying changes"
+        return 0
+    fi
 
     if [[ "$auto_mode" == "true" ]]; then
         choice="y"
@@ -615,7 +638,7 @@ merge_git_session() {
             mkdir -p "$patch_dir"
             trap "rm -rf $patch_dir" RETURN
 
-            # Export patches from session
+            # Export patches from session (only commits since merge point)
             docker run --rm \
                 -v "$volume:/session:ro" \
                 -v "$patch_dir:/patches" \
@@ -623,9 +646,17 @@ merge_git_session() {
                 sh -c '
                     git config --global --add safe.directory "*"
                     cd /session
-                    initial=$(git rev-list --max-parents=0 HEAD 2>/dev/null | tail -1)
-                    git format-patch -o /patches "$initial"..HEAD 2>/dev/null || \
-                        git format-patch -o /patches -10
+                    MERGE_POINT=""
+                    if [ -f /session/.last-merge-'"$repo_name"' ]; then
+                        MERGE_POINT=$(cat /session/.last-merge-'"$repo_name"')
+                    fi
+                    if [ -n "$MERGE_POINT" ]; then
+                        git format-patch -o /patches "$MERGE_POINT"..HEAD 2>/dev/null
+                    else
+                        # Fallback: export all commits (will likely fail on merge)
+                        initial=$(git rev-list --max-parents=0 HEAD 2>/dev/null | tail -1)
+                        git format-patch -o /patches "$initial"..HEAD 2>/dev/null
+                    fi
                 '
 
             # Apply patches to target
@@ -649,6 +680,16 @@ merge_git_session() {
             done
 
             success "Successfully merged $patch_count commit(s)"
+
+            # Update merge point so next merge only gets new commits
+            local host_uid
+            host_uid=$(get_host_uid)
+            docker run --rm \
+                --user "$host_uid:$host_uid" \
+                -v "$volume:/session" \
+                "$git_image" \
+                sh -c "cd /session && git rev-parse HEAD > '/session/.last-merge-${repo_name}'" 2>/dev/null \
+                || warn "Could not update merge point"
 
             # In auto mode, don't prompt to delete (preserve session for --continue)
             if [[ "$auto_mode" != "true" ]]; then
