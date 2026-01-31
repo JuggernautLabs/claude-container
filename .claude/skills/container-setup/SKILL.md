@@ -54,7 +54,7 @@ For multi-project setups, ask which repos should be tracked for merging:
 ### Optional: Runtime Mode
 Ask about runtime mode:
 
-1. **Rootish** (default) - Run with fake-root capabilities for installing system packages
+1. **Rootish** (default) - Run with passwordless sudo for installing system packages
 2. **User mode** - Run as non-root developer user
 3. **Root** - Run as actual root (not recommended)
 

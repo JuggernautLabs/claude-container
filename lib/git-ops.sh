@@ -657,7 +657,7 @@ ${host_projects}"
         local created_worktree=false
 
         # Check if branch already has a worktree
-        existing_worktree=$(cd "$ppath" && git worktree list --porcelain 2>/dev/null | grep -A2 "^worktree " | grep -B1 "branch refs/heads/$merge_branch" | head -1 | sed 's/worktree //' || true)
+        existing_worktree=$(cd "$ppath" && git worktree list --porcelain 2>/dev/null | grep -A2 "^worktree " | grep -B2 "branch refs/heads/$merge_branch" | head -1 | sed 's/worktree //' || true)
 
         if [[ -n "$existing_worktree" && -d "$existing_worktree" ]]; then
             # Use existing worktree for this branch
@@ -764,7 +764,7 @@ merge_git_session() {
 
     # Check if branch already has a worktree
     local existing_worktree=""
-    existing_worktree=$(cd "$target_dir" && git worktree list --porcelain 2>/dev/null | grep -A2 "^worktree " | grep -B1 "branch refs/heads/$target_branch" | head -1 | sed 's/worktree //' || true)
+    existing_worktree=$(cd "$target_dir" && git worktree list --porcelain 2>/dev/null | grep -A2 "^worktree " | grep -B2 "branch refs/heads/$target_branch" | head -1 | sed 's/worktree //' || true)
 
     if [[ -n "$existing_worktree" && -d "$existing_worktree" ]]; then
         info "Using existing worktree: $existing_worktree"
