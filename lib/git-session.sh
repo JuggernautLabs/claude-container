@@ -80,21 +80,47 @@ create_multi_project_session() {
         exit 1
     fi
 
-    # Create config file with absolute paths using temp file (avoids env var size limits)
+    # Store config in session volume
+    # If config already has metadata (from template system), copy directly
+    # Otherwise, generate a basic config for backwards compatibility
     info "Storing config in session volume..."
+
+    local has_meta=false
+    if command -v yq &>/dev/null; then
+        local meta_check
+        meta_check=$(yq eval '._meta // ""' "$config_file" 2>/dev/null)
+        [[ -n "$meta_check" ]] && [[ "$meta_check" != "null" ]] && has_meta=true
+    fi
+
     local temp_config="$CACHE_DIR/session-config-$$.yml"
     mkdir -p "$CACHE_DIR"
 
-    # Write config to temp file (streaming, not accumulating in memory)
-    {
-        echo 'version: "1"'
-        echo 'projects:'
-        while IFS='|' read -r proj_name proj_path; do
-            [[ -z "$proj_name" ]] && continue
-            echo "  ${proj_name}:"
-            echo "    path: ${proj_path}"
-        done <<< "$projects"
-    } > "$temp_config"
+    if $has_meta; then
+        # Config has metadata, copy as-is
+        cp "$config_file" "$temp_config"
+    else
+        # Legacy config without metadata - add minimal metadata
+        local timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+        {
+            echo 'version: "1"'
+            echo ''
+            echo '_meta:'
+            echo '  parent: null'
+            echo "  session: $name"
+            echo "  created: $timestamp"
+            echo "  modified: $timestamp"
+            echo ''
+            echo 'projects:'
+            while IFS='|' read -r proj_name proj_path proj_branch proj_track proj_source; do
+                [[ -z "$proj_name" ]] && continue
+                echo "  ${proj_name}:"
+                echo "    path: ${proj_path}"
+                [[ -n "$proj_branch" ]] && echo "    branch: ${proj_branch}"
+                [[ "$proj_track" == "false" ]] && echo "    track: false"
+                [[ "$proj_source" == "discovered" ]] && echo "    source: discovered"
+            done <<< "$projects"
+        } > "$temp_config"
+    fi
 
     # Copy via mounted temp file (works for any size), run as target UID
     if ! docker run --rm \
@@ -245,6 +271,52 @@ create_multi_project_session() {
     success "Multi-project session created: $name ($project_count projects)"
 }
 
+# Create session from project list (--add-repo and/or --template)
+# Arguments:
+#   $1 - session name
+#   $2 - source directory (workspace dir for fallback)
+# Returns:
+#   0 on success, exits on failure
+create_session_from_project_list() {
+    local name="$1"
+    local source_dir="$2"
+    local volume="claude-session-${name}"
+
+    # Check if session already exists
+    if docker volume inspect "$volume" &>/dev/null; then
+        info "Resuming existing session: $name"
+        return 0
+    fi
+
+    info "Building project list..."
+
+    # Build project list from all sources
+    local projects
+    projects=$(build_project_list "$name" "$source_dir")
+
+    if [[ -z "$projects" ]] || [[ "$projects" == $'\n' ]]; then
+        error "No projects to clone"
+        echo "Specify repos with --add-repo or use a template with -t"
+        exit 1
+    fi
+
+    # Generate config file
+    local temp_config="$CACHE_DIR/generated-config-$$.yml"
+    mkdir -p "$CACHE_DIR"
+
+    local parent_name=""
+    [[ -n "${TEMPLATE_FILE:-}" ]] && parent_name=$(basename "$TEMPLATE_FILE" .yml)
+
+    generate_config_file "$temp_config" "$projects" "$parent_name" "$name"
+
+    # Create multi-project session with generated config
+    create_multi_project_session "$name" "$temp_config"
+    local result=$?
+
+    rm -f "$temp_config"
+    return $result
+}
+
 # Git-based session isolation - clones repo into volume, strips remotes
 # This replaces privileged overlay mode with a safer git-based approach
 # Arguments:
@@ -256,6 +328,12 @@ create_git_session() {
     local name="$1"
     local source_dir="$2"
     local volume="claude-session-${name}"
+
+    # Check for --add-repo flags or --template (use template system)
+    if [[ ${#ADD_REPOS[@]} -gt 0 ]] || [[ -n "${TEMPLATE_FILE:-}" ]]; then
+        create_session_from_project_list "$name" "$source_dir"
+        return $?
+    fi
 
     # Check for --discover-repos flags (highest priority)
     if [[ ${#DISCOVER_REPOS_DIRS[@]} -gt 0 ]]; then

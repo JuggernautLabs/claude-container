@@ -19,9 +19,10 @@ DEFAULT_IMAGE="ghcr.io/hypermemetic/claude-container:latest"
 # Config and cache directories
 CONFIG_DIR="$HOME/.config/claude-container"
 CACHE_DIR="$CONFIG_DIR/cache"
+TEMPLATES_DIR="$CONFIG_DIR/templates"
 
 # Ensure directories exist
-mkdir -p "$CONFIG_DIR" "$CACHE_DIR"
+mkdir -p "$CONFIG_DIR" "$CACHE_DIR" "$TEMPLATES_DIR"
 chmod 700 "$CONFIG_DIR"
 
 # Source library modules (resolve symlinks to find actual script location)
@@ -34,6 +35,8 @@ source "$SCRIPT_DIR/lib/docker.sh"
 source "$SCRIPT_DIR/lib/git-session.sh"
 source "$SCRIPT_DIR/lib/git-ops.sh"
 source "$SCRIPT_DIR/lib/session-mgmt.sh"
+source "$SCRIPT_DIR/lib/template-ops.sh"
+source "$SCRIPT_DIR/lib/config-commands.sh"
 
 # Global state variables
 DOCKERFILE=""
@@ -55,6 +58,12 @@ USE_DOCKERFILE=false # Use local Dockerfile instead of default image
 SCAN_SESSION=false   # Scan session for new repos
 DISCOVER_REPOS_DIRS=()  # Array for multiple --discover-repos
 SESSIONS_CONFIG_DIR="$CONFIG_DIR/sessions"  # Where session configs are stored
+ADD_REPOS=()         # Array for --add-repo flags
+EMPTY_MODE=false     # Don't add current directory
+TEMPLATE_NAME=""     # Template name for -t/--template
+TEMPLATE_FILE=""     # Resolved template file path
+UNTRACKED_MODE=false # All repos untracked (exploration mode)
+TRACK_REPOS=()       # Override: track specific repos
 
 # Docker args accumulator
 declare -a DOCKER_ARGS
@@ -100,10 +109,28 @@ case "${1:-}" in
         exit 0
         ;;
 
-    --add-repo)
-        # Usage: --add-repo <session> <repo-path> [workspace-path]
+    --add-repo-to-session)
+        # Usage: --add-repo-to-session <session> <repo-path> [workspace-path]
         shift
         session_add_repo "$@"
+        exit 0
+        ;;
+
+    --list-templates)
+        list_templates
+        exit 0
+        ;;
+
+    --save-template)
+        shift
+        save_template_from_session "$@"
+        exit 0
+        ;;
+
+    config)
+        # Config subcommand for modifying session config
+        shift
+        handle_config_command "$@"
         exit 0
         ;;
 esac
@@ -165,6 +192,33 @@ while [[ $# -gt 0 ]]; do
             DISCOVER_REPOS_DIRS+=("$2")
             shift 2
             ;;
+        --add-repo)
+            ADD_REPOS+=("$2")
+            shift 2
+            ;;
+        --empty)
+            EMPTY_MODE=true
+            shift
+            ;;
+        -t|--template)
+            TEMPLATE_NAME="$2"
+            TEMPLATE_FILE="$TEMPLATES_DIR/${TEMPLATE_NAME}.yml"
+            if [[ ! -f "$TEMPLATE_FILE" ]]; then
+                error "Template not found: $TEMPLATE_NAME"
+                echo "Available templates:"
+                list_templates 2>/dev/null || echo "  (none)"
+                exit 1
+            fi
+            shift 2
+            ;;
+        --untracked)
+            UNTRACKED_MODE=true
+            shift
+            ;;
+        --track)
+            TRACK_REPOS+=("$2")
+            shift 2
+            ;;
         --config|-C)
             CONFIG_FILE="$2"
             shift 2
@@ -222,6 +276,17 @@ Options:
   --version, -V            Show version
   --help, -h               Show this help
 
+Repo Selection:
+  --add-repo <path|name>   Add repo to session (can specify multiple times)
+  --empty                  Don't add current directory to session
+  -t, --template <name>    Load named template
+  --untracked              All repos untracked (exploration mode)
+  --track <repo>           Override: track specific repo(s)
+
+Template Management:
+  --list-templates         List available templates
+  --save-template <name>   Save current session config as new BASE template
+
 Session Management:
   --cleanup                List and optionally delete all claude-related volumes
   --cleanup-unused [--yes] Delete volumes not used by running containers
@@ -230,7 +295,15 @@ Session Management:
   --restart-session <name> Restart a session (fixes permissions, continues conversation)
   --diff-session <name>    Show changes made in a git session vs original repo
   --merge-session <name>   Merge session commits back to repo
-  --add-repo <session> <path> [name]  Add a repo to an existing session
+  --add-repo-to-session <session> <path> [name]  Add a repo to an existing session
+
+Config Commands (inside container):
+  config show              Show current config
+  config track <repo>      Enable tracking for repo
+  config untrack <repo>    Disable tracking for repo
+  config set-main <repo>   Set main project
+  config add-repo <path>   Add discovered repo
+  config remove-repo <n>   Remove repo from config
 
 Environment:
   CLAUDE_CODE_OAUTH_TOKEN   OAuth token for authentication (required)
@@ -238,6 +311,10 @@ Environment:
 
 Examples:
   claude-container -s myproj                           # Start git session "myproj"
+  claude-container -s myproj --add-repo openclaw       # Add repo by name
+  claude-container -s myproj --add-repo ~/dev/lib      # Add repo by path
+  claude-container -s myproj -t hypermemetic           # Use template
+  claude-container -s myproj --add-repo lib --empty    # Only add lib, not cwd
   claude-container -s myproj --discover-repos ~/dev    # Discover repos and start session
   claude-container -s myproj --continue                # Resume session AND continue conversation
   claude-container -s myproj --scan                    # Find new repos created in session
@@ -469,6 +546,17 @@ DOCKER_ARGS+=(
     "-e" "IS_CI=$IS_CI"
 )
 
+# Add template environment variables
+DOCKER_ARGS+=(
+    "-e" "CLAUDE_SESSION=${SESSION_NAME}"
+    "-e" "CLAUDE_SESSION_CONFIG=/workspace/.claude-projects.yml"
+    "-e" "CLAUDE_TEMPLATE_DIR=/templates"
+    "-e" "CLAUDE_TEMPLATE_PARENT=${TEMPLATE_NAME:-}"
+)
+
+# Mount templates directory
+DOCKER_ARGS+=("-v" "$TEMPLATES_DIR:/templates:rw")
+
 # Inject token securely
 inject_token_securely "${CLAUDE_CODE_OAUTH_TOKEN}"
 
@@ -671,8 +759,15 @@ WRAPPER
     fi
 '
 
-# Auto-merge on exit: merge any new commits to branch named after session (or specified branch)
+# Post-session cleanup
 if $USE_GIT_SESSION; then
+    # Auto-save derived template if config was modified
+    if [[ -n "${TEMPLATE_NAME:-}" ]]; then
+        echo ""
+        save_derived_template "$SESSION_NAME" "claude-session-${SESSION_NAME}"
+    fi
+
+    # Auto-merge on exit: merge any new commits to branch named after session (or specified branch)
     merge_branch="${AUTO_SYNC_BRANCH:-$SESSION_NAME}"
     echo ""
     info "Merging session commits to branch: $merge_branch"
