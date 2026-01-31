@@ -607,11 +607,6 @@ EOF
 exec sudo "$@"
 WRAPPER
             chmod +x /usr/local/bin/rootish
-
-            # Create convenience symlinks for package managers
-            for cmd in apt apt-get dpkg; do
-                ln -sf rootish /usr/local/bin/${cmd}-rootish
-            done
             echo "rootish (sudo) wrapper installed"
         fi
     fi
