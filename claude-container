@@ -497,17 +497,16 @@ if $SHELL_ONLY; then
 fi
 
 if $ENABLE_DOCKER; then
-    # Find Docker socket path (varies by platform/setup)
+    # Dynamically detect Docker socket from current context
     DOCKER_SOCKET=""
-    if [[ -S "/var/run/docker.sock" ]]; then
-        DOCKER_SOCKET="/var/run/docker.sock"
-    elif [[ -S "$HOME/.colima/default/docker.sock" ]]; then
-        DOCKER_SOCKET="$HOME/.colima/default/docker.sock"
-    elif [[ -S "$HOME/.docker/run/docker.sock" ]]; then
-        DOCKER_SOCKET="$HOME/.docker/run/docker.sock"
+    if command -v docker &>/dev/null; then
+        DOCKER_HOST_URL=$(docker context inspect --format '{{.Endpoints.docker.Host}}' 2>/dev/null)
+        if [[ -n "$DOCKER_HOST_URL" ]] && [[ "$DOCKER_HOST_URL" == unix://* ]]; then
+            DOCKER_SOCKET="${DOCKER_HOST_URL#unix://}"
+        fi
     fi
 
-    if [[ -n "$DOCKER_SOCKET" ]]; then
+    if [[ -n "$DOCKER_SOCKET" ]] && [[ -S "$DOCKER_SOCKET" ]]; then
         DOCKER_ARGS+=("-v" "$DOCKER_SOCKET:/var/run/docker.sock")
         DOCKER_ARGS+=("-e" "DOCKER_HOST=unix:///var/run/docker.sock")
         if [[ "$PLATFORM" == "linux" ]]; then
@@ -518,6 +517,9 @@ if $ENABLE_DOCKER; then
         fi
     else
         warn "Could not find Docker socket - --enable-docker will not work"
+        if command -v docker &>/dev/null; then
+            warn "Active context: $(docker context show 2>/dev/null || echo 'unknown')"
+        fi
     fi
 fi
 
@@ -592,22 +594,21 @@ EOF
         chown developer:developer /workspace 2>/dev/null || true
 
         if [[ "${RUN_AS_ROOTISH:-}" == "1" ]]; then
-            # Install sudo if not present
             if ! command -v sudo &>/dev/null; then
-                apt-get update -qq && apt-get install -y sudo 2>/dev/null || true
-            fi
+                echo "WARNING: sudo not found - rootish mode requires sudo in the image"
+                echo "         Use --dockerfile to build an image with sudo, or use --as-root"
+            else
+                # Configure passwordless sudo for developer user
+                echo "developer ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/developer
+                chmod 0440 /etc/sudoers.d/developer
 
-            # Configure passwordless sudo for developer user
-            echo "developer ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/developer
-            chmod 0440 /etc/sudoers.d/developer
-
-            # Create rootish wrapper that uses sudo
-            cat > /usr/local/bin/rootish << '\''WRAPPER'\''
+                # Create rootish wrapper that uses sudo
+                cat > /usr/local/bin/rootish << '\''WRAPPER'\''
 #!/bin/bash
 exec sudo "$@"
 WRAPPER
-            chmod +x /usr/local/bin/rootish
-            echo "rootish (sudo) wrapper installed"
+                chmod +x /usr/local/bin/rootish
+            fi
         fi
     fi
 
