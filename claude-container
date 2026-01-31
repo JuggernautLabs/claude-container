@@ -45,7 +45,7 @@ SESSION_NAME_SET=false
 USE_GIT_SESSION=true  # Default: use git-based session isolation
 CONTINUE_SESSION=false
 RUN_AS_USER=false
-RUN_AS_ROOTISH=true  # Default: run as user with fake-root for package installs
+RUN_AS_ROOTISH=true  # Default: run as user with passwordless sudo for package installs
 AUTO_SYNC_BRANCH=""
 NO_RUN=false
 SHELL_ONLY=false
@@ -210,8 +210,8 @@ Options:
   --config-only            Generate config file only, don't create session (outputs path)
   --scan                   Scan session for new repos, prompt for destinations, update config
   --continue, -c           Continue the most recent Claude conversation
-  --as-user                Run as non-root developer user (no fake-root)
-  --as-rootish             Run as developer with fake-root for installs (default)
+  --as-user                Run as non-root developer user (no sudo)
+  --as-rootish             Run as developer with passwordless sudo for installs (default)
   --as-root, --no-rootish  Run as actual root user
   --auto-sync <branch>     Override branch name for auto-merge on exit (default: session name)
   --discover-repos <dir>   Auto-discover all git repos in directory
@@ -490,7 +490,6 @@ fi
 
 if $RUN_AS_ROOTISH; then
     DOCKER_ARGS+=("-e" "RUN_AS_ROOTISH=1")
-    DOCKER_ARGS+=("--security-opt" "seccomp=unconfined")
 fi
 
 if $SHELL_ONLY; then
@@ -593,21 +592,27 @@ EOF
         chown developer:developer /workspace 2>/dev/null || true
 
         if [[ "${RUN_AS_ROOTISH:-}" == "1" ]]; then
+            # Install sudo if not present
+            if ! command -v sudo &>/dev/null; then
+                apt-get update -qq && apt-get install -y sudo 2>/dev/null || true
+            fi
+
+            # Configure passwordless sudo for developer user
+            echo "developer ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/developer
+            chmod 0440 /etc/sudoers.d/developer
+
+            # Create rootish wrapper that uses sudo
             cat > /usr/local/bin/rootish << '\''WRAPPER'\''
 #!/bin/bash
-cmd=$(basename "$0")
-if [[ "$cmd" != "rootish" ]]; then
-    realcmd="${cmd%-rootish}"
-    exec unshare --user --map-root-user -- "$realcmd" "$@"
-else
-    exec unshare --user --map-root-user -- "$@"
-fi
+exec sudo "$@"
 WRAPPER
             chmod +x /usr/local/bin/rootish
+
+            # Create convenience symlinks for package managers
             for cmd in apt apt-get dpkg; do
                 ln -sf rootish /usr/local/bin/${cmd}-rootish
             done
-            echo "rootish wrapper installed"
+            echo "rootish (sudo) wrapper installed"
         fi
     fi
 

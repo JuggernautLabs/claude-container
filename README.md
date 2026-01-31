@@ -141,7 +141,7 @@ When creating a session, the branch to clone is determined by:
 | `--config, -C <path>` | Explicit path to `.claude-projects.yml` config file |
 | `--config-only` | Generate config file only, output path |
 | `--continue, -c` | Continue the most recent Claude conversation |
-| `--as-rootish` | Run as user with fake-root capabilities (default) |
+| `--as-rootish` | Run as user with passwordless sudo (default) |
 | `--as-root` | Run as actual root user (disables rootish) |
 | `--enable-docker` | Mount Docker socket for host Docker access |
 | `--build, -b` | Force rebuild the container image |
@@ -183,7 +183,7 @@ Claude: I'll install the PostgreSQL client.
 > rootish apt-get install -y postgresql-client
 ```
 
-The `rootish` wrapper makes commands think they're running as root without actual root privileges.
+The `rootish` wrapper uses passwordless sudo to run commands as root (Claude itself runs as non-root user).
 
 ### Making Changes
 
@@ -1184,7 +1184,7 @@ docker ps
 
 - **Tokens**: Stored in a file mount, not environment variables (hidden from `docker inspect`)
 - **Git remotes**: Stripped from cloned repos (Claude can't push)
-- **Rootish mode**: Fake root via user namespaces, not real root
+- **Rootish mode**: Non-root user with passwordless sudo for package installs
 - **Isolation**: Changes stay in volumes until explicitly merged
 
 ## License
