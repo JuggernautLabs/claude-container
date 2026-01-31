@@ -213,6 +213,29 @@ claude-container -s my-feature --dockerfile
 claude-container -s my-feature -f ./custom/Dockerfile
 ```
 
+### Switch Container Image Mid-Session
+Session volumes are decoupled from the container image. You can switch images without losing work:
+
+```bash
+# Start with default image
+claude-container -s my-feature
+
+# ... work, exit ...
+
+# Resume with custom Dockerfile (adds dependencies you need)
+claude-container -s my-feature --dockerfile --continue
+
+# Or switch to a specific Dockerfile
+claude-container -s my-feature -f ./Dockerfile.rust --continue
+```
+
+**Use cases:**
+- Started with default image, now need specific tools (PostgreSQL, Redis, etc.)
+- Need to test with different runtime versions
+- Adding project-specific Dockerfile after initial exploration
+
+The session data (`/workspace`) and conversation history are preserved - only the container environment changes.
+
 ### Shell Only (no Claude)
 ```bash
 claude-container -s my-feature --shell
@@ -379,6 +402,7 @@ Socket auto-detection:
 | Create session | `claude-container -s NAME --no-run` |
 | Start session | `claude-container -s NAME` |
 | Resume + continue | `claude-container -s NAME --continue` |
+| Switch image | `claude-container -s NAME --dockerfile --continue` |
 | Discover repos | `claude-container -s NAME --discover-repos DIR` |
 | Generate config only | `claude-container -s NAME --discover-repos DIR --config-only` |
 | Check changes | `claude-container --diff-session NAME` |

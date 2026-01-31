@@ -602,8 +602,10 @@ session_scan() {
     fi
 
     # Also check session config dir on host
-    local host_config="$SESSIONS_CONFIG_DIR/${session_name}.yml"
-    if [[ -f "$host_config" ]]; then
+    local host_config=""
+    local host_config_path="$SESSIONS_CONFIG_DIR/${session_name}.yml"
+    if [[ -f "$host_config_path" ]]; then
+        host_config="$host_config_path"
         local host_repos
         host_repos=$(grep -E "^  [a-zA-Z0-9_/-]+:" "$host_config" 2>/dev/null | \
             sed 's/://g' | sed 's/^ *//' | sort || echo "")
@@ -680,7 +682,7 @@ session_scan() {
 
         # Add to config file
         if [[ -n "$host_config" ]]; then
-            # Append to host config
+            # Append to existing host config
             echo "" >> "$host_config"
             echo "  # Discovered from session" >> "$host_config"
             echo "  $repo:" >> "$host_config"
@@ -689,8 +691,8 @@ session_scan() {
             success "Added $repo -> $dest_path to config"
             updated_config=true
         else
-            # Create new config
-            host_config="$SESSIONS_CONFIG_DIR/${session_name}.yml"
+            # Create new config file
+            host_config="$host_config_path"
             mkdir -p "$SESSIONS_CONFIG_DIR"
             cat > "$host_config" << EOF
 version: "1"

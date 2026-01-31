@@ -10,6 +10,23 @@
 #   - CACHE_DIR: directory for caching temporary files
 #   - IMAGE_NAME or DEFAULT_IMAGE: Docker image for git operations
 
+# Get the merge point (base commit) for a project in a session
+# Arguments:
+#   $1 - volume name
+#   $2 - project name
+# Returns:
+#   Commit hash (stdout) or empty if not found
+get_merge_point() {
+    local volume="$1"
+    local project_name="$2"
+    local git_image="${IMAGE_NAME:-$DEFAULT_IMAGE}"
+
+    docker run --rm \
+        -v "$volume:/session:ro" \
+        "$git_image" \
+        sh -c "cat /session/.last-merge-${project_name} 2>/dev/null || echo ''" 2>/dev/null
+}
+
 # Direct merge from volume repo to target path
 # This mounts both in a single container and performs the merge directly
 merge_volume_to_target() {
@@ -136,6 +153,74 @@ get_session_status() {
         ' 2>/dev/null || echo "0"
 }
 
+# Extract a new repo from session to host filesystem
+# Used for repos created inside the session (source: discovered)
+# Arguments:
+#   $1 - volume name
+#   $2 - repo name in session
+#   $3 - destination path on host
+#   $4 - git image to use
+# Returns:
+#   0 on success, 1 on failure
+extract_repo_from_session() {
+    local volume="$1"
+    local repo_name="$2"
+    local dest_path="$3"
+    local git_image="$4"
+
+    info "Extracting new repo: $repo_name -> $dest_path"
+
+    # Check if destination already exists
+    if [[ -e "$dest_path" ]]; then
+        error "Destination already exists: $dest_path"
+        return 1
+    fi
+
+    # Create parent directory
+    local parent_dir
+    parent_dir=$(dirname "$dest_path")
+    if [[ ! -d "$parent_dir" ]]; then
+        info "  Creating parent directory: $parent_dir"
+        mkdir -p "$parent_dir" || {
+            error "  Failed to create parent directory"
+            return 1
+        }
+    fi
+
+    # Clone the repo from the volume to a temp location, then move it
+    # We use git clone to preserve all git history and metadata
+    local temp_clone="$CACHE_DIR/extract-$$-$(date +%s)"
+    mkdir -p "$temp_clone"
+    trap "rm -rf '$temp_clone'" RETURN
+
+    # Clone from volume to temp directory
+    if ! docker run --rm \
+        -v "$volume:/session:ro" \
+        -v "$temp_clone:/output" \
+        "$git_image" \
+        sh -c "
+            git config --global --add safe.directory '*'
+            git clone /session/$repo_name /output/repo
+            cd /output/repo
+            # Remove any remote references (they point to container paths)
+            git remote remove origin 2>/dev/null || true
+        " 2>&1; then
+        error "  Failed to clone repo from session"
+        return 1
+    fi
+
+    # Move to final destination
+    if mv "$temp_clone/repo" "$dest_path"; then
+        local size
+        size=$(du -sh "$dest_path" 2>/dev/null | cut -f1)
+        success "  Extracted: $dest_path ($size)"
+        return 0
+    else
+        error "  Failed to move repo to destination"
+        return 1
+    fi
+}
+
 # Check if a volume contains multi-project config
 has_multi_project_config() {
     local volume="$1"
@@ -231,11 +316,35 @@ diff_multi_project_session() {
     info "Multi-project session: $name"
     echo ""
 
-    while IFS='|' read -r project_name source_path _branch project_track; do
+    while IFS='|' read -r project_name source_path _branch project_track project_source; do
         # Skip untracked projects
         if [[ "${project_track:-true}" != "true" ]]; then
             echo "Project: $project_name (untracked)"
             echo "  (not tracked for merging)"
+            echo ""
+            continue
+        fi
+
+        # Handle discovered repos (new repos created in session)
+        if [[ "$project_source" == "discovered" ]]; then
+            local commit_count
+            commit_count=$(docker run --rm \
+                -v "$volume:/session:ro" \
+                "$git_image" \
+                sh -c "
+                    git config --global --add safe.directory '*'
+                    cd /session/$project_name 2>/dev/null && git rev-list --count HEAD 2>/dev/null || echo 0
+                " 2>/dev/null) || echo "0"
+            echo "Project: $project_name (NEW - $commit_count commits)"
+            echo "  Will extract to: $source_path"
+            docker run --rm \
+                -v "$volume:/session:ro" \
+                "$git_image" \
+                sh -c "
+                    git config --global --add safe.directory '*'
+                    cd /session/$project_name
+                    git log --oneline -5 2>/dev/null | sed 's/^/  /'
+                " 2>/dev/null
             echo ""
             continue
         fi
@@ -363,13 +472,14 @@ diff_git_session() {
 merge_multi_project_session() {
     local name="$1"
     local target_dir="$2"
-    local target_branch="${3:-}"
+    local target_branch="${3:-$name}"  # Default to session name if --into not specified
     local auto_mode="${4:-false}"
     local no_run="${5:-false}"
     local volume="claude-session-${name}"
     local git_image="${IMAGE_NAME:-$DEFAULT_IMAGE}"
 
     info "Merging multi-project session: $name"
+    info "Target branch: $target_branch"
     echo ""
 
     # Extract config from volume (single docker call)
@@ -383,7 +493,7 @@ merge_multi_project_session() {
         exit 1
     }
 
-    # Parse config
+    # Parse config from session volume
     local temp_config="$CACHE_DIR/temp-config-$$.yml"
     mkdir -p "$CACHE_DIR"
     echo "$config_data" > "$temp_config"
@@ -392,17 +502,31 @@ merge_multi_project_session() {
     projects=$(parse_config_file "$temp_config")
     rm -f "$temp_config"
 
+    # Also check host config dir for discovered repos
+    local host_config="$SESSIONS_CONFIG_DIR/${name}.yml"
+    if [[ -f "$host_config" ]]; then
+        local host_projects
+        host_projects=$(parse_config_file "$host_config" 2>/dev/null) || true
+        if [[ -n "$host_projects" ]]; then
+            # Append host config projects (discovered repos)
+            projects="${projects}
+${host_projects}"
+        fi
+    fi
+
     # Collect project info into arrays (avoiding docker calls in read loop)
     local -a project_names=()
     local -a project_paths=()
     local -a project_branches=()
     local -a project_track=()
+    local -a project_source=()
 
-    while IFS='|' read -r pname ppath pbranch ptrack; do
+    while IFS='|' read -r pname ppath pbranch ptrack psource; do
         project_names+=("$pname")
         project_paths+=("$ppath")
         project_branches+=("$pbranch")
         project_track+=("${ptrack:-true}")
+        project_source+=("${psource:-}")
     done <<< "$projects"
 
     # Now get status for each project (docker calls outside the read loop)
@@ -413,11 +537,28 @@ merge_multi_project_session() {
     for i in "${!project_names[@]}"; do
         local pname="${project_names[$i]}"
         local ptrack="${project_track[$i]}"
+        local psource="${project_source[$i]}"
 
         # Skip untracked projects
         if [[ "$ptrack" != "true" ]]; then
             echo "  [-] $pname (untracked)"
             project_commits+=("0")
+            continue
+        fi
+
+        # Handle discovered repos (new repos created in session)
+        if [[ "$psource" == "discovered" ]]; then
+            local commit_count
+            commit_count=$(docker run --rm \
+                -v "$volume:/session:ro" \
+                "$git_image" \
+                sh -c "
+                    git config --global --add safe.directory '*'
+                    cd /session/$pname 2>/dev/null && git rev-list --count HEAD 2>/dev/null || echo 0
+                " 2>/dev/null) || echo "0"
+            project_commits+=("$commit_count")
+            echo "  [+] $pname (NEW - $commit_count commits, will extract)"
+            has_changes=true
             continue
         fi
 
@@ -468,6 +609,7 @@ merge_multi_project_session() {
         local ppath="${project_paths[$i]}"
         local pbranch="${project_branches[$i]}"
         local ptrack="${project_track[$i]}"
+        local psource="${project_source[$i]}"
         local commit_count="${project_commits[$i]}"
 
         # Skip untracked projects
@@ -481,6 +623,16 @@ merge_multi_project_session() {
 
         echo ""
 
+        # Handle discovered repos (new repos created in session) - extract instead of merge
+        if [[ "$psource" == "discovered" ]]; then
+            if extract_repo_from_session "$volume" "$pname" "$ppath" "$git_image"; then
+                success_count=$((success_count + 1))
+            else
+                fail_count=$((fail_count + 1))
+            fi
+            continue
+        fi
+
         # Verify source path is a git repo
         if ! is_git_repo "$ppath"; then
             error "Source is not a git repo: $ppath"
@@ -488,34 +640,63 @@ merge_multi_project_session() {
             continue
         fi
 
-        # Determine merge target path (handle worktrees)
-        local merge_branch="${target_branch:-$pbranch}"
-        local merge_path="$ppath"
+        # Get merge point (base commit the session was cloned from)
+        local merge_point
+        merge_point=$(get_merge_point "$volume" "$pname")
 
-        if [[ -n "$merge_branch" ]]; then
-            local worktree_path
-            worktree_path=$(find_worktree_for_branch "$ppath" "$merge_branch")
-
-            if [[ -n "$worktree_path" && -d "$worktree_path" ]]; then
-                info "Using worktree: $worktree_path (branch: $merge_branch)"
-                merge_path="$worktree_path"
-            else
-                cd "$ppath"
-                if git show-ref --verify --quiet "refs/heads/$merge_branch"; then
-                    info "Switching to branch: $merge_branch"
-                    git checkout "$merge_branch"
-                else
-                    info "Creating branch: $merge_branch"
-                    git checkout -b "$merge_branch"
-                fi
-            fi
+        if [[ -z "$merge_point" ]]; then
+            warn "No merge point found for $pname - skipping (cannot determine base commit)"
+            fail_count=$((fail_count + 1))
+            continue
         fi
 
-        # Perform the merge
-        if merge_volume_to_target "$volume" "$pname" "$merge_path"; then
+        # Use worktree approach: create temp worktree at merge point, apply patches, remove worktree
+        local merge_branch="$target_branch"
+        local worktree_dir="$CACHE_DIR/worktree-$$-${pname//\//-}"
+        local existing_worktree=""
+        local created_worktree=false
+
+        # Check if branch already has a worktree
+        existing_worktree=$(cd "$ppath" && git worktree list --porcelain 2>/dev/null | grep -A2 "^worktree " | grep -B1 "branch refs/heads/$merge_branch" | head -1 | sed 's/worktree //' || true)
+
+        if [[ -n "$existing_worktree" && -d "$existing_worktree" ]]; then
+            # Use existing worktree for this branch
+            info "Using existing worktree: $existing_worktree (branch: $merge_branch)"
+            worktree_dir="$existing_worktree"
+        elif (cd "$ppath" && git show-ref --verify --quiet "refs/heads/$merge_branch" 2>/dev/null); then
+            # Branch exists but no worktree - create temp worktree for it
+            info "Creating temp worktree for existing branch: $merge_branch"
+            mkdir -p "$worktree_dir"
+            if ! (cd "$ppath" && git worktree add "$worktree_dir" "$merge_branch" 2>/dev/null); then
+                error "Failed to create worktree for $pname"
+                fail_count=$((fail_count + 1))
+                continue
+            fi
+            created_worktree=true
+        else
+            # Branch doesn't exist - create new branch from merge point in temp worktree
+            info "Creating branch '$merge_branch' from merge point in temp worktree"
+            mkdir -p "$worktree_dir"
+            if ! (cd "$ppath" && git worktree add "$worktree_dir" -b "$merge_branch" "$merge_point" 2>/dev/null); then
+                error "Failed to create worktree for $pname"
+                rm -rf "$worktree_dir"
+                fail_count=$((fail_count + 1))
+                continue
+            fi
+            created_worktree=true
+        fi
+
+        # Perform the merge in the worktree
+        if merge_volume_to_target "$volume" "$pname" "$worktree_dir"; then
             success_count=$((success_count + 1))
         else
             fail_count=$((fail_count + 1))
+        fi
+
+        # Clean up temp worktree (branch remains)
+        if $created_worktree; then
+            info "Cleaning up temp worktree for $pname"
+            (cd "$ppath" && git worktree remove "$worktree_dir" 2>/dev/null) || rm -rf "$worktree_dir"
         fi
     done
 
@@ -541,7 +722,7 @@ merge_multi_project_session() {
 merge_git_session() {
     local name="$1"
     local target_dir="$2"
-    local target_branch="${3:-}"
+    local target_branch="${3:-$name}"  # Default to session name if --into not specified
     local auto_mode="${4:-false}"
     local no_run="${5:-false}"
     local volume="claude-session-${name}"
@@ -566,26 +747,52 @@ merge_git_session() {
 
     local git_image="${IMAGE_NAME:-$DEFAULT_IMAGE}"
 
-    # Handle target branch
-    if [[ -n "$target_branch" ]]; then
-        info "Merging session '$name' into branch: $target_branch"
-        cd "$target_dir"
-        # Create branch if it doesn't exist, or switch to it
-        if git show-ref --verify --quiet "refs/heads/$target_branch"; then
-            info "Switching to existing branch: $target_branch"
-            git checkout "$target_branch"
-        else
-            info "Creating new branch: $target_branch"
-            git checkout -b "$target_branch"
-        fi
-    else
-        info "Merging session '$name' into: $target_dir (current branch)"
-    fi
-    echo ""
-
     # Get repo name for merge point tracking
     local repo_name
     repo_name=$(basename "$target_dir")
+
+    # Get merge point (base commit the session was cloned from)
+    local merge_point
+    merge_point=$(get_merge_point "$volume" "$repo_name")
+
+    info "Merging session '$name' into branch: $target_branch"
+
+    # Use worktree approach to avoid conflicts with uncommitted changes
+    local worktree_dir="$CACHE_DIR/worktree-$$-${repo_name}"
+    local merge_path=""
+    local created_worktree=false
+
+    # Check if branch already has a worktree
+    local existing_worktree=""
+    existing_worktree=$(cd "$target_dir" && git worktree list --porcelain 2>/dev/null | grep -A2 "^worktree " | grep -B1 "branch refs/heads/$target_branch" | head -1 | sed 's/worktree //' || true)
+
+    if [[ -n "$existing_worktree" && -d "$existing_worktree" ]]; then
+        info "Using existing worktree: $existing_worktree"
+        merge_path="$existing_worktree"
+    elif (cd "$target_dir" && git show-ref --verify --quiet "refs/heads/$target_branch" 2>/dev/null); then
+        # Branch exists but no worktree - create temp worktree
+        info "Creating temp worktree for existing branch: $target_branch"
+        mkdir -p "$worktree_dir"
+        if ! (cd "$target_dir" && git worktree add "$worktree_dir" "$target_branch" 2>/dev/null); then
+            error "Failed to create worktree"
+            exit 1
+        fi
+        merge_path="$worktree_dir"
+        created_worktree=true
+    else
+        # Branch doesn't exist - create from merge point (or HEAD if no merge point)
+        local base_commit="${merge_point:-HEAD}"
+        info "Creating branch '$target_branch' from ${merge_point:+merge point}${merge_point:-HEAD} in temp worktree"
+        mkdir -p "$worktree_dir"
+        if ! (cd "$target_dir" && git worktree add "$worktree_dir" -b "$target_branch" "$base_commit" 2>/dev/null); then
+            error "Failed to create worktree"
+            rm -rf "$worktree_dir"
+            exit 1
+        fi
+        merge_path="$worktree_dir"
+        created_worktree=true
+    fi
+    echo ""
 
     # Show what will be merged (only commits since last merge point)
     echo "=== Commits to merge ==="
@@ -659,27 +866,41 @@ merge_git_session() {
                     fi
                 '
 
-            # Apply patches to target
-            cd "$target_dir"
+            # Apply patches to worktree
+            cd "$merge_path"
             local patch_count
             patch_count=$(ls -1 "$patch_dir"/*.patch 2>/dev/null | wc -l | tr -d ' ')
 
             if [[ "$patch_count" -eq 0 ]]; then
                 warn "No patches to apply"
+                # Clean up worktree if we created it
+                if $created_worktree; then
+                    (cd "$target_dir" && git worktree remove "$worktree_dir" 2>/dev/null) || rm -rf "$worktree_dir"
+                fi
                 return 0
             fi
 
+            local apply_failed=false
             for patch in "$patch_dir"/*.patch; do
                 if git am "$patch"; then
                     success "Applied: $(basename "$patch")"
                 else
                     error "Failed to apply: $(basename "$patch")"
-                    echo "Run 'git am --abort' to cancel or 'git am --skip' to skip this patch"
-                    return 1
+                    echo "Resolve conflicts in: $merge_path"
+                    echo "Then run: git am --continue"
+                    echo "Or skip: git am --skip"
+                    apply_failed=true
+                    break
                 fi
             done
 
-            success "Successfully merged $patch_count commit(s)"
+            if $apply_failed; then
+                # Don't clean up worktree on failure - user needs to resolve
+                warn "Worktree preserved for conflict resolution: $merge_path"
+                return 1
+            fi
+
+            success "Successfully merged $patch_count commit(s) to branch '$target_branch'"
 
             # Update merge point so next merge only gets new commits
             local host_uid
@@ -690,6 +911,12 @@ merge_git_session() {
                 "$git_image" \
                 sh -c "cd /session && git rev-parse HEAD > '/session/.last-merge-${repo_name}'" 2>/dev/null \
                 || warn "Could not update merge point"
+
+            # Clean up worktree if we created it
+            if $created_worktree; then
+                info "Cleaning up temp worktree"
+                (cd "$target_dir" && git worktree remove "$worktree_dir" 2>/dev/null) || rm -rf "$worktree_dir"
+            fi
 
             # In auto mode, don't prompt to delete (preserve session for --continue)
             if [[ "$auto_mode" != "true" ]]; then
@@ -703,13 +930,25 @@ merge_git_session() {
             ;;
         n|N)
             echo "Cancelled"
+            # Clean up worktree if we created it
+            if $created_worktree; then
+                (cd "$target_dir" && git worktree remove "$worktree_dir" 2>/dev/null) || rm -rf "$worktree_dir"
+            fi
             ;;
         select|s|S)
             warn "Interactive selection not yet implemented"
             echo "Use 'git cherry-pick' manually after inspecting the session"
+            # Clean up worktree if we created it
+            if $created_worktree; then
+                (cd "$target_dir" && git worktree remove "$worktree_dir" 2>/dev/null) || rm -rf "$worktree_dir"
+            fi
             ;;
         *)
             echo "Invalid choice"
+            # Clean up worktree if we created it
+            if $created_worktree; then
+                (cd "$target_dir" && git worktree remove "$worktree_dir" 2>/dev/null) || rm -rf "$worktree_dir"
+            fi
             ;;
     esac
 }
