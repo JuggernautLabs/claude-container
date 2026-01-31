@@ -177,7 +177,7 @@ while [[ $# -gt 0 ]]; do
             SHELL_ONLY=true
             shift
             ;;
-        --enable-docker|--docker)
+        --docker)
             ENABLE_DOCKER=true
             shift
             ;;
@@ -218,7 +218,7 @@ Options:
   --config, -C <path>      Explicit path to .claude-projects.yml config file
   --verify, -v             Verify container setup works (run checks and exit)
   --shell, --bash          Start bash shell instead of claude
-  --enable-docker          Mount Docker socket for host Docker access (security risk on Linux)
+  --docker                 Mount Docker socket for host Docker access (security risk on Linux)
   --version, -V            Show version
   --help, -h               Show this help
 
@@ -516,7 +516,7 @@ if $ENABLE_DOCKER; then
             info "Docker socket mounted ($DOCKER_SOCKET)"
         fi
     else
-        warn "Could not find Docker socket - --enable-docker will not work"
+        warn "Could not find Docker socket - --docker will not work"
         if command -v docker &>/dev/null; then
             warn "Active context: $(docker context show 2>/dev/null || echo 'unknown')"
         fi
