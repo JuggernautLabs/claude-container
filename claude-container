@@ -587,6 +587,12 @@ EOF
         cp /root/.gitconfig /home/developer/.gitconfig 2>/dev/null || true
     fi
 
+    # Check for docker CLI if socket is mounted
+    if [[ -S /var/run/docker.sock ]] && ! command -v docker &>/dev/null; then
+        echo "WARNING: docker socket mounted but docker CLI not found"
+        echo "         Use --dockerfile to build an image with docker"
+    fi
+
     if [[ "${RUN_AS_USER:-}" == "1" ]] || [[ "${RUN_AS_ROOTISH:-}" == "1" ]]; then
         groupadd -g $DEV_GID developer 2>/dev/null || true
         useradd -u $HOST_UID -g $DEV_GID -m -s /bin/bash developer 2>/dev/null || true
