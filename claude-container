@@ -49,6 +49,7 @@ RUN_AS_ROOTISH=true  # Default: run as user with passwordless sudo for package i
 AUTO_SYNC_BRANCH=""
 NO_RUN=false
 SHELL_ONLY=false
+BASH_EXEC=""  # Command to execute instead of claude
 ENABLE_DOCKER=false  # Mount Docker socket for host Docker access
 CONFIG_ONLY=false    # Just generate config, don't create session
 SCAN_SESSION=false   # Scan session for new repos
@@ -176,6 +177,10 @@ while [[ $# -gt 0 ]]; do
             SHELL_ONLY=true
             shift
             ;;
+        --bash-exec)
+            BASH_EXEC="$2"
+            shift 2
+            ;;
         --docker)
             ENABLE_DOCKER=true
             shift
@@ -216,6 +221,7 @@ Options:
   --config, -C <path>      Explicit path to .claude-projects.yml config file
   --verify, -v             Verify container setup works (run checks and exit)
   --shell, --bash          Start bash shell instead of claude
+  --bash-exec <cmd>        Execute a bash command and exit
   --docker                 Mount Docker socket for host Docker access (security risk on Linux)
   --version, -V            Show version
   --help, -h               Show this help
@@ -492,24 +498,33 @@ if $SHELL_ONLY; then
     DOCKER_ARGS+=("-e" "SHELL_ONLY=1")
 fi
 
+if [[ -n "$BASH_EXEC" ]]; then
+    DOCKER_ARGS+=("-e" "BASH_EXEC=$BASH_EXEC")
+fi
+
 if $ENABLE_DOCKER; then
-    # Dynamically detect Docker socket from current context
-    DOCKER_SOCKET=""
+    # Verify Docker is accessible from host
+    DOCKER_AVAILABLE=false
     if command -v docker &>/dev/null; then
         DOCKER_HOST_URL=$(docker context inspect --format '{{.Endpoints.docker.Host}}' 2>/dev/null)
         if [[ -n "$DOCKER_HOST_URL" ]] && [[ "$DOCKER_HOST_URL" == unix://* ]]; then
-            DOCKER_SOCKET="${DOCKER_HOST_URL#unix://}"
+            HOST_SOCKET="${DOCKER_HOST_URL#unix://}"
+            if [[ -S "$HOST_SOCKET" ]]; then
+                DOCKER_AVAILABLE=true
+            fi
         fi
     fi
 
-    if [[ -n "$DOCKER_SOCKET" ]] && [[ -S "$DOCKER_SOCKET" ]]; then
-        DOCKER_ARGS+=("-v" "$DOCKER_SOCKET:/var/run/docker.sock")
+    if $DOCKER_AVAILABLE; then
+        # Mount the VM-side socket (works for Colima/Docker Desktop on macOS)
+        # Containers run inside the VM, so they access /var/run/docker.sock directly
+        DOCKER_ARGS+=("-v" "/var/run/docker.sock:/var/run/docker.sock")
         DOCKER_ARGS+=("-e" "DOCKER_HOST=unix:///var/run/docker.sock")
         if [[ "$PLATFORM" == "linux" ]]; then
             warn "Docker socket mounted - this grants full Docker access"
             warn "On Linux, this is equivalent to root access on the host"
         else
-            info "Docker socket mounted ($DOCKER_SOCKET)"
+            info "Docker socket mounted (VM: /var/run/docker.sock)"
         fi
     else
         warn "Could not find Docker socket - --docker will not work"
@@ -537,8 +552,8 @@ fi
 if $USE_GIT_SESSION; then
     echo "  Git Session: $SESSION_NAME"
 fi
-if $ENABLE_DOCKER && [[ -n "${DOCKER_SOCKET:-}" ]]; then
-    echo "  Docker: enabled ($DOCKER_SOCKET)"
+if $ENABLE_DOCKER && ${DOCKER_AVAILABLE:-false}; then
+    echo "  Docker: enabled (/var/run/docker.sock)"
 fi
 echo ""
 
@@ -594,6 +609,11 @@ EOF
         useradd -u $HOST_UID -g $DEV_GID -m -s /bin/bash developer 2>/dev/null || true
         chown -R developer:developer /home/developer
         chown developer:developer /workspace 2>/dev/null || true
+
+        # Make docker socket accessible if mounted
+        if [[ -S /var/run/docker.sock ]]; then
+            chmod 666 /var/run/docker.sock 2>/dev/null || true
+        fi
 
         if [[ "${RUN_AS_ROOTISH:-}" == "1" ]]; then
             if ! command -v sudo &>/dev/null; then
@@ -652,6 +672,16 @@ WRAPPER
             exec gosu developer bash -c "cd $WORK_DIR && exec bash"
         else
             exec bash -c "cd $WORK_DIR && exec bash"
+        fi
+    fi
+
+    # Bash exec mode - run command and exit
+    if [[ -n "${BASH_EXEC:-}" ]]; then
+        cd $WORK_DIR
+        if [[ "${RUN_AS_USER:-}" == "1" ]] || [[ "${RUN_AS_ROOTISH:-}" == "1" ]]; then
+            exec gosu developer bash -c "$BASH_EXEC"
+        else
+            exec bash -c "$BASH_EXEC"
         fi
     fi
 
