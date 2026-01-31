@@ -51,7 +51,6 @@ NO_RUN=false
 SHELL_ONLY=false
 ENABLE_DOCKER=false  # Mount Docker socket for host Docker access
 CONFIG_ONLY=false    # Just generate config, don't create session
-USE_DOCKERFILE=false # Use local Dockerfile instead of default image
 SCAN_SESSION=false   # Scan session for new repos
 DISCOVER_REPOS_DIRS=()  # Array for multiple --discover-repos
 SESSIONS_CONFIG_DIR="$CONFIG_DIR/sessions"  # Where session configs are stored
@@ -182,8 +181,7 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         --dockerfile|-f)
-            USE_DOCKERFILE=true
-            # Check if next arg exists and isn't a flag
+            # Specify explicit Dockerfile path (auto-detected if not provided)
             if [[ -n "${2:-}" ]] && [[ ! "$2" =~ ^- ]]; then
                 DOCKERFILE="$2"
                 shift 2
@@ -203,7 +201,7 @@ Spawn into a Docker container with Claude Code ready.
 
 Options:
   --build, -b              Force rebuild the image
-  --dockerfile, -f [path]  Use local Dockerfile (searches ./Dockerfile if no path given)
+  --dockerfile, -f [path]  Specify Dockerfile path (auto-detected from ./Dockerfile if present)
   --dir, -d <path>         Directory to use with overlay (DEPRECATED)
   --session, -s <name>     Session name (required, identifies the session)
   --no-git-session         Disable git-based isolation (mount cwd directly)
@@ -298,27 +296,25 @@ if $USE_GIT_SESSION || [[ -n "$CONFIG_FILE" ]]; then
 fi
 
 # Determine image to use
-if $USE_DOCKERFILE; then
-    # --dockerfile was specified, find or use the Dockerfile
-    if [[ -z "$DOCKERFILE" ]]; then
-        # Search for Dockerfile in standard locations
-        for candidate in "./Dockerfile" "./.devcontainer/Dockerfile" "./docker/Dockerfile"; do
-            if [[ -f "$candidate" ]]; then
-                DOCKERFILE="$candidate"
-                break
-            fi
-        done
-        if [[ -z "$DOCKERFILE" ]]; then
-            error "No Dockerfile found in ./Dockerfile, ./.devcontainer/Dockerfile, or ./docker/Dockerfile"
-            exit 1
+# Auto-detect local Dockerfile unless explicit path given via --dockerfile
+if [[ -z "$DOCKERFILE" ]]; then
+    # Search for Dockerfile in standard locations
+    for candidate in "./Dockerfile" "./.devcontainer/Dockerfile" "./docker/Dockerfile"; do
+        if [[ -f "$candidate" ]]; then
+            DOCKERFILE="$candidate"
+            break
         fi
-    elif [[ ! -f "$DOCKERFILE" ]]; then
+    done
+fi
+
+if [[ -n "$DOCKERFILE" ]]; then
+    if [[ ! -f "$DOCKERFILE" ]]; then
         error "Dockerfile not found: $DOCKERFILE"
         exit 1
     fi
     USE_DEFAULT_IMAGE=false
 else
-    # Default: use the default image
+    # No local Dockerfile found, use default image
     USE_DEFAULT_IMAGE=true
     IMAGE_NAME="$DEFAULT_IMAGE"
 fi
