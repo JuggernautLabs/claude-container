@@ -234,6 +234,8 @@ Session Management:
   --restart-session <name> Restart a session (fixes permissions, continues conversation)
   --diff-session <name>    Show changes made in a git session vs original repo
   --merge-session <name>   Merge session commits back to repo
+                           Options: --into <branch> (target branch, default: session name)
+                                    --from <branch> (create new branch from this, default: HEAD)
   --add-repo <session> <path> [name]  Add a repo to an existing session
 
 Environment:

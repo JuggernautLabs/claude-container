@@ -10,23 +10,6 @@
 #   - CACHE_DIR: directory for caching temporary files
 #   - IMAGE_NAME or DEFAULT_IMAGE: Docker image for git operations
 
-# Get the merge point (base commit) for a project in a session
-# Arguments:
-#   $1 - volume name
-#   $2 - project name
-# Returns:
-#   Commit hash (stdout) or empty if not found
-get_merge_point() {
-    local volume="$1"
-    local project_name="$2"
-    local git_image="${IMAGE_NAME:-$DEFAULT_IMAGE}"
-
-    docker run --rm \
-        -v "$volume:/session:ro" \
-        "$git_image" \
-        sh -c "cat /session/.last-merge-${project_name} 2>/dev/null || echo ''" 2>/dev/null
-}
-
 # Direct merge from volume repo to target path
 # This mounts both in a single container and performs the merge directly
 merge_volume_to_target() {
@@ -42,7 +25,7 @@ merge_volume_to_target() {
     patch_file=$(mktemp)
     trap "rm -f '$patch_file'" RETURN
 
-    # Generate patches from container
+    # Generate patches from container (all commits from initial to HEAD)
     local result
     result=$(docker run --rm \
         -v "$volume:/session:ro" \
@@ -51,35 +34,18 @@ merge_volume_to_target() {
         -c '
             git config --global --add safe.directory "*"
             cd /session/'"$project_name"'
-            SESSION_HEAD=$(git rev-parse HEAD)
 
-            # Check for merge point marker
-            MERGE_POINT=""
-            if [ -f /session/.last-merge-'"$project_name"' ]; then
-                MERGE_POINT=$(cat /session/.last-merge-'"$project_name"')
-            fi
+            # Get initial commit and count patches
+            INITIAL=$(git rev-list --max-parents=0 HEAD 2>/dev/null | tail -1)
+            PATCH_COUNT=$(git rev-list --count "$INITIAL..HEAD" 2>/dev/null || echo 0)
 
-            # Check if anything to merge
-            if [ -n "$MERGE_POINT" ] && [ "$SESSION_HEAD" = "$MERGE_POINT" ]; then
+            if [ "$PATCH_COUNT" = "0" ]; then
                 echo "NO_CHANGES:0"
                 exit 0
             fi
 
-            # Generate patches
-            if [ -n "$MERGE_POINT" ]; then
-                PATCH_COUNT=$(git rev-list --count "$MERGE_POINT..HEAD" 2>/dev/null || echo 0)
-                if [ "$PATCH_COUNT" = "0" ]; then
-                    echo "NO_CHANGES:0"
-                    exit 0
-                fi
-                echo "PATCHES:$PATCH_COUNT"
-                git format-patch --stdout "$MERGE_POINT..HEAD"
-            else
-                INITIAL=$(git rev-list --max-parents=0 HEAD 2>/dev/null | tail -1)
-                PATCH_COUNT=$(git rev-list --count "$INITIAL..HEAD" 2>/dev/null || echo 0)
-                echo "PATCHES:$PATCH_COUNT"
-                git format-patch --stdout "$INITIAL..HEAD"
-            fi
+            echo "PATCHES:$PATCH_COUNT"
+            git format-patch --stdout "$INITIAL..HEAD"
         ' 2>/dev/null > "$patch_file")
 
     # Check first line for status
@@ -103,17 +69,6 @@ merge_volume_to_target() {
     cd "$target_path"
     if tail -n +2 "$patch_file" | git am --3way; then
         success "  Merged $patch_count commit(s)"
-
-        # Record the merge point
-        docker run --rm \
-            -v "$volume:/session" \
-            --entrypoint sh \
-            "$git_image" \
-            -c '
-                git config --global --add safe.directory "*"
-                cd /session/'"$project_name"'
-                git rev-parse HEAD > /session/.last-merge-'"$project_name"'
-            ' 2>/dev/null
         return 0
     else
         error "  Merge failed - resolve conflicts and run: git am --continue"
@@ -135,21 +90,9 @@ get_session_status() {
             git config --global --add safe.directory "*"
             cd /session/'"$project_name"' 2>/dev/null || exit 1
 
-            SESSION_HEAD=$(git rev-parse HEAD)
-
-            # Check for merge point marker
-            if [ -f /session/.last-merge-'"$project_name"' ]; then
-                MERGE_POINT=$(cat /session/.last-merge-'"$project_name"')
-                if [ "$SESSION_HEAD" = "$MERGE_POINT" ]; then
-                    echo "0"
-                else
-                    git rev-list --count "$MERGE_POINT..HEAD" 2>/dev/null || echo "0"
-                fi
-            else
-                # No merge point - count from initial commit
-                INITIAL=$(git rev-list --max-parents=0 HEAD 2>/dev/null | tail -1)
-                git rev-list --count "$INITIAL..HEAD" 2>/dev/null || echo "0"
-            fi
+            # Count all commits from initial commit to HEAD
+            INITIAL=$(git rev-list --max-parents=0 HEAD 2>/dev/null | tail -1)
+            git rev-list --count "$INITIAL..HEAD" 2>/dev/null || echo "0"
         ' 2>/dev/null || echo "0"
 }
 
@@ -349,63 +292,33 @@ diff_multi_project_session() {
             continue
         fi
 
-        # First check for a recorded merge point (from previous merges)
-        local merge_point
-        merge_point=$(get_last_merge_point "$volume" "$project_name")
-
-        # Count NEW commits since last merge point
+        # Count all commits from initial commit
         local commit_count
-        local commit_range=""
-        if [[ -n "$merge_point" ]]; then
-            # Use recorded merge point - this is the most reliable
-            commit_count=$(docker run --rm \
-                -v "$volume:/session:ro" \
-                -e "MERGE_POINT=$merge_point" \
-                "$git_image" \
-                sh -c '
-                    git config --global --add safe.directory "*"
-                    cd /session/'"$project_name"' 2>/dev/null || exit 0
-                    container_head=$(git rev-parse HEAD 2>/dev/null)
-                    if [ "$container_head" = "$MERGE_POINT" ]; then
-                        echo 0
-                    else
-                        git rev-list --count "$MERGE_POINT..HEAD" 2>/dev/null || echo 0
-                    fi
-                ' < /dev/null) || echo "0"
-            commit_range="$merge_point..HEAD"
-        else
-            # No merge point - fall back to counting all commits (first merge)
-            commit_count=$(docker run --rm \
-                -v "$volume:/session:ro" \
-                "$git_image" \
-                sh -c '
-                    git config --global --add safe.directory "*"
-                    cd /session/'"$project_name"' 2>/dev/null || exit 0
-                    initial=$(git rev-list --max-parents=0 HEAD 2>/dev/null | tail -1)
-                    git rev-list --count "$initial..HEAD" 2>/dev/null || echo 0
-                ' < /dev/null) || echo "0"
-        fi
+        commit_count=$(docker run --rm \
+            -v "$volume:/session:ro" \
+            "$git_image" \
+            sh -c '
+                git config --global --add safe.directory "*"
+                cd /session/'"$project_name"' 2>/dev/null || exit 0
+                initial=$(git rev-list --max-parents=0 HEAD 2>/dev/null | tail -1)
+                git rev-list --count "$initial..HEAD" 2>/dev/null || echo 0
+            ' < /dev/null) || echo "0"
 
-        echo "Project: $project_name ($commit_count new commits)"
+        echo "Project: $project_name ($commit_count commits)"
 
         if [[ "$commit_count" -gt 0 ]]; then
-            # Show commit messages since merge point (or all if no merge point)
+            # Show all commit messages
             docker run --rm \
                 -v "$volume:/session:ro" \
-                -e "MERGE_POINT=$merge_point" \
                 "$git_image" \
                 sh -c '
                     git config --global --add safe.directory "*"
                     cd /session/'"$project_name"'
-                    if [ -n "$MERGE_POINT" ]; then
-                        git log --oneline "$MERGE_POINT..HEAD" 2>/dev/null | sed "s/^/  /"
-                    else
-                        initial=$(git rev-list --max-parents=0 HEAD 2>/dev/null | tail -1)
-                        git log --oneline "$initial..HEAD" 2>/dev/null | sed "s/^/  /"
-                    fi
+                    initial=$(git rev-list --max-parents=0 HEAD 2>/dev/null | tail -1)
+                    git log --oneline "$initial..HEAD" 2>/dev/null | sed "s/^/  /"
                 ' < /dev/null
         else
-            echo "  (no new commits)"
+            echo "  (no commits)"
         fi
         echo ""
     done <<< "$projects"
@@ -475,11 +388,15 @@ merge_multi_project_session() {
     local target_branch="${3:-$name}"  # Default to session name if --into not specified
     local auto_mode="${4:-false}"
     local no_run="${5:-false}"
+    local from_branch="${6:-HEAD}"     # Default to HEAD if --from not specified
     local volume="claude-session-${name}"
     local git_image="${IMAGE_NAME:-$DEFAULT_IMAGE}"
 
     info "Merging multi-project session: $name"
     info "Target branch: $target_branch"
+    if [[ "$from_branch" != "HEAD" ]]; then
+        info "Creating from: $from_branch"
+    fi
     echo ""
 
     # Extract config from volume (single docker call)
@@ -640,17 +557,7 @@ ${host_projects}"
             continue
         fi
 
-        # Get merge point (base commit the session was cloned from)
-        local merge_point
-        merge_point=$(get_merge_point "$volume" "$pname")
-
-        if [[ -z "$merge_point" ]]; then
-            warn "No merge point found for $pname - skipping (cannot determine base commit)"
-            fail_count=$((fail_count + 1))
-            continue
-        fi
-
-        # Use worktree approach: create temp worktree at merge point, apply patches, remove worktree
+        # Create worktree for target branch
         local merge_branch="$target_branch"
         local worktree_dir="$CACHE_DIR/worktree-$$-${pname//\//-}"
         local existing_worktree=""
@@ -674,11 +581,11 @@ ${host_projects}"
             fi
             created_worktree=true
         else
-            # Branch doesn't exist - create new branch from merge point in temp worktree
-            info "Creating branch '$merge_branch' from merge point in temp worktree"
+            # Branch doesn't exist - create new branch from from_branch in temp worktree
+            info "Creating branch '$merge_branch' from $from_branch in temp worktree"
             mkdir -p "$worktree_dir"
-            if ! (cd "$ppath" && git worktree add "$worktree_dir" -b "$merge_branch" "$merge_point" 2>/dev/null); then
-                error "Failed to create worktree for $pname"
+            if ! (cd "$ppath" && git worktree add "$worktree_dir" -b "$merge_branch" "$from_branch" 2>/dev/null); then
+                error "Failed to create worktree for $pname (branch '$from_branch' may not exist)"
                 rm -rf "$worktree_dir"
                 fail_count=$((fail_count + 1))
                 continue
@@ -725,6 +632,7 @@ merge_git_session() {
     local target_branch="${3:-$name}"  # Default to session name if --into not specified
     local auto_mode="${4:-false}"
     local no_run="${5:-false}"
+    local from_branch="${6:-HEAD}"     # Default to HEAD if --from not specified
     local volume="claude-session-${name}"
 
     # Check if session exists
@@ -735,7 +643,7 @@ merge_git_session() {
 
     # Check if this is a multi-project session
     if has_multi_project_config "$volume"; then
-        merge_multi_project_session "$name" "$target_dir" "$target_branch" "$auto_mode" "$no_run"
+        merge_multi_project_session "$name" "$target_dir" "$target_branch" "$auto_mode" "$no_run" "$from_branch"
         return $?
     fi
 
@@ -747,15 +655,14 @@ merge_git_session() {
 
     local git_image="${IMAGE_NAME:-$DEFAULT_IMAGE}"
 
-    # Get repo name for merge point tracking
+    # Get repo name for tracking
     local repo_name
     repo_name=$(basename "$target_dir")
 
-    # Get merge point (base commit the session was cloned from)
-    local merge_point
-    merge_point=$(get_merge_point "$volume" "$repo_name")
-
     info "Merging session '$name' into branch: $target_branch"
+    if [[ "$from_branch" != "HEAD" ]]; then
+        info "Creating from: $from_branch"
+    fi
 
     # Use worktree approach to avoid conflicts with uncommitted changes
     local worktree_dir="$CACHE_DIR/worktree-$$-${repo_name}"
@@ -780,12 +687,11 @@ merge_git_session() {
         merge_path="$worktree_dir"
         created_worktree=true
     else
-        # Branch doesn't exist - create from merge point (or HEAD if no merge point)
-        local base_commit="${merge_point:-HEAD}"
-        info "Creating branch '$target_branch' from ${merge_point:+merge point}${merge_point:-HEAD} in temp worktree"
+        # Branch doesn't exist - create from from_branch in temp worktree
+        info "Creating branch '$target_branch' from $from_branch in temp worktree"
         mkdir -p "$worktree_dir"
-        if ! (cd "$target_dir" && git worktree add "$worktree_dir" -b "$target_branch" "$base_commit" 2>/dev/null); then
-            error "Failed to create worktree"
+        if ! (cd "$target_dir" && git worktree add "$worktree_dir" -b "$target_branch" "$from_branch" 2>/dev/null); then
+            error "Failed to create worktree (branch '$from_branch' may not exist)"
             rm -rf "$worktree_dir"
             exit 1
         fi
@@ -794,7 +700,7 @@ merge_git_session() {
     fi
     echo ""
 
-    # Show what will be merged (only commits since last merge point)
+    # Show what will be merged (all commits from initial commit)
     echo "=== Commits to merge ==="
     docker run --rm \
         -v "$volume:/session:ro" \
@@ -802,21 +708,12 @@ merge_git_session() {
         sh -c '
             git config --global --add safe.directory "*"
             cd /session
-            MERGE_POINT=""
-            if [ -f /session/.last-merge-'"$repo_name"' ]; then
-                MERGE_POINT=$(cat /session/.last-merge-'"$repo_name"')
-            fi
-            if [ -n "$MERGE_POINT" ]; then
-                COUNT=$(git rev-list --count "$MERGE_POINT"..HEAD 2>/dev/null || echo "0")
-                if [ "$COUNT" = "0" ]; then
-                    echo "(no new commits since last merge)"
-                else
-                    git log --oneline "$MERGE_POINT"..HEAD 2>/dev/null
-                fi
+            INITIAL=$(git rev-list --max-parents=0 HEAD 2>/dev/null | tail -1)
+            COUNT=$(git rev-list --count "$INITIAL..HEAD" 2>/dev/null || echo "0")
+            if [ "$COUNT" = "0" ]; then
+                echo "(no commits)"
             else
-                # No merge point - show recent commits as warning
-                echo "(WARNING: no merge point found, showing last 10 commits)"
-                git log --oneline -10
+                git log --oneline "$INITIAL..HEAD" 2>/dev/null
             fi
         '
 
@@ -845,7 +742,7 @@ merge_git_session() {
             mkdir -p "$patch_dir"
             trap "rm -rf $patch_dir" RETURN
 
-            # Export patches from session (only commits since merge point)
+            # Export patches from session (all commits from initial commit)
             docker run --rm \
                 -v "$volume:/session:ro" \
                 -v "$patch_dir:/patches" \
@@ -853,17 +750,8 @@ merge_git_session() {
                 sh -c '
                     git config --global --add safe.directory "*"
                     cd /session
-                    MERGE_POINT=""
-                    if [ -f /session/.last-merge-'"$repo_name"' ]; then
-                        MERGE_POINT=$(cat /session/.last-merge-'"$repo_name"')
-                    fi
-                    if [ -n "$MERGE_POINT" ]; then
-                        git format-patch -o /patches "$MERGE_POINT"..HEAD 2>/dev/null
-                    else
-                        # Fallback: export all commits (will likely fail on merge)
-                        initial=$(git rev-list --max-parents=0 HEAD 2>/dev/null | tail -1)
-                        git format-patch -o /patches "$initial"..HEAD 2>/dev/null
-                    fi
+                    initial=$(git rev-list --max-parents=0 HEAD 2>/dev/null | tail -1)
+                    git format-patch -o /patches "$initial"..HEAD 2>/dev/null
                 '
 
             # Apply patches to worktree
@@ -901,16 +789,6 @@ merge_git_session() {
             fi
 
             success "Successfully merged $patch_count commit(s) to branch '$target_branch'"
-
-            # Update merge point so next merge only gets new commits
-            local host_uid
-            host_uid=$(get_host_uid)
-            docker run --rm \
-                --user "$host_uid:$host_uid" \
-                -v "$volume:/session" \
-                "$git_image" \
-                sh -c "cd /session && git rev-parse HEAD > '/session/.last-merge-${repo_name}'" 2>/dev/null \
-                || warn "Could not update merge point"
 
             # Clean up worktree if we created it
             if $created_worktree; then
