@@ -5,17 +5,27 @@
 # Requires: CONFIG_DIR and CACHE_DIR must be set before sourcing
 # Provides: inject_token_securely(), ensure_token()
 
-# Token variables (set by ensure_token)
-CLAUDE_CODE_OAUTH_TOKEN=""
+# Token variables (set by ensure_token or command-line args)
+# Don't clear CLAUDE_CODE_OAUTH_TOKEN if it's already set (e.g., via --token flag)
 TOKEN_FILE=""
 TOKEN_TMPFILE=""
 
 # Secure token injection - mounts token as file instead of env var
 # This prevents token from being visible in `docker inspect`
 # Requires: CACHE_DIR, DOCKER_ARGS array
+# Note: When running in a nested container, uses env var instead of file mount
 inject_token_securely() {
     local token="$1"
 
+    # Detect if we're running inside a container (nested)
+    # If so, we can't mount files from our filesystem into the new container
+    if is_running_in_container; then
+        info "Nested container detected - passing token via environment"
+        DOCKER_ARGS+=("-e" "CLAUDE_CODE_OAUTH_TOKEN_NESTED=$token")
+        return 0
+    fi
+
+    # Normal operation: mount token as file
     # Use a path that Docker VM can definitely access
     # On macOS with Colima/Docker Desktop, $TMPDIR (/var/folders/...) may not be shared
     # Use $HOME/.cache which is always shared
@@ -33,8 +43,10 @@ inject_token_securely() {
         exit 1
     fi
 
-    # Add cleanup trap
-    trap "rm -f '$TOKEN_TMPFILE'" EXIT
+    # Don't auto-cleanup - let the token file persist until manual cleanup or system reboot
+    # The file is in /cache which is meant for temporary files anyway
+    # Cleanup on error signals only
+    trap "rm -f '$TOKEN_TMPFILE'" INT TERM
 
     # Mount as file (must be absolute path for Docker)
     DOCKER_ARGS+=("-v" "$TOKEN_TMPFILE:/run/secrets/claude_token:ro")
@@ -48,9 +60,15 @@ ensure_token() {
 
     # Already have token from environment?
     if [[ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]]; then
-        info "Using token from environment"
-        export CLAUDE_CODE_OAUTH_TOKEN
-        return 0
+        # Validate token format (should start with sk-ant-oat)
+        if [[ "$CLAUDE_CODE_OAUTH_TOKEN" =~ ^sk-ant-oat ]]; then
+            info "Using token from environment (${CLAUDE_CODE_OAUTH_TOKEN:0:20}...)"
+            export CLAUDE_CODE_OAUTH_TOKEN
+            return 0
+        else
+            warn "Invalid token format in environment, trying other sources..."
+            CLAUDE_CODE_OAUTH_TOKEN=""
+        fi
     fi
 
     # Try config file first
@@ -78,9 +96,21 @@ ensure_token() {
         fi
     fi
 
-    # Final check - still no token? Start auth flow
+    # Final check - still no token? Start auth flow (unless --no-interactive)
     warn "No token found in keychain or config"
     echo ""
+
+    # Check if interactive mode is disabled
+    if [[ "${NO_INTERACTIVE:-false}" == "true" ]]; then
+        error "No token found and --no-interactive specified"
+        echo ""
+        echo "Please provide a token via one of:"
+        echo "  1. --token <token> flag"
+        echo "  2. CLAUDE_CODE_OAUTH_TOKEN environment variable"
+        echo "  3. ~/.config/claude-container/token file"
+        echo "  4. macOS Keychain (claude.ai)"
+        exit 1
+    fi
 
     if ! command -v claude &>/dev/null; then
         error "claude CLI not found"

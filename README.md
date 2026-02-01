@@ -147,6 +147,7 @@ When creating a session, the branch to clone is determined by:
 | `--build, -b` | Force rebuild the container image |
 | `--sessions` | List all sessions with disk usage |
 | `--delete-session <name>` | Delete a session and all its volumes |
+| `--import-session <path> <name>` | Import a claude-code session into a container |
 
 ## Working Inside the Container
 
@@ -995,6 +996,34 @@ Commands:
 ```
 
 This deletes all volumes associated with the session (workspace, state, and caches).
+
+### Import a Session
+
+Import an existing claude-code session (conversation history, plans, etc.) into a container:
+
+```bash
+# Import from your local claude session
+./claude-container --import-session ~/.claude my-session
+
+# Import from a backup
+./claude-container --import-session /path/to/backup my-session
+
+# Force overwrite existing session
+./claude-container --import-session ~/.claude my-session --force
+```
+
+After importing, use the session with `--continue` to load the conversation history:
+
+```bash
+./claude-container -s my-session --continue
+```
+
+The imported session data includes conversation history, plans, todos, and environment state. This is useful for:
+- Migrating conversations from standalone claude-code to containers
+- Sharing session context between environments
+- Restoring from backups
+
+See [SESSION_IMPORT.md](SESSION_IMPORT.md) for detailed documentation and testing instructions.
 
 ### Clean Up All Sessions
 

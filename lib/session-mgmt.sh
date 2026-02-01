@@ -542,6 +542,118 @@ session_merge() {
     merge_git_session "$session_name" "$source_dir" "$target_branch" "$auto_mode" "$no_run"
 }
 
+# Import a claude-code session into a container session
+# Usage: session_import <source_path> <session_name> [--force]
+# Arguments:
+#   $1 - source path (e.g., ~/.claude or path to session backup)
+#   $2 - target session name
+#   --force - overwrite existing session state
+session_import() {
+    local source_path="$1"
+    local session_name="$2"
+    local force=false
+
+    # Parse flags
+    shift 2
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --force|-f) force=true; shift ;;
+            *) shift ;;
+        esac
+    done
+
+    if [[ -z "$source_path" ]] || [[ -z "$session_name" ]]; then
+        error "Usage: session_import <source_path> <session_name> [--force]"
+        echo ""
+        echo "Examples:"
+        echo "  # Import from local claude session"
+        echo "  ./claude-container --import-session ~/.claude my-session"
+        echo ""
+        echo "  # Import from backup directory"
+        echo "  ./claude-container --import-session /backups/claude-session-2024 my-session"
+        return 1
+    fi
+
+    # Expand ~ to home directory
+    source_path="${source_path/#\~/$HOME}"
+
+    # Verify source exists and is a directory
+    if [[ ! -d "$source_path" ]]; then
+        error "Source path does not exist or is not a directory: $source_path"
+        return 1
+    fi
+
+    # Check for key session files to validate it's a claude session
+    local has_session_files=false
+    if [[ -f "$source_path/history.jsonl" ]] || [[ -d "$source_path/session-env" ]]; then
+        has_session_files=true
+    fi
+
+    if ! $has_session_files; then
+        warn "Source path does not contain expected claude session files (history.jsonl, session-env/)"
+        read -p "Continue anyway? [y/N] " confirm
+        if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
+            echo "Cancelled"
+            return 0
+        fi
+    fi
+
+    local state_volume="claude-state-${session_name}"
+
+    # Check if volume already exists
+    if docker volume inspect "$state_volume" &>/dev/null; then
+        if ! $force; then
+            error "Session state already exists: $session_name"
+            echo "Use --force to overwrite existing session state"
+            return 1
+        else
+            warn "Overwriting existing session state: $session_name"
+        fi
+    else
+        info "Creating new session state volume: $state_volume"
+        docker volume create "$state_volume" >/dev/null
+    fi
+
+    # Get absolute path for source
+    local abs_source_path
+    abs_source_path=$(cd "$source_path" && pwd)
+
+    info "Importing session data from: $abs_source_path"
+    info "Target: $state_volume"
+
+    # Copy session data into volume using tar to handle nested containers
+    local git_image="${IMAGE_NAME:-$DEFAULT_IMAGE}"
+    local copy_output
+
+    # Create tar archive of source and pipe into container
+    if ! copy_output=$(cd "$abs_source_path" && tar -cf - . 2>/dev/null | docker run --rm -i \
+        -v "$state_volume:/target" \
+        "$git_image" \
+        sh -c '
+            cd /target
+            tar -xf - 2>&1
+            echo "---"
+            echo "Files imported:"
+            ls -lah /target/ 2>&1
+            echo "---"
+            echo "Disk usage:"
+            du -sh /target/ 2>&1
+        ' 2>&1); then
+        error "Failed to import session:"
+        echo "$copy_output" >&2
+        return 1
+    fi
+
+    echo "$copy_output"
+    echo ""
+    success "Session imported successfully!"
+    echo ""
+    echo "To use this session, run:"
+    echo "  ./claude-container -s $session_name --continue"
+    echo ""
+    echo "The --continue flag will load the conversation history from the imported session."
+}
+
 # Scan session for new repos not in config
 # Usage: session_scan <session_name>
 # Discovers git repos in session volume, compares against config,
