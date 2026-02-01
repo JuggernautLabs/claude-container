@@ -75,6 +75,24 @@ Ask if they want to use a custom Dockerfile instead of the default image.
 - If yes, add `--dockerfile` flag (searches `./Dockerfile`, `./.devcontainer/Dockerfile`, `./docker/Dockerfile`)
 - Or `-f <path>` for a specific Dockerfile
 
+### Optional: Import Existing Session
+Ask if they want to import an existing claude-code session (conversation history, plans, todos).
+- If yes, ask for the source path (e.g., `~/.claude` or path to a backup)
+- Use `--import-session <path> <session-name>` before creating the session
+- The imported session will include conversation history that can be accessed with `--continue`
+
+### Optional: Non-Interactive Mode
+Ask if they're running in an automated/CI environment where OAuth browser login isn't possible.
+- If yes, add `--no-interactive` flag
+- This will fail fast if no token is found instead of trying to open a browser
+- Requires token from `--token`, environment variable, or config file
+
+### Optional: Passthrough Arguments
+Ask if they want to run claude in a specific mode (like print mode for one-off questions).
+- If yes, use `-- <claude-args>` syntax
+- Example: `-- --print "Question?"` or `-- -p "Question?"`
+- Useful for headless/scripted usage
+
 ## Step 2: Build the Command
 
 Construct the claude-container command based on their answers:
@@ -84,6 +102,8 @@ claude-container -s <session-name> [options]
 ```
 
 Options to include based on answers:
+- `--import-session <path> <session-name>` - if importing an existing session (run this FIRST, before other setup)
+- `--token <token>` or `-t <token>` - if providing OAuth token directly
 - `--discover-repos <path>` - if they chose repo discovery
 - `--config <path>` - if they specified a config file
 - `--as-rootish` - rootish mode (default, can omit)
@@ -92,6 +112,8 @@ Options to include based on answers:
 - `--auto-sync <branch>` - if they specified an auto-sync branch
 - `--enable-docker` - if they need Docker access inside container
 - `--dockerfile [path]` - if they want to use a custom Dockerfile
+- `--no-interactive` - if running in automated/CI environment
+- `-- <claude-args>` - if passing arguments directly to claude (e.g., `-- --print "Question?"`)
 
 ## Step 3: Validate with --no-run
 
@@ -310,6 +332,77 @@ Then `--merge-session` will include the new repos.
 claude-container --add-repo my-feature /path/to/repo [workspace-name]
 ```
 
+## Importing Sessions
+
+### Import Local Claude Session
+Import an existing claude-code session (conversation history, plans, todos):
+
+```bash
+claude-container --import-session ~/.claude my-imported-session
+```
+
+### Import from Backup
+```bash
+claude-container --import-session /path/to/backup my-restored-session
+```
+
+### Force Overwrite Existing Session
+```bash
+claude-container --import-session ~/.claude my-session --force
+```
+
+### Use Imported Session
+After importing, use `--continue` to load the conversation history:
+
+```bash
+claude-container -s my-imported-session --continue
+```
+
+**What gets imported:**
+- Conversation history (history.jsonl)
+- Plans and todos
+- Session environment state
+- File history
+
+**Use cases:**
+- Migrate conversations from standalone claude-code to containers
+- Share session context between environments
+- Restore from backups
+- Continue work on a different machine
+
+## Headless/Automated Usage
+
+### Run in Print Mode (one-off question)
+```bash
+claude-container -s my-feature --token "$TOKEN" --no-interactive -- --print "What files were modified?"
+```
+
+### Non-Interactive with Token
+```bash
+claude-container -s my-feature --token "$CLAUDE_CODE_OAUTH_TOKEN" --no-interactive --continue
+```
+
+### Passthrough Arguments
+Pass arguments directly to claude using `--` separator:
+
+```bash
+# Print mode
+claude-container -s my-feature -- --print "Summarize the changes"
+claude-container -s my-feature -- -p "Summarize the changes"
+
+# Continue and print
+claude-container -s my-feature --continue -- -p "What's the status?"
+
+# Multiple args
+claude-container -s my-feature -- --print --continue "Question?"
+```
+
+**Notes:**
+- `--token` / `-t` allows passing OAuth token directly
+- `--no-interactive` fails fast if no token found (no browser OAuth)
+- Automatically detects nested containers and adjusts token passing
+- Works from inside other containers (nested support)
+
 ## Session Management
 
 ### List All Sessions
@@ -399,9 +492,15 @@ Socket auto-detection:
 
 | Task | Command |
 |------|---------|
+| Import session | `claude-container --import-session ~/.claude NAME` |
+| Import with force | `claude-container --import-session /path NAME --force` |
 | Create session | `claude-container -s NAME --no-run` |
 | Start session | `claude-container -s NAME` |
 | Resume + continue | `claude-container -s NAME --continue` |
+| With token flag | `claude-container -s NAME --token "$TOKEN"` |
+| Non-interactive | `claude-container -s NAME --no-interactive` |
+| Print mode | `claude-container -s NAME -- --print "Question?"` |
+| Continue + print | `claude-container -s NAME --continue -- -p "Status?"` |
 | Switch image | `claude-container -s NAME --dockerfile --continue` |
 | Discover repos | `claude-container -s NAME --discover-repos DIR` |
 | Generate config only | `claude-container -s NAME --discover-repos DIR --config-only` |
