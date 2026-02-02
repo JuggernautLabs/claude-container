@@ -872,20 +872,23 @@ merge_git_session() {
     fi
     echo ""
 
-    # Show what will be merged (all commits from initial commit)
-    echo "=== Commits to merge ==="
-    show_session_commits "$volume" "" "count"
-
-    echo ""
-
     if $no_run; then
+        # Show what would be merged for dry run
+        echo "=== Commits in session ==="
+        show_session_commits "$volume" "" "count"
+        echo ""
         info "Dry run - not applying changes"
         return 0
     fi
 
     if [[ "$auto_mode" == "true" ]]; then
+        # In auto mode, skip upfront commit list - merge logic will report what happens
         choice="y"
     else
+        # Show commits for interactive mode
+        echo "=== Commits in session ==="
+        show_session_commits "$volume" "" "count"
+        echo ""
         read -p "Merge all commits? [y/n/select] " choice
     fi
 
