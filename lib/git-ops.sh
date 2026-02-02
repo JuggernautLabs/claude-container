@@ -837,16 +837,16 @@ merge_multi_project_session() {
         project_source+=("${psource:-}")
     done <<< "$projects"
 
-    # Get status for each project in PARALLEL
+    # Get status for each project in PARALLEL with live output
     local -a project_status=()
     local -a project_counts=()
     local has_changes=false
     local status_dir
     status_dir=$(mktemp -d)
 
-    info "Checking ${#project_names[@]} projects..."
+    echo "Projects:"
 
-    # Launch parallel status checks
+    # Launch parallel status checks with immediate output
     local -a pids=()
     for i in "${!project_names[@]}"; do
         local pname="${project_names[$i]}"
@@ -857,6 +857,7 @@ merge_multi_project_session() {
         # Skip untracked projects (no async needed)
         if [[ "$ptrack" != "true" ]]; then
             echo "SKIP:0" > "$status_dir/$i"
+            echo "  [-] $pname (untracked)"
             continue
         fi
 
@@ -865,15 +866,26 @@ merge_multi_project_session() {
             (
                 commit_count=$(get_total_commits "$volume" "$pname" 2>/dev/null)
                 echo "NEW:$commit_count" > "$status_dir/$i"
+                echo "  [+] $pname (NEW - $commit_count commits)"
             ) &
             pids+=($!)
             continue
         fi
 
-        # Get sync status async
+        # Get sync status async with immediate output
         (
             result=$(get_sync_status "$volume" "$pname" "$ppath" 2>/dev/null)
             echo "$result" > "$status_dir/$i"
+            status="${result%%:*}"
+            count="${result##*:}"
+            [[ "$count" == "$status" ]] && count="0"
+            case "$status" in
+                SYNCED)       echo "  [✓] $pname" ;;
+                SESSION_AHEAD) echo "  [↓] $pname ($count from session)" ;;
+                LOCAL_AHEAD)  echo "  [↑] $pname (local +$count)" ;;
+                DIVERGED)     echo "  [!] $pname (diverged)" ;;
+                *)            echo "  [?] $pname" ;;
+            esac
         ) &
         pids+=($!)
     done
@@ -883,12 +895,8 @@ merge_multi_project_session() {
         wait "$pid" 2>/dev/null
     done
 
-    # Collect results and display
-    echo "Projects to sync:"
+    # Collect results into arrays (for later use)
     for i in "${!project_names[@]}"; do
-        local pname="${project_names[$i]}"
-        local ptrack="${project_track[$i]}"
-
         local sync_result
         sync_result=$(cat "$status_dir/$i" 2>/dev/null || echo "UNKNOWN:0")
         local status="${sync_result%%:*}"
@@ -898,34 +906,9 @@ merge_multi_project_session() {
         project_status+=("$status")
         project_counts+=("$count")
 
-        case "$status" in
-            SKIP)
-                echo "  [-] $pname (untracked)"
-                ;;
-            NEW)
-                echo "  [+] $pname (NEW - $count commits, will extract)"
-                has_changes=true
-                ;;
-            SYNCED)
-                echo "  [✓] $pname (synced)"
-                ;;
-            SESSION_AHEAD)
-                echo "  [↓] $pname ($count commits from session)"
-                has_changes=true
-                ;;
-            LOCAL_AHEAD)
-                echo "  [↑] $pname (local $count ahead)"
-                has_changes=true
-                ;;
-            DIVERGED)
-                echo "  [!] $pname (diverged)"
-                has_changes=true
-                ;;
-            *)
-                echo "  [?] $pname (unknown)"
-                project_status[$i]="UNKNOWN"
-                ;;
-        esac
+        if [[ "$status" != "SYNCED" && "$status" != "SKIP" ]]; then
+            has_changes=true
+        fi
     done
 
     rm -rf "$status_dir"
@@ -956,13 +939,31 @@ merge_multi_project_session() {
         return 0
     fi
 
-    # Sync projects in PARALLEL
+    # Sync projects in PARALLEL with live output
     local sync_dir
     sync_dir=$(mktemp -d)
     local -a sync_pids=()
     local projects_to_sync=0
 
-    # Count and launch parallel syncs
+    # Count projects needing sync
+    for i in "${!project_names[@]}"; do
+        local status="${project_status[$i]}"
+        if [[ "$status" != "SYNCED" && "$status" != "SKIP" ]]; then
+            projects_to_sync=$((projects_to_sync + 1))
+        fi
+    done
+
+    if [[ $projects_to_sync -eq 0 ]]; then
+        echo ""
+        success "All projects already synced"
+        rm -rf "$sync_dir"
+        return 0
+    fi
+
+    echo ""
+    echo "Syncing:"
+
+    # Launch parallel syncs with immediate output
     for i in "${!project_names[@]}"; do
         local pname="${project_names[$i]}"
         local ppath="${project_paths[$i]}"
@@ -974,23 +975,25 @@ merge_multi_project_session() {
             continue
         fi
 
-        projects_to_sync=$((projects_to_sync + 1))
-
-        # Launch sync in background
+        # Launch sync in background with live output
         (
             result="FAIL"
 
             # Handle discovered repos
             if [[ "$status" == "NEW" ]]; then
                 if extract_repo_from_session "$volume" "$pname" "$ppath" "$git_image" >/dev/null 2>&1; then
-                    result="OK"
+                    echo "  [✓] $pname (extracted)"
+                    echo "OK:extracted" > "$sync_dir/$i"
+                else
+                    echo "  [✗] $pname (extract failed)"
+                    echo "FAIL:extract" > "$sync_dir/$i"
                 fi
-                echo "$result" > "$sync_dir/$i"
                 exit 0
             fi
 
             # Verify source path is a git repo
             if ! is_git_repo "$ppath"; then
+                echo "  [✗] $pname (not a git repo)"
                 echo "FAIL:not a git repo" > "$sync_dir/$i"
                 exit 1
             fi
@@ -998,11 +1001,12 @@ merge_multi_project_session() {
             # Create worktree for target branch
             worktree_dir=$(create_or_find_worktree "$ppath" "$target_branch" "$from_branch" "$pname" 2>/dev/null)
             if [[ $? -ne 0 ]]; then
+                echo "  [✗] $pname (worktree failed)"
                 echo "FAIL:worktree" > "$sync_dir/$i"
                 exit 1
             fi
 
-            # Perform bidirectional sync (suppress detailed output for parallel)
+            # Perform bidirectional sync
             if sync_local_to_session "$volume" "$pname" "$worktree_dir" >/dev/null 2>&1 && \
                sync_session_to_local "$volume" "$pname" "$worktree_dir" >/dev/null 2>&1; then
                 # Verify
@@ -1013,11 +1017,14 @@ merge_multi_project_session() {
                         cd /session/$pname && git rev-parse HEAD
                     " 2>/dev/null)
                 if [[ "$local_head" == "$session_head" ]]; then
+                    echo "  [✓] $pname (${local_head:0:7})"
                     echo "OK:$local_head" > "$sync_dir/$i"
                 else
+                    echo "  [✗] $pname (verify failed)"
                     echo "FAIL:verify" > "$sync_dir/$i"
                 fi
             else
+                echo "  [✗] $pname (sync failed)"
                 echo "FAIL:sync" > "$sync_dir/$i"
             fi
 
@@ -1027,26 +1034,17 @@ merge_multi_project_session() {
         sync_pids+=($!)
     done
 
-    if [[ $projects_to_sync -gt 0 ]]; then
-        info "Syncing $projects_to_sync project(s) in parallel..."
+    # Wait for all syncs to complete
+    for pid in "${sync_pids[@]}"; do
+        wait "$pid" 2>/dev/null
+    done
 
-        # Wait for all syncs to complete
-        for pid in "${sync_pids[@]}"; do
-            wait "$pid" 2>/dev/null
-        done
-    fi
-
-    # Collect results
+    # Count results
     local success_count=0
     local fail_count=0
 
-    echo ""
-    echo "Results:"
     for i in "${!project_names[@]}"; do
-        local pname="${project_names[$i]}"
         local status="${project_status[$i]}"
-
-        # Skip projects that weren't synced
         if [[ "$status" == "SYNCED" ]] || [[ "$status" == "SKIP" ]]; then
             continue
         fi
@@ -1054,13 +1052,10 @@ merge_multi_project_session() {
         local result
         result=$(cat "$sync_dir/$i" 2>/dev/null || echo "FAIL:unknown")
         local res_status="${result%%:*}"
-        local res_detail="${result##*:}"
 
         if [[ "$res_status" == "OK" ]]; then
-            echo "  [✓] $pname (${res_detail:0:7})"
             success_count=$((success_count + 1))
         else
-            echo "  [✗] $pname ($res_detail)"
             fail_count=$((fail_count + 1))
         fi
     done
