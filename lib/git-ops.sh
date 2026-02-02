@@ -724,10 +724,48 @@ merge_session_project() {
     local git_image="$4"  # unused but kept for API compatibility
 
     # First sync local to session (so session has any local changes)
-    sync_local_to_session "$volume" "$project_name" "$target_path"
+    sync_local_to_session "$volume" "$project_name" "$target_path" || return 1
 
     # Then sync session to local (pull any session changes)
-    sync_session_to_local "$volume" "$project_name" "$target_path"
+    sync_session_to_local "$volume" "$project_name" "$target_path" || return 1
+
+    # Verify sync succeeded
+    verify_sync "$volume" "$project_name" "$target_path"
+}
+
+# Verify that local and session are in sync
+# Arguments:
+#   $1 - volume name
+#   $2 - project name
+#   $3 - local repo path
+# Returns:
+#   0 if synced, 1 if not
+verify_sync() {
+    local volume="$1"
+    local project_name="$2"
+    local local_path="$3"
+
+    local session_path="/session"
+    [[ -n "$project_name" ]] && session_path="/session/$project_name"
+
+    # Get both HEADs and compare
+    local local_head session_head
+    local_head=$(git -C "$local_path" rev-parse HEAD 2>/dev/null)
+    session_head=$(docker run --rm -v "$volume:/session:ro" \
+        ${IMAGE_NAME:-$DEFAULT_IMAGE} sh -c "
+            git config --global --add safe.directory '*'
+            cd $session_path && git rev-parse HEAD
+        " 2>/dev/null)
+
+    if [[ "$local_head" == "$session_head" ]]; then
+        success "Verified: local and session at $local_head"
+        return 0
+    else
+        error "Sync verification failed!"
+        echo "  Local:   $local_head"
+        echo "  Session: $session_head"
+        return 1
+    fi
 }
 
 # Show diff between git session and original repo
