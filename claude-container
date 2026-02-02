@@ -28,6 +28,7 @@ chmod 700 "$CONFIG_DIR"
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null || echo "$0")")" && pwd)"
 source "$SCRIPT_DIR/lib/utils.sh"
 source "$SCRIPT_DIR/lib/platform.sh"
+source "$SCRIPT_DIR/lib/container-detect.sh"
 source "$SCRIPT_DIR/lib/config.sh"
 source "$SCRIPT_DIR/lib/auth.sh"
 source "$SCRIPT_DIR/lib/docker.sh"
@@ -55,6 +56,8 @@ CONFIG_ONLY=false    # Just generate config, don't create session
 SCAN_SESSION=false   # Scan session for new repos
 DISCOVER_REPOS_DIRS=()  # Array for multiple --discover-repos
 SESSIONS_CONFIG_DIR="$CONFIG_DIR/sessions"  # Where session configs are stored
+CLAUDE_ARGS=()  # Arguments to pass through to claude
+NO_INTERACTIVE=false  # Fail fast if no token found (don't start OAuth flow)
 
 # Docker args accumulator
 declare -a DOCKER_ARGS
@@ -97,6 +100,12 @@ case "${1:-}" in
     --merge-session)
         shift
         session_merge "$@"
+        exit 0
+        ;;
+
+    --import-session)
+        shift
+        session_import "$@"
         exit 0
         ;;
 
@@ -144,6 +153,11 @@ while [[ $# -gt 0 ]]; do
             CONTINUE_SESSION=true
             shift
             ;;
+        --token|-t)
+            CLAUDE_CODE_OAUTH_TOKEN="$2"
+            export CLAUDE_CODE_OAUTH_TOKEN
+            shift 2
+            ;;
         --as-user)
             RUN_AS_USER=true
             shift
@@ -185,6 +199,10 @@ while [[ $# -gt 0 ]]; do
             ENABLE_DOCKER=true
             shift
             ;;
+        --no-interactive)
+            NO_INTERACTIVE=true
+            shift
+            ;;
         --dockerfile|-f)
             # Specify explicit Dockerfile path (auto-detected if not provided)
             if [[ -n "${2:-}" ]] && [[ ! "$2" =~ ^- ]]; then
@@ -198,9 +216,15 @@ while [[ $# -gt 0 ]]; do
             echo "claude-container $VERSION"
             exit 0
             ;;
+        --)
+            # All remaining args go to claude
+            shift
+            CLAUDE_ARGS=("$@")
+            break
+            ;;
         --help|-h)
             cat <<EOF
-Usage: claude-container [options]
+Usage: claude-container [options] [-- <claude-args>]
 
 Spawn into a Docker container with Claude Code ready.
 
@@ -213,6 +237,7 @@ Options:
   --config-only            Generate config file only, don't create session (outputs path)
   --scan                   Scan session for new repos, prompt for destinations, update config
   --continue, -c           Continue the most recent Claude conversation
+  --token, -t <token>      Provide OAuth token directly (alternative to env var)
   --as-user                Run as non-root developer user (no sudo)
   --as-rootish             Run as developer with passwordless sudo for installs (default)
   --as-root, --no-rootish  Run as actual root user
@@ -223,8 +248,12 @@ Options:
   --shell, --bash          Start bash shell instead of claude
   --bash-exec <cmd>        Execute a bash command and exit
   --docker                 Mount Docker socket for host Docker access (security risk on Linux)
+  --no-interactive         Exit with error if no token found (don't start OAuth flow)
   --version, -V            Show version
   --help, -h               Show this help
+
+Arguments:
+  -- <claude-args>         Pass remaining arguments to claude (e.g., -p, --print)
 
 Session Management:
   --cleanup                List and optionally delete all claude-related volumes
@@ -248,6 +277,8 @@ Examples:
   claude-container -s myproj --continue                # Resume session AND continue conversation
   claude-container -s myproj --scan                    # Find new repos created in session
   claude-container --no-git-session                    # Direct mount cwd (no isolation)
+  claude-container -s myproj -- -p "What is this?"     # Run claude in print mode
+  claude-container -s myproj --continue -- -p "Status" # Continue session and print
 EOF
             exit 0
             ;;
@@ -504,6 +535,13 @@ if [[ -n "$BASH_EXEC" ]]; then
     DOCKER_ARGS+=("-e" "BASH_EXEC=$BASH_EXEC")
 fi
 
+# Pass through claude args if provided
+if [[ ${#CLAUDE_ARGS[@]} -gt 0 ]]; then
+    # Serialize the array as a base64-encoded string to preserve spaces and special chars
+    CLAUDE_PASSTHROUGH_ARGS=$(printf '%s\n' "${CLAUDE_ARGS[@]}" | base64 -w 0 2>/dev/null || printf '%s\n' "${CLAUDE_ARGS[@]}" | base64)
+    DOCKER_ARGS+=("-e" "CLAUDE_PASSTHROUGH_ARGS=$CLAUDE_PASSTHROUGH_ARGS")
+fi
+
 if $ENABLE_DOCKER; then
     # Verify Docker is accessible from host
     DOCKER_AVAILABLE=false
@@ -563,8 +601,17 @@ echo ""
 docker run "${DOCKER_ARGS[@]}" "$IMAGE_NAME" /bin/bash -c '
     set -e
 
-    # Read token from securely mounted file
-    export CLAUDE_CODE_OAUTH_TOKEN=$(cat /run/secrets/claude_token)
+    # Read token from securely mounted file OR from nested env var
+    if [[ -n "${CLAUDE_CODE_OAUTH_TOKEN_NESTED:-}" ]]; then
+        # Nested container mode - token passed via env var
+        export CLAUDE_CODE_OAUTH_TOKEN="$CLAUDE_CODE_OAUTH_TOKEN_NESTED"
+    elif [[ -f /run/secrets/claude_token ]]; then
+        # Normal mode - token mounted as file
+        export CLAUDE_CODE_OAUTH_TOKEN=$(cat /run/secrets/claude_token)
+    else
+        echo "ERROR: No token found (neither file nor env var)" >&2
+        exit 1
+    fi
 
     HOST_UID=${HOST_UID:-1000}
     DEV_GID=61000
@@ -645,11 +692,17 @@ WRAPPER
 
         echo ""
         echo "=== Token Check ==="
-        if [[ -f /run/secrets/claude_token ]]; then
-            echo "  Token file: OK"
+        if [[ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]]; then
+            if [[ -f /run/secrets/claude_token ]]; then
+                echo "  Token source: file"
+            elif [[ -n "${CLAUDE_CODE_OAUTH_TOKEN_NESTED:-}" ]]; then
+                echo "  Token source: nested env var"
+            else
+                echo "  Token source: environment"
+            fi
             echo "  Token: ${CLAUDE_CODE_OAUTH_TOKEN:0:20}..."
         else
-            echo "  Token file missing"
+            echo "  Token missing"
             exit 1
         fi
 
@@ -671,7 +724,7 @@ WRAPPER
     # Shell-only mode - just run bash in working directory
     if [[ "${SHELL_ONLY:-}" == "1" ]]; then
         if [[ "${RUN_AS_USER:-}" == "1" ]] || [[ "${RUN_AS_ROOTISH:-}" == "1" ]]; then
-            exec gosu developer bash -c "cd $WORK_DIR && exec bash"
+            exec gosu developer bash -c "export CLAUDE_CODE_OAUTH_TOKEN='$CLAUDE_CODE_OAUTH_TOKEN' && cd $WORK_DIR && exec bash"
         else
             exec bash -c "cd $WORK_DIR && exec bash"
         fi
@@ -687,22 +740,41 @@ WRAPPER
         fi
     fi
 
-    # Run claude
+    # Build claude command arguments
+    CLAUDE_CMD_ARGS=""
+
+    # Add permission flag if running as user
     if [[ "${RUN_AS_USER:-}" == "1" ]] || [[ "${RUN_AS_ROOTISH:-}" == "1" ]]; then
-        CLAUDE_ARGS="--dangerously-skip-permissions"
-    else
-        CLAUDE_ARGS=""
+        CLAUDE_CMD_ARGS="--dangerously-skip-permissions"
     fi
 
+    # Add --continue if requested
     if [[ "${CONTINUE_SESSION:-}" == "1" ]]; then
-        CLAUDE_ARGS="--continue $CLAUDE_ARGS"
+        CLAUDE_CMD_ARGS="--continue $CLAUDE_CMD_ARGS"
+    fi
+
+    # Add passthrough args if provided
+    if [[ -n "${CLAUDE_PASSTHROUGH_ARGS:-}" ]]; then
+        # Decode the base64-encoded args
+        PASSTHROUGH_DECODED=$(echo "$CLAUDE_PASSTHROUGH_ARGS" | base64 -d 2>/dev/null || echo "$CLAUDE_PASSTHROUGH_ARGS" | base64 -D 2>/dev/null)
+        # Append each arg (properly quoted for arguments with spaces)
+        while IFS= read -r arg; do
+            if [[ -n "$arg" ]]; then
+                # Quote the argument if it contains spaces
+                if [[ "$arg" =~ \  ]]; then
+                    CLAUDE_CMD_ARGS="$CLAUDE_CMD_ARGS \"$arg\""
+                else
+                    CLAUDE_CMD_ARGS="$CLAUDE_CMD_ARGS $arg"
+                fi
+            fi
+        done <<< "$PASSTHROUGH_DECODED"
     fi
 
     cd $WORK_DIR
     if [[ "${RUN_AS_USER:-}" == "1" ]] || [[ "${RUN_AS_ROOTISH:-}" == "1" ]]; then
-        exec gosu developer claude $CLAUDE_ARGS
+        exec gosu developer bash -c "claude $CLAUDE_CMD_ARGS"
     else
-        HOME=/home/developer exec claude $CLAUDE_ARGS
+        exec bash -c "HOME=/home/developer claude $CLAUDE_CMD_ARGS"
     fi
 '
 
