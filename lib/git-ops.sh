@@ -479,9 +479,10 @@ export_session_patches() {
             fi
         done
 
-        # Case 3: Target tree doesn't match any session commit - diverged
+        # Case 3: Target tree doesn't match any session commit
+        # Return session HEAD tree so caller can check if local is ahead
         if [ -z \"\$MERGE_BASE\" ]; then
-            echo 'DIVERGED'
+            echo \"NO_MATCH:\$SESSION_HEAD_TREE\"
             exit 0
         fi
 
@@ -506,7 +507,9 @@ export_session_patches() {
         return 2
     fi
 
-    if [[ "$first_line" == "DIVERGED" ]]; then
+    if [[ "$first_line" == NO_MATCH:* ]]; then
+        # Return session tree hash for caller to check if local is ahead
+        echo "${first_line#NO_MATCH:}"
         rm -f "$patch_file"
         return 3
     fi
@@ -584,10 +587,18 @@ merge_session_project() {
         success "Already caught up"
         return 0
     elif [[ $export_result -eq 3 ]]; then
-        error "Session and target branch have diverged"
-        echo "  The target branch contains changes not in the session."
-        echo "  This can happen if the branch was modified outside the session."
-        return 1
+        # patch_file contains session tree hash - check if local is ahead
+        local session_tree="$patch_file"
+        # Check if session tree exists in local history
+        if git -C "$target_path" log --format='%T' | grep -q "^${session_tree}$"; then
+            success "Already caught up (local is ahead of session)"
+            return 0
+        else
+            error "Session and target branch have diverged"
+            echo "  The target branch contains changes not in the session."
+            echo "  This can happen if the branch was modified outside the session."
+            return 1
+        fi
     elif [[ $export_result -ne 0 ]]; then
         error "  Failed to export patches"
         return 1
