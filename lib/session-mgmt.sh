@@ -14,6 +14,71 @@
 #   - session_diff: Show diff between session and source repo
 #   - session_merge: Merge session commits back to source repo
 
+# ============================================================================
+# Volume Utility Functions
+# ============================================================================
+# These functions provide reusable patterns for extracting session names
+# from volume names and performing set operations on volume/session lists.
+
+# Extract session name from a Docker volume name
+# Arguments:
+#   $1 - volume name (e.g., "claude-session-foo", "claude-state-bar")
+# Returns: session name without prefix, or empty string
+# Examples:
+#   extract_session_name "claude-session-myproject" => "myproject"
+#   extract_session_name "claude-state-test" => "test"
+#   extract_session_name "unrelated-volume" => ""
+extract_session_name() {
+    local volume="$1"
+    case "$volume" in
+        claude-session-*) echo "${volume#claude-session-}" ;;
+        claude-state-*)   echo "${volume#claude-state-}" ;;
+        claude-cargo-*)   echo "${volume#claude-cargo-}" ;;
+        claude-npm-*)     echo "${volume#claude-npm-}" ;;
+        claude-pip-*)     echo "${volume#claude-pip-}" ;;
+        session-data-*)   echo "${volume#session-data-}" ;;
+        *) echo "" ;;
+    esac
+}
+
+# Map a list of volumes to unique session names
+# Arguments:
+#   $1 - newline-separated volume names
+# Returns: unique session names, sorted
+# Examples:
+#   map_volumes_to_sessions "claude-session-foo\nclaude-state-foo\nclaude-session-bar"
+#   => "bar\nfoo"
+map_volumes_to_sessions() {
+    local volumes="$1"
+
+    while read -r vol; do
+        [[ -z "$vol" ]] && continue
+        local name=$(extract_session_name "$vol")
+        [[ -n "$name" ]] && echo "$name"
+    done <<< "$volumes" | sort -u
+}
+
+# Filter items not in exclude set
+# Arguments:
+#   $1 - items (newline-separated)
+#   $2 - exclude set (newline-separated)
+# Returns: items not in exclude set
+# Examples:
+#   filter_not_in_set "a\nb\nc" "b\nd" => "a\nc"
+filter_not_in_set() {
+    local items="$1"
+    local exclude_set="$2"
+
+    while read -r item; do
+        [[ -z "$item" ]] && continue
+        echo "$exclude_set" | grep -q "^${item}$" || echo "$item"
+    done <<< "$items"
+}
+
+# ============================================================================
+# Session Management Functions
+# ============================================================================
+
 # Clean up all claude-container resources (volumes)
 # Usage: session_cleanup
 session_cleanup() {

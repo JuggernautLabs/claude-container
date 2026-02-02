@@ -404,3 +404,174 @@ if projects:
 " 2>/dev/null
     fi
 }
+
+# ============================================================================
+# Project Iteration Utilities
+# ============================================================================
+# These functions consolidate the 7+ project parsing loops across the codebase
+# that parse the pipe-delimited format: name|path|branch|track|source
+#
+# Project format specification:
+#   name|path|branch|track|source
+#   - name:   project name (required)
+#   - path:   absolute path to project (required)
+#   - branch: git branch name (optional, may be empty)
+#   - track:  "true" or "false" for merge tracking (defaults to "true")
+#   - source: "" or "discovered" for discovery source (optional)
+# ============================================================================
+
+# Iterate over projects with callback function
+#
+# Provides a clean abstraction for processing each project in a project list.
+# The callback function receives parsed project fields as positional parameters
+# plus any additional arguments passed to for_each_project.
+#
+# Arguments:
+#   $1 - projects string (pipe-delimited: name|path|branch|track|source)
+#   $2 - callback function name
+#   $@ - additional args passed to callback
+#
+# Callback signature:
+#   callback_function proj_name proj_path proj_branch proj_track proj_source [additional_args...]
+#
+# Returns:
+#   Exit code of last callback invocation
+#
+# Example usage:
+#   # Define callback function
+#   my_callback() {
+#       local name=$1 path=$2 branch=$3 track=$4 source=$5
+#       echo "Processing: $name at $path"
+#   }
+#
+#   # Iterate over projects
+#   for_each_project "$projects" my_callback
+#
+#   # With additional arguments
+#   process_with_flag() {
+#       local name=$1 path=$2 branch=$3 track=$4 source=$5
+#       local flag=$6
+#       echo "$name: $flag"
+#   }
+#   for_each_project "$projects" process_with_flag "--verbose"
+for_each_project() {
+    local projects="$1"
+    local callback="$2"
+    shift 2
+    local callback_args=("$@")
+
+    # Handle empty project list gracefully
+    [[ -z "$projects" ]] && return 0
+
+    while IFS='|' read -r pname ppath pbranch ptrack psource; do
+        [[ -z "$pname" ]] && continue
+        "$callback" "$pname" "$ppath" "$pbranch" "$ptrack" "$psource" "${callback_args[@]}"
+    done <<< "$projects"
+}
+
+# Find a project by name in project list
+#
+# Searches through the project list and returns the full project line
+# (pipe-delimited) for the matching project name.
+#
+# Arguments:
+#   $1 - projects string (pipe-delimited: name|path|branch|track|source)
+#   $2 - target project name
+#
+# Returns:
+#   0 and outputs project line (name|path|branch|track|source) if found
+#   1 if not found
+#
+# Example usage:
+#   if project_line=$(find_project "$projects" "my-app"); then
+#       echo "Found: $project_line"
+#       # Parse the fields
+#       IFS='|' read -r name path branch track source <<< "$project_line"
+#       echo "Path: $path"
+#   else
+#       echo "Project not found"
+#   fi
+find_project() {
+    local projects="$1"
+    local target_name="$2"
+
+    # Handle empty project list gracefully
+    [[ -z "$projects" ]] && return 1
+
+    while IFS='|' read -r pname ppath pbranch ptrack psource; do
+        if [[ "$pname" == "$target_name" ]]; then
+            echo "$pname|$ppath|$pbranch|$ptrack|$psource"
+            return 0
+        fi
+    done <<< "$projects"
+
+    return 1
+}
+
+# Check if a project is tracked for merging
+#
+# Projects can be marked as untracked (track: false) to exclude them from
+# merge operations. This function checks the track flag, defaulting to true
+# if the flag is empty or unset.
+#
+# Arguments:
+#   $1 - track flag ("true", "false", or empty defaults to "true")
+#
+# Returns:
+#   0 if tracked (track is "true" or empty)
+#   1 if not tracked (track is "false")
+#
+# Example usage:
+#   if is_project_tracked "$track_flag"; then
+#       echo "Project will be merged"
+#   else
+#       echo "Project is untracked, skipping merge"
+#   fi
+#
+#   # In a loop
+#   while IFS='|' read -r name path branch track source; do
+#       is_project_tracked "$track" || continue
+#       echo "Processing tracked project: $name"
+#   done <<< "$projects"
+is_project_tracked() {
+    local track_flag="$1"
+    [[ "${track_flag:-true}" == "true" ]]
+}
+
+# Filter projects to only tracked ones
+#
+# Returns a new project list containing only projects where track != "false".
+# Preserves the original pipe-delimited format for each project.
+#
+# Arguments:
+#   $1 - projects string (pipe-delimited: name|path|branch|track|source)
+#
+# Returns:
+#   Filtered project list (stdout), one per line
+#
+# Example usage:
+#   # Get only tracked projects
+#   tracked_projects=$(filter_tracked_projects "$all_projects")
+#
+#   # Count tracked projects
+#   tracked_count=$(filter_tracked_projects "$projects" | wc -l)
+#
+#   # Chain with other operations
+#   filter_tracked_projects "$projects" | while IFS='|' read -r name path _; do
+#       echo "Tracked: $name"
+#   done
+#
+#   # Composable with for_each_project
+#   tracked=$(filter_tracked_projects "$projects")
+#   for_each_project "$tracked" process_callback
+filter_tracked_projects() {
+    local projects="$1"
+
+    # Handle empty project list gracefully
+    [[ -z "$projects" ]] && return 0
+
+    while IFS='|' read -r pname ppath pbranch ptrack psource; do
+        [[ -z "$pname" ]] && continue
+        is_project_tracked "$ptrack" && echo "$pname|$ppath|$pbranch|$ptrack|$psource"
+    done <<< "$projects"
+}
