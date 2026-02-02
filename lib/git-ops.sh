@@ -435,182 +435,287 @@ cleanup_worktree() {
     fi
 }
 
-# Export patches from session volume for a project
-# Compares session against target branch to determine what needs merging:
-#   - If target tree == session HEAD tree: already caught up
-#   - If target tree matches a session ancestor: export patches from that point
-#   - If target tree matches no session commit: diverged, error
+# ============================================================================
+# Git-Native Sync Functions (fetch/merge based, no patches)
+# ============================================================================
+
+# Sync session to local using git fetch
+# Mounts local repo into container, fetches from it, and resets session to match
 # Arguments:
 #   $1 - volume name
-#   $2 - project name (path within volume, defaults to "" for single-project)
-#   $3 - git image
-#   $4 - target tree hash (from target branch HEAD)
+#   $2 - project name (empty string for single-project)
+#   $3 - local repo path
+#   $4 - branch name (optional, defaults to current branch)
 # Returns:
-#   Prints patch file path to stdout (on success)
-#   Returns 0 on success (patches to apply), 1 on failure, 2 if caught up, 3 if diverged
-export_session_patches() {
+#   0 on success, 1 on failure
+sync_local_to_session() {
     local volume="$1"
     local project_name="$2"
-    local git_image="$3"
-    local target_tree="$4"
+    local local_path="$3"
+    local branch="${4:-}"
 
-    local patch_file
-    patch_file=$(mktemp)
+    # Get current branch if not specified
+    if [[ -z "$branch" ]]; then
+        branch=$(git -C "$local_path" rev-parse --abbrev-ref HEAD)
+    fi
 
-    # Generate patches, comparing against target tree
-    docker_run_git "$volume" "$project_name" "
-        TARGET_TREE='$target_tree'
-        SESSION_HEAD_TREE=\$(git rev-parse HEAD^{tree} 2>/dev/null)
+    local local_head
+    local_head=$(git -C "$local_path" rev-parse HEAD)
 
-        # Case 1: Already caught up
-        if [ \"\$SESSION_HEAD_TREE\" = \"\$TARGET_TREE\" ]; then
-            echo 'CAUGHT_UP'
-            exit 0
-        fi
+    info "Syncing local ($branch) → session..."
 
-        # Case 2: Find where target tree matches in session history
-        # Walk through all commits from HEAD back to initial
-        MERGE_BASE=''
-        for commit in \$(git rev-list HEAD); do
-            commit_tree=\$(git rev-parse \"\$commit^{tree}\" 2>/dev/null)
-            if [ \"\$commit_tree\" = \"\$TARGET_TREE\" ]; then
-                MERGE_BASE=\"\$commit\"
-                break
+    # Build session path
+    local session_path="/session"
+    [[ -n "$project_name" ]] && session_path="/session/$project_name"
+
+    # Mount both local and session, fetch and reset
+    docker run --rm \
+        -v "$volume:/session" \
+        -v "$local_path:/local:ro" \
+        ${IMAGE_NAME:-$DEFAULT_IMAGE} sh -c "
+            git config --global --add safe.directory '*'
+            cd $session_path
+
+            # Add local as remote (ignore if exists)
+            git remote add local /local 2>/dev/null || git remote set-url local /local
+
+            # Fetch from local
+            git fetch local $branch --quiet
+
+            # Check if we need to update
+            LOCAL_HEAD=\$(git rev-parse local/$branch 2>/dev/null)
+            SESSION_HEAD=\$(git rev-parse HEAD 2>/dev/null)
+
+            if [ \"\$LOCAL_HEAD\" = \"\$SESSION_HEAD\" ]; then
+                echo 'ALREADY_SYNCED'
+                exit 0
             fi
-        done
 
-        # Case 3: Target tree doesn't match any session commit
-        # Return session HEAD tree so caller can check if local is ahead
-        if [ -z \"\$MERGE_BASE\" ]; then
-            echo \"NO_MATCH:\$SESSION_HEAD_TREE\"
-            exit 0
-        fi
+            # Reset session to match local
+            git reset --hard local/$branch
+            echo 'SYNCED'
+        " 2>/dev/null
 
-        # Generate patches from merge base to HEAD
-        PATCH_COUNT=\$(git rev-list --count \"\$MERGE_BASE..HEAD\" 2>/dev/null || echo 0)
+    local result=$?
+    if [[ $result -eq 0 ]]; then
+        return 0
+    else
+        error "Failed to sync local to session"
+        return 1
+    fi
+}
 
-        if [ \"\$PATCH_COUNT\" = \"0\" ]; then
-            echo 'CAUGHT_UP'
-            exit 0
-        fi
+# Sync session changes to local using git fetch
+# Mounts session into local context, fetches from it, and merges/fast-forwards
+# Arguments:
+#   $1 - volume name
+#   $2 - project name (empty string for single-project)
+#   $3 - local repo path (worktree path)
+#   $4 - branch name
+# Returns:
+#   0 on success (or already synced), 1 on failure
+#   Outputs: SYNCED, ALREADY_SYNCED, CONFLICT, or error
+sync_session_to_local() {
+    local volume="$1"
+    local project_name="$2"
+    local local_path="$3"
+    local branch="${4:-}"
 
-        echo \"PATCHES:\$PATCH_COUNT\"
-        git format-patch --stdout \"\$MERGE_BASE..HEAD\"
-    " > "$patch_file"
-
-    # Check first line for status
-    local first_line
-    first_line=$(head -1 "$patch_file")
-
-    if [[ "$first_line" == "CAUGHT_UP" ]]; then
-        rm -f "$patch_file"
-        return 2
+    # Get current branch if not specified
+    if [[ -z "$branch" ]]; then
+        branch=$(git -C "$local_path" rev-parse --abbrev-ref HEAD)
     fi
 
-    if [[ "$first_line" == NO_MATCH:* ]]; then
-        # Return session tree hash for caller to check if local is ahead
-        echo "${first_line#NO_MATCH:}"
-        rm -f "$patch_file"
-        return 3
-    fi
+    # Build session path
+    local session_path="/session"
+    [[ -n "$project_name" ]] && session_path="/session/$project_name"
 
-    if [[ "$first_line" != "PATCHES:"* ]]; then
-        error "Unexpected response from container"
-        rm -f "$patch_file"
+    info "Syncing session → local ($branch)..."
+
+    # Mount both session and local, fetch from session and merge
+    local output
+    output=$(docker run --rm \
+        -v "$volume:/session:ro" \
+        -v "$local_path:/local" \
+        ${IMAGE_NAME:-$DEFAULT_IMAGE} sh -c "
+            git config --global --add safe.directory '*'
+            cd /local
+
+            # Add session as remote (ignore if exists)
+            git remote add session $session_path 2>/dev/null || git remote set-url session $session_path
+
+            # Fetch from session
+            git fetch session HEAD --quiet 2>/dev/null
+
+            # Get commit info
+            SESSION_HEAD=\$(git rev-parse FETCH_HEAD 2>/dev/null)
+            LOCAL_HEAD=\$(git rev-parse HEAD 2>/dev/null)
+            SESSION_TREE=\$(git rev-parse FETCH_HEAD^{tree} 2>/dev/null)
+            LOCAL_TREE=\$(git rev-parse HEAD^{tree} 2>/dev/null)
+
+            # Same tree = already synced
+            if [ \"\$SESSION_TREE\" = \"\$LOCAL_TREE\" ]; then
+                echo 'ALREADY_SYNCED:0'
+                exit 0
+            fi
+
+            # Check if local is ancestor of session (can fast-forward)
+            if git merge-base --is-ancestor HEAD FETCH_HEAD 2>/dev/null; then
+                COMMIT_COUNT=\$(git rev-list --count HEAD..FETCH_HEAD)
+                git merge --ff-only FETCH_HEAD --quiet 2>/dev/null
+                echo \"SYNCED:\$COMMIT_COUNT\"
+                exit 0
+            fi
+
+            # Check if session is ancestor of local (local is ahead)
+            if git merge-base --is-ancestor FETCH_HEAD HEAD 2>/dev/null; then
+                echo 'LOCAL_AHEAD:0'
+                exit 0
+            fi
+
+            # Diverged - try to merge
+            COMMIT_COUNT=\$(git rev-list --count HEAD..FETCH_HEAD)
+            if git merge FETCH_HEAD -m 'Merge session changes' --quiet 2>/dev/null; then
+                echo \"MERGED:\$COMMIT_COUNT\"
+                exit 0
+            else
+                git merge --abort 2>/dev/null
+                echo 'CONFLICT:0'
+                exit 1
+            fi
+        " 2>/dev/null)
+
+    local result=$?
+    local status="${output%%:*}"
+    local count="${output##*:}"
+
+    case "$status" in
+        ALREADY_SYNCED)
+            success "Already synced"
+            return 0
+            ;;
+        SYNCED)
+            success "Fast-forwarded $count commit(s) from session"
+            return 0
+            ;;
+        MERGED)
+            success "Merged $count commit(s) from session"
+            return 0
+            ;;
+        LOCAL_AHEAD)
+            success "Local is ahead of session (nothing to merge)"
+            return 0
+            ;;
+        CONFLICT)
+            error "Merge conflict - session and local have diverged"
+            echo "  Resolve manually or sync local to session first"
+            return 1
+            ;;
+        *)
+            error "Sync failed: $output"
+            return 1
+            ;;
+    esac
+}
+
+# Bidirectional sync: ensure local and session are in sync
+# First syncs local→session, then session→local
+# Arguments:
+#   $1 - volume name
+#   $2 - project name (empty string for single-project)
+#   $3 - local repo path
+#   $4 - branch name (optional)
+# Returns:
+#   0 on success, 1 on failure
+bidirectional_sync() {
+    local volume="$1"
+    local project_name="$2"
+    local local_path="$3"
+    local branch="${4:-}"
+
+    # First: push local to session (so session has latest local changes)
+    if ! sync_local_to_session "$volume" "$project_name" "$local_path" "$branch"; then
         return 1
     fi
 
-    echo "$patch_file"
+    # Then: pull session to local (in case session had changes local didn't)
+    if ! sync_session_to_local "$volume" "$project_name" "$local_path" "$branch"; then
+        return 1
+    fi
+
     return 0
 }
 
-# Apply patches to a worktree using git am
+# Compare session and local, return sync status
 # Arguments:
-#   $1 - patch file path
-#   $2 - worktree directory (where to apply patches)
+#   $1 - volume name
+#   $2 - project name
+#   $3 - local repo path
 # Returns:
-#   0 on success, 1 on failure
-apply_patches() {
-    local patch_file="$1"
-    local worktree_dir="$2"
+#   Outputs one of: SYNCED, SESSION_AHEAD:<count>, LOCAL_AHEAD:<count>, DIVERGED
+#   Exit 0 on success, 1 on error
+get_sync_status() {
+    local volume="$1"
+    local project_name="$2"
+    local local_path="$3"
 
-    # Extract patch count from first line
-    local first_line
-    first_line=$(head -1 "$patch_file")
-    local patch_count="${first_line#PATCHES:}"
+    local session_path="/session"
+    [[ -n "$project_name" ]] && session_path="/session/$project_name"
 
-    info "Applying $patch_count patch(es)..."
+    docker run --rm \
+        -v "$volume:/session:ro" \
+        -v "$local_path:/local:ro" \
+        ${IMAGE_NAME:-$DEFAULT_IMAGE} sh -c "
+            git config --global --add safe.directory '*'
 
-    # Remove the status line and apply patches
-    cd "$worktree_dir"
-    if tail -n +2 "$patch_file" | git am --3way; then
-        success "Merged $patch_count commit(s)"
-        return 0
-    else
-        error "Merge failed - resolve conflicts and run: git am --continue"
-        return 1
-    fi
+            SESSION_TREE=\$(cd $session_path && git rev-parse HEAD^{tree} 2>/dev/null)
+            LOCAL_TREE=\$(cd /local && git rev-parse HEAD^{tree} 2>/dev/null)
+
+            if [ \"\$SESSION_TREE\" = \"\$LOCAL_TREE\" ]; then
+                echo 'SYNCED'
+                exit 0
+            fi
+
+            # Add remotes for comparison
+            cd /local
+            git remote add session $session_path 2>/dev/null || true
+            git fetch session HEAD --quiet 2>/dev/null
+
+            # Check relationships
+            if git merge-base --is-ancestor HEAD FETCH_HEAD 2>/dev/null; then
+                COUNT=\$(git rev-list --count HEAD..FETCH_HEAD)
+                echo \"SESSION_AHEAD:\$COUNT\"
+            elif git merge-base --is-ancestor FETCH_HEAD HEAD 2>/dev/null; then
+                COUNT=\$(git rev-list --count FETCH_HEAD..HEAD)
+                echo \"LOCAL_AHEAD:\$COUNT\"
+            else
+                echo 'DIVERGED'
+            fi
+        " 2>/dev/null
 }
 
 # Merge a single project from session volume to target directory
-# This is the core merge logic shared by both single and multi-project merges
+# Uses git-native fetch/merge instead of patches
 # Arguments:
 #   $1 - volume name
 #   $2 - project name (empty string for single-project sessions)
 #   $3 - target directory (repo path or worktree path)
-#   $4 - git image
+#   $4 - git image (unused, kept for compatibility)
 # Returns:
 #   0 on success, 1 on failure
 merge_session_project() {
     local volume="$1"
     local project_name="$2"
     local target_path="$3"
-    local git_image="$4"
+    local git_image="$4"  # unused but kept for API compatibility
 
     local display_name="${project_name:-session}"
-    info "Merging $display_name to $target_path"
 
-    # Get target branch tree hash for comparison
-    local target_tree
-    target_tree=$(git -C "$target_path" rev-parse HEAD^{tree} 2>/dev/null)
-    if [[ -z "$target_tree" ]]; then
-        error "  Failed to get target branch tree hash"
-        return 1
-    fi
+    # First sync local to session (so session has any local changes)
+    sync_local_to_session "$volume" "$project_name" "$target_path" >/dev/null 2>&1
 
-    # Export patches from session (comparing against target)
-    local patch_file
-    patch_file=$(export_session_patches "$volume" "$project_name" "$git_image" "$target_tree")
-    local export_result=$?
-
-    if [[ $export_result -eq 2 ]]; then
-        success "Already caught up"
-        return 0
-    elif [[ $export_result -eq 3 ]]; then
-        # patch_file contains session tree hash - check if local is ahead
-        local session_tree="$patch_file"
-        # Check if session tree exists in local history
-        if git -C "$target_path" log --format='%T' | grep -q "^${session_tree}$"; then
-            success "Already caught up (local is ahead of session)"
-            return 0
-        else
-            error "Session and target branch have diverged"
-            echo "  The target branch contains changes not in the session."
-            echo "  This can happen if the branch was modified outside the session."
-            return 1
-        fi
-    elif [[ $export_result -ne 0 ]]; then
-        error "  Failed to export patches"
-        return 1
-    fi
-
-    # Apply patches to target
-    trap "rm -f '$patch_file'" RETURN
-    if apply_patches "$patch_file" "$target_path"; then
-        return 0
-    else
-        return 1
-    fi
+    # Then sync session to local (pull any session changes)
+    sync_session_to_local "$volume" "$project_name" "$target_path"
 }
 
 # Show diff between git session and original repo
@@ -682,20 +787,23 @@ merge_multi_project_session() {
         project_source+=("${psource:-}")
     done <<< "$projects"
 
-    # Now get status for each project (docker calls outside the read loop)
-    local -a project_commits=()
+    # Now get status for each project using git-native sync status
+    local -a project_status=()
+    local -a project_counts=()
     local has_changes=false
 
-    echo "Projects to merge:"
+    echo "Projects to sync:"
     for i in "${!project_names[@]}"; do
         local pname="${project_names[$i]}"
+        local ppath="${project_paths[$i]}"
         local ptrack="${project_track[$i]}"
         local psource="${project_source[$i]}"
 
         # Skip untracked projects
         if [[ "$ptrack" != "true" ]]; then
             echo "  [-] $pname (untracked)"
-            project_commits+=("0")
+            project_status+=("SKIP")
+            project_counts+=("0")
             continue
         fi
 
@@ -703,22 +811,44 @@ merge_multi_project_session() {
         if [[ "$psource" == "discovered" ]]; then
             local commit_count
             commit_count=$(get_total_commits "$volume" "$pname")
-            project_commits+=("$commit_count")
+            project_status+=("NEW")
+            project_counts+=("$commit_count")
             echo "  [+] $pname (NEW - $commit_count commits, will extract)"
             has_changes=true
             continue
         fi
 
-        local commit_count
-        commit_count=$(get_session_status "$volume" "$pname")
-        project_commits+=("$commit_count")
+        # Get sync status using git-native comparison
+        local sync_result
+        sync_result=$(get_sync_status "$volume" "$pname" "$ppath" 2>/dev/null)
+        local status="${sync_result%%:*}"
+        local count="${sync_result##*:}"
+        [[ "$count" == "$status" ]] && count="0"
 
-        if [[ "$commit_count" -gt 0 ]]; then
-            echo "  [x] $pname ($commit_count commits)"
-            has_changes=true
-        else
-            echo "  [ ] $pname (no new commits)"
-        fi
+        project_status+=("$status")
+        project_counts+=("$count")
+
+        case "$status" in
+            SYNCED)
+                echo "  [✓] $pname (synced)"
+                ;;
+            SESSION_AHEAD)
+                echo "  [↓] $pname ($count commits from session)"
+                has_changes=true
+                ;;
+            LOCAL_AHEAD)
+                echo "  [↑] $pname (local $count ahead, will push to session)"
+                has_changes=true
+                ;;
+            DIVERGED)
+                echo "  [!] $pname (diverged - will sync)"
+                has_changes=true
+                ;;
+            *)
+                echo "  [?] $pname (unknown status)"
+                project_status[$i]="UNKNOWN"
+                ;;
+        esac
     done
 
     if ! $has_changes; then
@@ -747,7 +877,7 @@ merge_multi_project_session() {
         return 0
     fi
 
-    # Merge each project with commits
+    # Sync each project
     local success_count=0
     local fail_count=0
 
@@ -757,21 +887,17 @@ merge_multi_project_session() {
         local pbranch="${project_branches[$i]}"
         local ptrack="${project_track[$i]}"
         local psource="${project_source[$i]}"
-        local commit_count="${project_commits[$i]}"
+        local status="${project_status[$i]}"
 
-        # Skip untracked projects
-        if [[ "$ptrack" != "true" ]]; then
-            continue
-        fi
-
-        if [[ "$commit_count" -eq 0 ]]; then
+        # Skip untracked and already synced
+        if [[ "$ptrack" != "true" ]] || [[ "$status" == "SYNCED" ]] || [[ "$status" == "SKIP" ]]; then
             continue
         fi
 
         echo ""
 
         # Handle discovered repos (new repos created in session) - extract instead of merge
-        if [[ "$psource" == "discovered" ]]; then
+        if [[ "$status" == "NEW" ]]; then
             if extract_repo_from_session "$volume" "$pname" "$ppath" "$git_image"; then
                 success_count=$((success_count + 1))
             else
@@ -796,7 +922,8 @@ merge_multi_project_session() {
             continue
         fi
 
-        # Perform the merge in the worktree
+        # Perform bidirectional sync
+        info "Syncing $pname..."
         if merge_session_project "$volume" "$pname" "$worktree_dir" "$git_image"; then
             success_count=$((success_count + 1))
         else
@@ -809,7 +936,11 @@ merge_multi_project_session() {
 
     echo ""
     if [[ $fail_count -eq 0 ]]; then
-        success "Successfully merged all projects ($success_count projects)"
+        if [[ $success_count -eq 0 ]]; then
+            success "All projects already synced"
+        else
+            success "Successfully synced $success_count project(s)"
+        fi
 
         if [[ "$auto_mode" != "true" ]]; then
             echo ""
@@ -820,7 +951,7 @@ merge_multi_project_session() {
             fi
         fi
     else
-        error "Merge completed with errors ($success_count succeeded, $fail_count failed)"
+        error "Sync completed with errors ($success_count succeeded, $fail_count failed)"
         return 1
     fi
 }
@@ -872,36 +1003,54 @@ merge_git_session() {
     fi
     echo ""
 
+    # Get sync status
+    local sync_status
+    sync_status=$(get_sync_status "$volume" "" "$merge_path" 2>/dev/null)
+    local status="${sync_status%%:*}"
+    local count="${sync_status##*:}"
+    [[ "$count" == "$status" ]] && count="0"
+
     if $no_run; then
-        # Show what would be merged for dry run
-        echo "=== Commits in session ==="
-        show_session_commits "$volume" "" "count"
+        # Show sync status for dry run
+        echo "=== Sync Status ==="
+        case "$status" in
+            SYNCED) echo "  Already synced" ;;
+            SESSION_AHEAD) echo "  Session has $count commit(s) to pull" ;;
+            LOCAL_AHEAD) echo "  Local has $count commit(s) to push" ;;
+            DIVERGED) echo "  Diverged - will attempt merge" ;;
+        esac
         echo ""
-        info "Dry run - not applying changes"
+        info "Dry run - not syncing"
         return 0
     fi
 
     if [[ "$auto_mode" == "true" ]]; then
-        # In auto mode, skip upfront commit list - merge logic will report what happens
         choice="y"
     else
-        # Show commits for interactive mode
-        echo "=== Commits in session ==="
-        show_session_commits "$volume" "" "count"
+        # Show status for interactive mode
+        echo "=== Sync Status ==="
+        case "$status" in
+            SYNCED)
+                success "Already synced"
+                cleanup_worktree "$target_dir" "$merge_path" "$created_worktree" "$repo_name"
+                return 0
+                ;;
+            SESSION_AHEAD) echo "  Session has $count commit(s) to pull" ;;
+            LOCAL_AHEAD) echo "  Local has $count commit(s) to push to session" ;;
+            DIVERGED) echo "  Diverged - will attempt bidirectional sync" ;;
+        esac
         echo ""
-        read -p "Merge all commits? [y/n/select] " choice
+        read -p "Sync? [y/n] " choice
     fi
 
     case "$choice" in
         y|Y)
-            # Use shared merge function (empty project name for single-project)
+            # Use shared sync function (empty project name for single-project)
             if merge_session_project "$volume" "" "$merge_path" "$git_image"; then
-                success "Successfully merged to branch '$target_branch'"
-                # Clean up worktree if we created it
+                success "Successfully synced branch '$target_branch'"
                 cleanup_worktree "$target_dir" "$merge_path" "$created_worktree" "$repo_name"
             else
-                # Don't clean up worktree on failure - user needs to resolve
-                warn "Worktree preserved for conflict resolution: $merge_path"
+                warn "Sync had issues - worktree preserved: $merge_path"
                 return 1
             fi
 
@@ -917,11 +1066,6 @@ merge_git_session() {
             ;;
         n|N)
             echo "Cancelled"
-            cleanup_worktree "$target_dir" "$merge_path" "$created_worktree" "$repo_name"
-            ;;
-        select|s|S)
-            warn "Interactive selection not yet implemented"
-            echo "Use 'git cherry-pick' manually after inspecting the session"
             cleanup_worktree "$target_dir" "$merge_path" "$created_worktree" "$repo_name"
             ;;
         *)
