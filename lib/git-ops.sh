@@ -866,7 +866,7 @@ merge_multi_project_session() {
             (
                 commit_count=$(get_total_commits "$volume" "$pname" 2>/dev/null)
                 echo "NEW:$commit_count" > "$status_dir/$i"
-                echo "  [+] $pname (NEW - $commit_count commits)"
+                echo "  [+] $pname (NEW repo - $commit_count commit(s), will extract)"
             ) &
             pids+=($!)
             continue
@@ -880,11 +880,11 @@ merge_multi_project_session() {
             count="${result##*:}"
             [[ "$count" == "$status" ]] && count="0"
             case "$status" in
-                SYNCED)       echo "  [✓] $pname" ;;
-                SESSION_AHEAD) echo "  [↓] $pname ($count from session)" ;;
-                LOCAL_AHEAD)  echo "  [↑] $pname (local +$count)" ;;
-                DIVERGED)     echo "  [!] $pname (diverged)" ;;
-                *)            echo "  [?] $pname" ;;
+                SYNCED)       echo "  [✓] $pname (synced)" ;;
+                SESSION_AHEAD) echo "  [↓] $pname ($count commit(s) to pull from session)" ;;
+                LOCAL_AHEAD)  echo "  [↑] $pname ($count commit(s) to push to session)" ;;
+                DIVERGED)     echo "  [!] $pname (diverged - needs sync)" ;;
+                *)            echo "  [?] $pname (checking...)" ;;
             esac
         ) &
         pids+=($!)
@@ -982,10 +982,10 @@ merge_multi_project_session() {
             # Handle discovered repos
             if [[ "$status" == "NEW" ]]; then
                 if extract_repo_from_session "$volume" "$pname" "$ppath" "$git_image" >/dev/null 2>&1; then
-                    echo "  [✓] $pname (extracted)"
+                    echo "  [✓] $pname extracted to $ppath"
                     echo "OK:extracted" > "$sync_dir/$i"
                 else
-                    echo "  [✗] $pname (extract failed)"
+                    echo "  [✗] $pname extraction failed"
                     echo "FAIL:extract" > "$sync_dir/$i"
                 fi
                 exit 0
@@ -993,7 +993,7 @@ merge_multi_project_session() {
 
             # Verify source path is a git repo
             if ! is_git_repo "$ppath"; then
-                echo "  [✗] $pname (not a git repo)"
+                echo "  [✗] $pname not a git repo at $ppath"
                 echo "FAIL:not a git repo" > "$sync_dir/$i"
                 exit 1
             fi
@@ -1001,7 +1001,7 @@ merge_multi_project_session() {
             # Create worktree for target branch
             worktree_dir=$(create_or_find_worktree "$ppath" "$target_branch" "$from_branch" "$pname" 2>/dev/null)
             if [[ $? -ne 0 ]]; then
-                echo "  [✗] $pname (worktree failed)"
+                echo "  [✗] $pname worktree creation failed"
                 echo "FAIL:worktree" > "$sync_dir/$i"
                 exit 1
             fi
@@ -1017,14 +1017,14 @@ merge_multi_project_session() {
                         cd /session/$pname && git rev-parse HEAD
                     " 2>/dev/null)
                 if [[ "$local_head" == "$session_head" ]]; then
-                    echo "  [✓] $pname (${local_head:0:7})"
+                    echo "  [✓] $pname synced at ${local_head:0:7}"
                     echo "OK:$local_head" > "$sync_dir/$i"
                 else
-                    echo "  [✗] $pname (verify failed)"
+                    echo "  [✗] $pname verification failed (local: ${local_head:0:7}, session: ${session_head:0:7})"
                     echo "FAIL:verify" > "$sync_dir/$i"
                 fi
             else
-                echo "  [✗] $pname (sync failed)"
+                echo "  [✗] $pname sync failed"
                 echo "FAIL:sync" > "$sync_dir/$i"
             fi
 
