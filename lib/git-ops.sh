@@ -5,10 +5,15 @@
 # Dependencies:
 #   - utils.sh must be sourced first (provides: info, success, warn, error, get_main_repo_path)
 #   - config.sh must be sourced first (provides: parse_config_file)
+#   - docker-utils.sh must be sourced (provides: docker_run_git, docker_run_in_volume)
 #
 # Required globals:
 #   - CACHE_DIR: directory for caching temporary files
 #   - IMAGE_NAME or DEFAULT_IMAGE: Docker image for git operations
+
+# Source docker utilities
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/docker-utils.sh"
 
 # Show diff between session and source repository
 # Arguments:
@@ -33,6 +38,8 @@ show_diff_vs_source() {
     # Construct diff command based on format
     local diff_cmd="git diff --${format} source/HEAD HEAD"
 
+    # This requires mounting both source and session volumes, so we use direct docker run
+    # but with the same patterns as docker_run_git for consistency
     docker run --rm \
         -v "$source_path:/source:ro" \
         -v "$volume:/session:ro" \
@@ -44,27 +51,19 @@ show_diff_vs_source() {
             git fetch source --quiet 2>/dev/null || true
             $diff_cmd 2>/dev/null || \
                 echo '  (unable to compare - source may not be a git repo)'
-        "
+        " 2>/dev/null
 }
 
 # Get session project status (commits pending merge)
 get_session_status() {
     local volume="$1"
     local project_name="$2"
-    local git_image="${IMAGE_NAME:-$DEFAULT_IMAGE}"
 
-    docker run --rm \
-        -v "$volume:/session:ro" \
-        --entrypoint sh \
-        "$git_image" \
-        -c '
-            git config --global --add safe.directory "*"
-            cd /session/'"$project_name"' 2>/dev/null || exit 1
-
-            # Count all commits from initial commit to HEAD
-            INITIAL=$(git rev-list --max-parents=0 HEAD 2>/dev/null | tail -1)
-            git rev-list --count "$INITIAL..HEAD" 2>/dev/null || echo "0"
-        ' 2>/dev/null || echo "0"
+    docker_run_git "$volume" "$project_name" '
+        # Count all commits from initial commit to HEAD
+        INITIAL=$(git rev-list --max-parents=0 HEAD 2>/dev/null | tail -1)
+        git rev-list --count "$INITIAL..HEAD" 2>/dev/null || echo "0"
+    ' || echo "0"
 }
 
 # Get total commit count for discovered repos (new repos created in session)
@@ -72,17 +71,10 @@ get_session_status() {
 get_total_commits() {
     local volume="$1"
     local project_name="$2"
-    local git_image="${IMAGE_NAME:-$DEFAULT_IMAGE}"
 
-    docker run --rm \
-        -v "$volume:/session:ro" \
-        --entrypoint sh \
-        "$git_image" \
-        -c '
-            git config --global --add safe.directory "*"
-            cd /session/'"$project_name"' 2>/dev/null || exit 1
-            git rev-list --count HEAD 2>/dev/null || echo "0"
-        ' 2>/dev/null || echo "0"
+    docker_run_git "$volume" "$project_name" '
+        git rev-list --count HEAD 2>/dev/null || echo "0"
+    ' || echo "0"
 }
 
 # Show session commits with various formatting options
@@ -102,13 +94,6 @@ show_session_commits() {
     local format="${3:-oneline}"
     local indent="${4:-}"
     local limit="${5:-all}"
-    local git_image="${IMAGE_NAME:-$DEFAULT_IMAGE}"
-
-    # Build the cd path: /session or /session/project_name
-    local session_path="/session"
-    if [[ -n "$project_path" ]]; then
-        session_path="/session/$project_path"
-    fi
 
     # Build sed command for indentation
     local sed_cmd=""
@@ -119,20 +104,15 @@ show_session_commits() {
     # Build the git log command based on format
     if [[ "$format" == "count" ]]; then
         # Count-only format: check count and show log or "(no commits)"
-        docker run --rm \
-            -v "$volume:/session:ro" \
-            "$git_image" \
-            sh -c '
-                git config --global --add safe.directory "*"
-                cd '"$session_path"'
-                INITIAL=$(git rev-list --max-parents=0 HEAD 2>/dev/null | tail -1)
-                COUNT=$(git rev-list --count "$INITIAL..HEAD" 2>/dev/null || echo "0")
-                if [ "$COUNT" = "0" ]; then
-                    echo "(no commits)"
-                else
-                    git log --oneline "$INITIAL..HEAD" 2>/dev/null
-                fi
-            '
+        docker_run_git "$volume" "$project_path" '
+            INITIAL=$(git rev-list --max-parents=0 HEAD 2>/dev/null | tail -1)
+            COUNT=$(git rev-list --count "$INITIAL..HEAD" 2>/dev/null || echo "0")
+            if [ "$COUNT" = "0" ]; then
+                echo "(no commits)"
+            else
+                git log --oneline "$INITIAL..HEAD" 2>/dev/null
+            fi
+        '
     else
         # Standard oneline format with optional fallback to -10
         local fallback_cmd=""
@@ -140,15 +120,10 @@ show_session_commits() {
             fallback_cmd=" || git log --oneline -10"
         fi
 
-        docker run --rm \
-            -v "$volume:/session:ro" \
-            "$git_image" \
-            sh -c '
-                git config --global --add safe.directory "*"
-                cd '"$session_path"'
-                initial=$(git rev-list --max-parents=0 HEAD 2>/dev/null | tail -1)
-                git log --oneline "$initial..HEAD" 2>/dev/null'"$fallback_cmd$sed_cmd"'
-            '
+        docker_run_git "$volume" "$project_path" '
+            initial=$(git rev-list --max-parents=0 HEAD 2>/dev/null | tail -1)
+            git log --oneline "$initial..HEAD" 2>/dev/null'"$fallback_cmd$sed_cmd"'
+        '
     fi
 }
 
@@ -194,6 +169,7 @@ extract_repo_from_session() {
     trap "rm -rf '$temp_clone'" RETURN
 
     # Clone from volume to temp directory
+    # This requires mounting both session and output volumes, so we use direct docker run
     if ! docker run --rm \
         -v "$volume:/session:ro" \
         -v "$temp_clone:/output" \
@@ -237,11 +213,7 @@ load_session_config() {
 
     # Extract config from volume
     local config_data
-    config_data=$(docker run --rm \
-        -v "$volume:/session:ro" \
-        --entrypoint sh \
-        "$git_image" \
-        -c 'cat /session/.claude-projects.yml' 2>/dev/null) || {
+    config_data=$(docker_run_in_volume "$volume" "/session" "$git_image" 'cat /session/.claude-projects.yml' "ro") || {
         error "Failed to read config from session volume"
         exit 1
     }
@@ -277,10 +249,54 @@ has_multi_project_config() {
     local git_image="${IMAGE_NAME:-$DEFAULT_IMAGE}"
 
     # Check if .claude-projects.yml exists in volume
-    docker run --rm \
-        -v "$volume:/session:ro" \
-        "$git_image" \
-        sh -c 'test -f /session/.claude-projects.yml' 2>/dev/null
+    docker_run_in_volume "$volume" "/session" "$git_image" 'test -f /session/.claude-projects.yml' "ro"
+}
+
+# Helper callback for showing project diff summary
+# Arguments: $1=project_name $2=source_path $3=branch $4=track $5=source $6=volume
+_show_project_diff_summary() {
+    local project_name="$1"
+    local source_path="$2"
+    local _branch="$3"
+    local project_track="$4"
+    local project_source="$5"
+    local volume="$6"
+
+    # Skip untracked projects
+    if ! is_project_tracked "$project_track"; then
+        echo "Project: $project_name (untracked)"
+        echo "  (not tracked for merging)"
+        echo ""
+        return 0
+    fi
+
+    # Handle discovered repos (new repos created in session)
+    if [[ "$project_source" == "discovered" ]]; then
+        local commit_count
+        commit_count=$(get_total_commits "$volume" "$project_name")
+        echo "Project: $project_name (NEW - $commit_count commits)"
+        echo "  Will extract to: $source_path"
+        docker_run_git "$volume" "$project_name" "git log --oneline -5 2>/dev/null | sed 's/^/  /'"
+        echo ""
+        return 0
+    fi
+
+    # Count all commits from initial commit
+    local commit_count
+    commit_count=$(docker_run_git "$volume" "$project_name" '
+        initial=$(git rev-list --max-parents=0 HEAD 2>/dev/null | tail -1)
+        git rev-list --count "$initial..HEAD" 2>/dev/null || echo 0
+    ' < /dev/null) || echo "0"
+
+    echo "Project: $project_name ($commit_count commits)"
+
+    if [[ "$commit_count" -gt 0 ]]; then
+        # Show all commit messages
+        show_session_commits "$volume" "$project_name" "oneline" "  "
+    else
+        echo "  (no commits)"
+    fi
+    echo ""
 }
 
 # Show diff for multi-project session
@@ -297,25 +313,20 @@ diff_multi_project_session() {
 
     # If project filter specified, show detailed diff for that project only
     if [[ -n "$project_filter" ]]; then
-        local found=false
-        while IFS='|' read -r project_name source_path _branch; do
-            if [[ "$project_name" == "$project_filter" ]]; then
-                found=true
-                info "Comparing project '$project_name' with source: $source_path"
-                echo ""
+        local project_line
+        if project_line=$(find_project "$projects" "$project_filter"); then
+            IFS='|' read -r project_name source_path _branch _track _source <<< "$project_line"
+            info "Comparing project '$project_name' with source: $source_path"
+            echo ""
 
-                # Show commits made in this project
-                echo "=== Commits in session (project: $project_name) ==="
-                show_session_commits "$volume" "$project_name"
+            # Show commits made in this project
+            echo "=== Commits in session (project: $project_name) ==="
+            show_session_commits "$volume" "$project_name"
 
-                echo ""
-                echo "=== File changes (session vs source) ==="
-                show_diff_vs_source "$volume" "$project_name" "$source_path"
-                break
-            fi
-        done <<< "$projects"
-
-        if ! $found; then
+            echo ""
+            echo "=== File changes (session vs source) ==="
+            show_diff_vs_source "$volume" "$project_name" "$source_path"
+        else
             error "Project not found in session: $project_filter"
             echo "Available projects:"
             while IFS='|' read -r project_name _path _branch; do
@@ -330,55 +341,7 @@ diff_multi_project_session() {
     info "Multi-project session: $name"
     echo ""
 
-    while IFS='|' read -r project_name source_path _branch project_track project_source; do
-        # Skip untracked projects
-        if [[ "${project_track:-true}" != "true" ]]; then
-            echo "Project: $project_name (untracked)"
-            echo "  (not tracked for merging)"
-            echo ""
-            continue
-        fi
-
-        # Handle discovered repos (new repos created in session)
-        if [[ "$project_source" == "discovered" ]]; then
-            local commit_count
-            commit_count=$(get_total_commits "$volume" "$project_name")
-            echo "Project: $project_name (NEW - $commit_count commits)"
-            echo "  Will extract to: $source_path"
-            docker run --rm \
-                -v "$volume:/session:ro" \
-                "$git_image" \
-                sh -c "
-                    git config --global --add safe.directory '*'
-                    cd /session/$project_name
-                    git log --oneline -5 2>/dev/null | sed 's/^/  /'
-                " 2>/dev/null
-            echo ""
-            continue
-        fi
-
-        # Count all commits from initial commit
-        local commit_count
-        commit_count=$(docker run --rm \
-            -v "$volume:/session:ro" \
-            "$git_image" \
-            sh -c '
-                git config --global --add safe.directory "*"
-                cd /session/'"$project_name"' 2>/dev/null || exit 0
-                initial=$(git rev-list --max-parents=0 HEAD 2>/dev/null | tail -1)
-                git rev-list --count "$initial..HEAD" 2>/dev/null || echo 0
-            ' < /dev/null) || echo "0"
-
-        echo "Project: $project_name ($commit_count commits)"
-
-        if [[ "$commit_count" -gt 0 ]]; then
-            # Show all commit messages
-            show_session_commits "$volume" "$project_name" "oneline" "  "
-        else
-            echo "  (no commits)"
-        fi
-        echo ""
-    done <<< "$projects"
+    for_each_project "$projects" _show_project_diff_summary "$volume"
 
     echo "Tip: Use --diff-session $name <project-name> to see detailed changes for a specific project"
 }
@@ -473,27 +436,19 @@ export_session_patches() {
     patch_file=$(mktemp)
 
     # Generate patches from container (all commits from initial to HEAD)
-    local project_path="${project_name:+/$project_name}"
-    docker run --rm \
-        -v "$volume:/session:ro" \
-        --entrypoint sh \
-        "$git_image" \
-        -c "
-            git config --global --add safe.directory '*'
-            cd /session$project_path
+    docker_run_git "$volume" "$project_name" '
+        # Get initial commit and count patches
+        INITIAL=$(git rev-list --max-parents=0 HEAD 2>/dev/null | tail -1)
+        PATCH_COUNT=$(git rev-list --count "$INITIAL..HEAD" 2>/dev/null || echo 0)
 
-            # Get initial commit and count patches
-            INITIAL=\$(git rev-list --max-parents=0 HEAD 2>/dev/null | tail -1)
-            PATCH_COUNT=\$(git rev-list --count \"\$INITIAL..HEAD\" 2>/dev/null || echo 0)
+        if [ "$PATCH_COUNT" = "0" ]; then
+            echo "NO_CHANGES:0"
+            exit 0
+        fi
 
-            if [ \"\$PATCH_COUNT\" = \"0\" ]; then
-                echo \"NO_CHANGES:0\"
-                exit 0
-            fi
-
-            echo \"PATCHES:\$PATCH_COUNT\"
-            git format-patch --stdout \"\$INITIAL..HEAD\"
-        " 2>/dev/null > "$patch_file"
+        echo "PATCHES:$PATCH_COUNT"
+        git format-patch --stdout "$INITIAL..HEAD"
+    ' > "$patch_file"
 
     # Check first line for status
     local first_line

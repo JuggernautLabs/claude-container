@@ -5,6 +5,7 @@
 # Dependencies:
 #   - utils.sh must be sourced first (provides: info, success, warn, error)
 #   - git-ops.sh must be sourced first (provides: diff_git_session, merge_git_session)
+#   - docker-utils.sh must be sourced first (provides: docker_run_in_volume, get_volume_sizes_batch, etc.)
 #
 # This module provides functions for managing claude-container sessions:
 #   - session_cleanup: Clean up all claude-container Docker volumes
@@ -13,6 +14,11 @@
 #   - session_restart: Restart a session with permission fixes
 #   - session_diff: Show diff between session and source repo
 #   - session_merge: Merge session commits back to source repo
+
+# Source docker-utils.sh if not already sourced
+if [[ -z "$(type -t docker_run_in_volume)" ]]; then
+    source "$(dirname "${BASH_SOURCE[0]}")/docker-utils.sh"
+fi
 
 # ============================================================================
 # Volume Utility Functions
@@ -129,17 +135,14 @@ session_cleanup_unused() {
         grep -oE '"Name": "claude-[^"]+"|"Name": "session-data-[^"]+"' | \
         cut -d'"' -f4 | sort -u || true)
 
-    # Find unused volumes
+    # Find unused volumes using utility function
+    local unused_volumes_str
+    unused_volumes_str=$(filter_not_in_set "$all_volumes" "$used_volumes")
+
     local unused_volumes=()
     while read -r vol; do
-        [[ -z "$vol" ]] && continue
-        # Check if volume is NOT in used list (avoid ! for zsh compatibility)
-        if echo "$used_volumes" | grep -q "^${vol}$"; then
-            : # Volume is in use, skip
-        else
-            unused_volumes+=("$vol")
-        fi
-    done <<< "$all_volumes"
+        [[ -n "$vol" ]] && unused_volumes+=("$vol")
+    done <<< "$unused_volumes_str"
 
     if [[ ${#unused_volumes[@]} -eq 0 ]]; then
         echo "No unused volumes found (all volumes are currently in use)"
@@ -156,37 +159,11 @@ session_cleanup_unused() {
     echo ""
     echo "Calculating sizes..."
 
-    # Build mount arguments for all unused volumes at once (much faster!)
-    local mount_args=""
-    for vol in "${unused_volumes[@]}"; do
-        mount_args="$mount_args -v $vol:/$vol"
-    done
-
-    # Get all sizes in one container run
+    # Get all sizes in one container run using docker-utils function
+    local unused_volumes_list
+    unused_volumes_list=$(printf "%s\n" "${unused_volumes[@]}")
     local sizes
-    sizes=$(docker run --rm $mount_args alpine sh -c '
-        total=0
-        for dir in /claude-* /session-data-*; do
-            [ -d "$dir" ] || continue
-            name=$(basename "$dir")
-            bytes=$(du -sb "$dir" 2>/dev/null | cut -f1)
-            bytes=${bytes:-0}
-            human=$(du -sh "$dir" 2>/dev/null | cut -f1)
-            human=${human:-?}
-            total=$((total + bytes))
-            echo "$name|$human"
-        done
-        # Output total in human readable
-        if [ $total -gt 1073741824 ]; then
-            echo "TOTAL|$((total / 1073741824))G"
-        elif [ $total -gt 1048576 ]; then
-            echo "TOTAL|$((total / 1048576))M"
-        elif [ $total -gt 1024 ]; then
-            echo "TOTAL|$((total / 1024))K"
-        else
-            echo "TOTAL|${total}B"
-        fi
-    ' 2>/dev/null || echo "")
+    sizes=$(get_volume_sizes_batch_with_total "$unused_volumes_list")
 
     echo ""
     echo "Volumes to delete:"
@@ -235,45 +212,22 @@ session_list() {
         return 0
     fi
 
-    # Extract unique session names
+    # Extract unique session names using utility function
     declare -A sessions
     while read -r vol; do
         [[ -z "$vol" ]] && continue
-        local session_name=""
-        case "$vol" in
-            claude-session-*) session_name="${vol#claude-session-}" ;;
-            claude-state-*)   session_name="${vol#claude-state-}" ;;
-            claude-cargo-*)   session_name="${vol#claude-cargo-}" ;;
-            claude-npm-*)     session_name="${vol#claude-npm-}" ;;
-            claude-pip-*)     session_name="${vol#claude-pip-}" ;;
-        esac
+        local session_name=$(extract_session_name "$vol")
         [[ -n "$session_name" ]] && sessions[$session_name]=1
     done <<< "$all_volumes"
 
-    # Build mount arguments for all volumes at once
+    # Get all sizes in one container run using docker-utils function
     echo "Scanning $(echo "$all_volumes" | wc -l | tr -d ' ') volumes..."
-    local mount_args=""
-    local vol_list=""
-    while read -r vol; do
-        [[ -z "$vol" ]] && continue
-        mount_args="$mount_args -v $vol:/$vol:ro"
-        vol_list="$vol_list $vol"
-    done <<< "$all_volumes"
-
-    # Get all sizes in one container run (much faster!)
     local sizes
-    sizes=$(docker run --rm $mount_args alpine sh -c '
-        for dir in /claude-*/; do
-            [ -d "$dir" ] || continue
-            name=$(basename "$dir")
-            size=$(du -sh "$dir" 2>/dev/null | cut -f1)
-            echo "$name $size"
-        done
-    ' 2>/dev/null || echo "")
+    sizes=$(get_volume_sizes_batch "$all_volumes")
 
-    # Parse sizes into associative array
+    # Parse sizes into associative array (format: name|size)
     declare -A vol_sizes
-    while read -r vol size; do
+    while IFS='|' read -r vol size; do
         [[ -z "$vol" ]] && continue
         vol_sizes[$vol]="$size"
     done <<< "$sizes"
@@ -292,9 +246,13 @@ session_list() {
         printf "%-30s %10s %10s %10s %10s %10s\n" "$session" "$ws" "$st" "$ca" "$np" "$pi"
     done
 
-    # Calculate total size across all volumes
-    local total_human
-    total_human=$(docker run --rm $mount_args alpine sh -c 'du -sch /claude-*/ 2>/dev/null | tail -1 | cut -f1' 2>/dev/null || echo "?")
+    # Calculate total size across all volumes using docker-utils function
+    local total_human="?"
+    local sizes_with_total
+    sizes_with_total=$(get_volume_sizes_batch_with_total "$all_volumes")
+    # Extract TOTAL line
+    total_human=$(echo "$sizes_with_total" | grep "^TOTAL|" | cut -d'|' -f2)
+    [[ -z "$total_human" ]] && total_human="?"
 
     echo ""
     echo "Total disk usage: $total_human"
@@ -412,6 +370,7 @@ session_restart() {
 
     # Fix permissions on existing volumes before restart
     info "Fixing volume permissions..."
+    # Mount multiple cache/state volumes and fix ownership
     docker run --rm \
         -v "claude-cargo-${session}:/cargo" \
         -v "claude-npm-${session}:/npm" \
@@ -495,10 +454,8 @@ session_add_repo() {
 
     # Check if path already exists in session
     local exists
-    exists=$(docker run --rm \
-        -v "$volume:/session:ro" \
-        "$git_image" \
-        sh -c "test -d '/session/$workspace_path' && echo 'yes' || echo 'no'")
+    exists=$(docker_run_in_volume "$volume" "/session" "$git_image" \
+        "test -d '/session/$workspace_path' && echo 'yes' || echo 'no'" "ro")
 
     if [[ "$exists" == "yes" ]]; then
         error "Path already exists in session: $workspace_path"
@@ -526,6 +483,7 @@ session_add_repo() {
         du -sh '/session/$workspace_path' | cut -f1"
 
     # Clone the repo into the session
+    # Note: Uses direct docker run due to --user flag and dual volume mounts
     local clone_output
     if ! clone_output=$(docker run --rm \
         --user "$host_uid:$host_uid" \
@@ -546,6 +504,8 @@ session_add_repo() {
     local config_path="$source_repo_path"
     local config_branch="$branch_to_checkout"
 
+    # Update .claude-projects.yml
+    # Note: Uses direct docker run due to --user flag requirement
     docker run --rm \
         --user "$host_uid:$host_uid" \
         -v "$volume:/session" \
@@ -692,6 +652,7 @@ session_import() {
     info "Target: $state_volume"
 
     # Copy session data into volume using tar to handle nested containers
+    # Note: Uses direct docker run with -i flag for stdin piping
     local git_image="${IMAGE_NAME:-$DEFAULT_IMAGE}"
     local copy_output
 
@@ -748,14 +709,8 @@ session_scan() {
 
     # Get list of all git repos in the session
     local repos_in_session
-    repos_in_session=$(docker run --rm \
-        -v "$volume:/workspace:ro" \
-        alpine sh -c '
-            cd /workspace
-            for dir in */; do
-                [ -d "$dir/.git" ] && echo "${dir%/}"
-            done
-        ' 2>/dev/null | sort)
+    repos_in_session=$(docker_run_in_volume "$volume" "/workspace" "alpine" \
+        'cd /workspace && for dir in */; do [ -d "$dir/.git" ] && echo "${dir%/}"; done' "ro" | sort)
 
     if [[ -z "$repos_in_session" ]]; then
         warn "No git repositories found in session"
@@ -768,18 +723,13 @@ session_scan() {
 
     # Check for config in session volume
     local has_config
-    has_config=$(docker run --rm \
-        -v "$volume:/workspace:ro" \
-        alpine sh -c 'test -f /workspace/.claude-projects.yml && echo "yes" || echo "no"')
+    has_config=$(docker_run_in_volume "$volume" "/workspace" "alpine" \
+        'test -f /workspace/.claude-projects.yml && echo "yes" || echo "no"' "ro")
 
     if [[ "$has_config" == "yes" ]]; then
         # Extract repo names from config
-        config_repos=$(docker run --rm \
-            -v "$volume:/workspace:ro" \
-            alpine sh -c '
-                grep -E "^  [a-zA-Z0-9_/-]+:" /workspace/.claude-projects.yml 2>/dev/null | \
-                sed "s/://g" | sed "s/^ *//" | sort
-            ' 2>/dev/null || echo "")
+        config_repos=$(docker_run_in_volume "$volume" "/workspace" "alpine" \
+            'grep -E "^  [a-zA-Z0-9_/-]+:" /workspace/.claude-projects.yml 2>/dev/null | sed "s/://g" | sed "s/^ *//" | sort' "ro" || echo "")
         config_file="/workspace/.claude-projects.yml"
     fi
 
@@ -797,17 +747,22 @@ session_scan() {
         fi
     fi
 
-    # Compare and categorize
+    # Compare and categorize using utility function
+    local new_repos_str
+    new_repos_str=$(filter_not_in_set "$repos_in_session" "$config_repos")
+
     local known_repos=()
     local new_repos=()
 
+    # Split into arrays
+    while read -r repo; do
+        [[ -n "$repo" ]] && new_repos+=("$repo")
+    done <<< "$new_repos_str"
+
+    # Known repos are those in session but not in new_repos
     while read -r repo; do
         [[ -z "$repo" ]] && continue
-        if echo "$config_repos" | grep -q "^${repo}$"; then
-            known_repos+=("$repo")
-        else
-            new_repos+=("$repo")
-        fi
+        echo "$new_repos_str" | grep -q "^${repo}$" || known_repos+=("$repo")
     done <<< "$repos_in_session"
 
     # Display results

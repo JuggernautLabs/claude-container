@@ -234,12 +234,20 @@ docker_run_git() {
 mount_all_volumes() {
     local volumes_ref="$1"
     local mount_prefix="${2:-}"
-    local readonly="${3:-ro}"
+    local readonly="${3}"
+
+    # Default to "ro" only if parameter not provided at all
+    if [[ $# -lt 3 ]]; then
+        readonly="ro"
+    fi
 
     if [[ -z "$volumes_ref" ]]; then
         error "mount_all_volumes: volumes_array_ref parameter is required"
         return 1
     fi
+
+    # Strip [@] suffix if present (e.g., "volumes[@]" -> "volumes")
+    volumes_ref="${volumes_ref%\[@\]}"
 
     # Dereference array
     local -n volumes_array="$volumes_ref"
