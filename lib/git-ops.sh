@@ -837,40 +837,60 @@ merge_multi_project_session() {
         project_source+=("${psource:-}")
     done <<< "$projects"
 
-    # Now get status for each project using git-native sync status
+    # Get status for each project in PARALLEL
     local -a project_status=()
     local -a project_counts=()
     local has_changes=false
+    local status_dir
+    status_dir=$(mktemp -d)
 
-    echo "Projects to sync:"
+    info "Checking ${#project_names[@]} projects..."
+
+    # Launch parallel status checks
+    local -a pids=()
     for i in "${!project_names[@]}"; do
         local pname="${project_names[$i]}"
         local ppath="${project_paths[$i]}"
         local ptrack="${project_track[$i]}"
         local psource="${project_source[$i]}"
 
-        # Skip untracked projects
+        # Skip untracked projects (no async needed)
         if [[ "$ptrack" != "true" ]]; then
-            echo "  [-] $pname (untracked)"
-            project_status+=("SKIP")
-            project_counts+=("0")
+            echo "SKIP:0" > "$status_dir/$i"
             continue
         fi
 
-        # Handle discovered repos (new repos created in session)
+        # Handle discovered repos
         if [[ "$psource" == "discovered" ]]; then
-            local commit_count
-            commit_count=$(get_total_commits "$volume" "$pname")
-            project_status+=("NEW")
-            project_counts+=("$commit_count")
-            echo "  [+] $pname (NEW - $commit_count commits, will extract)"
-            has_changes=true
+            (
+                commit_count=$(get_total_commits "$volume" "$pname" 2>/dev/null)
+                echo "NEW:$commit_count" > "$status_dir/$i"
+            ) &
+            pids+=($!)
             continue
         fi
 
-        # Get sync status using git-native comparison
+        # Get sync status async
+        (
+            result=$(get_sync_status "$volume" "$pname" "$ppath" 2>/dev/null)
+            echo "$result" > "$status_dir/$i"
+        ) &
+        pids+=($!)
+    done
+
+    # Wait for all status checks to complete
+    for pid in "${pids[@]}"; do
+        wait "$pid" 2>/dev/null
+    done
+
+    # Collect results and display
+    echo "Projects to sync:"
+    for i in "${!project_names[@]}"; do
+        local pname="${project_names[$i]}"
+        local ptrack="${project_track[$i]}"
+
         local sync_result
-        sync_result=$(get_sync_status "$volume" "$pname" "$ppath" 2>/dev/null)
+        sync_result=$(cat "$status_dir/$i" 2>/dev/null || echo "UNKNOWN:0")
         local status="${sync_result%%:*}"
         local count="${sync_result##*:}"
         [[ "$count" == "$status" ]] && count="0"
@@ -879,6 +899,13 @@ merge_multi_project_session() {
         project_counts+=("$count")
 
         case "$status" in
+            SKIP)
+                echo "  [-] $pname (untracked)"
+                ;;
+            NEW)
+                echo "  [+] $pname (NEW - $count commits, will extract)"
+                has_changes=true
+                ;;
             SYNCED)
                 echo "  [✓] $pname (synced)"
                 ;;
@@ -887,19 +914,21 @@ merge_multi_project_session() {
                 has_changes=true
                 ;;
             LOCAL_AHEAD)
-                echo "  [↑] $pname (local $count ahead, will push to session)"
+                echo "  [↑] $pname (local $count ahead)"
                 has_changes=true
                 ;;
             DIVERGED)
-                echo "  [!] $pname (diverged - will sync)"
+                echo "  [!] $pname (diverged)"
                 has_changes=true
                 ;;
             *)
-                echo "  [?] $pname (unknown status)"
+                echo "  [?] $pname (unknown)"
                 project_status[$i]="UNKNOWN"
                 ;;
         esac
     done
+
+    rm -rf "$status_dir"
 
     if ! $has_changes; then
         warn "No changes to merge in any project"
@@ -927,16 +956,17 @@ merge_multi_project_session() {
         return 0
     fi
 
-    # Sync each project
-    local success_count=0
-    local fail_count=0
+    # Sync projects in PARALLEL
+    local sync_dir
+    sync_dir=$(mktemp -d)
+    local -a sync_pids=()
+    local projects_to_sync=0
 
+    # Count and launch parallel syncs
     for i in "${!project_names[@]}"; do
         local pname="${project_names[$i]}"
         local ppath="${project_paths[$i]}"
-        local pbranch="${project_branches[$i]}"
         local ptrack="${project_track[$i]}"
-        local psource="${project_source[$i]}"
         local status="${project_status[$i]}"
 
         # Skip untracked and already synced
@@ -944,45 +974,98 @@ merge_multi_project_session() {
             continue
         fi
 
-        echo ""
+        projects_to_sync=$((projects_to_sync + 1))
 
-        # Handle discovered repos (new repos created in session) - extract instead of merge
-        if [[ "$status" == "NEW" ]]; then
-            if extract_repo_from_session "$volume" "$pname" "$ppath" "$git_image"; then
-                success_count=$((success_count + 1))
-            else
-                fail_count=$((fail_count + 1))
+        # Launch sync in background
+        (
+            result="FAIL"
+
+            # Handle discovered repos
+            if [[ "$status" == "NEW" ]]; then
+                if extract_repo_from_session "$volume" "$pname" "$ppath" "$git_image" >/dev/null 2>&1; then
+                    result="OK"
+                fi
+                echo "$result" > "$sync_dir/$i"
+                exit 0
             fi
+
+            # Verify source path is a git repo
+            if ! is_git_repo "$ppath"; then
+                echo "FAIL:not a git repo" > "$sync_dir/$i"
+                exit 1
+            fi
+
+            # Create worktree for target branch
+            worktree_dir=$(create_or_find_worktree "$ppath" "$target_branch" "$from_branch" "$pname" 2>/dev/null)
+            if [[ $? -ne 0 ]]; then
+                echo "FAIL:worktree" > "$sync_dir/$i"
+                exit 1
+            fi
+
+            # Perform bidirectional sync (suppress detailed output for parallel)
+            if sync_local_to_session "$volume" "$pname" "$worktree_dir" >/dev/null 2>&1 && \
+               sync_session_to_local "$volume" "$pname" "$worktree_dir" >/dev/null 2>&1; then
+                # Verify
+                local_head=$(git -C "$worktree_dir" rev-parse HEAD 2>/dev/null)
+                session_head=$(docker run --rm -v "$volume:/session:ro" \
+                    ${IMAGE_NAME:-$DEFAULT_IMAGE} sh -c "
+                        git config --global --add safe.directory '*'
+                        cd /session/$pname && git rev-parse HEAD
+                    " 2>/dev/null)
+                if [[ "$local_head" == "$session_head" ]]; then
+                    echo "OK:$local_head" > "$sync_dir/$i"
+                else
+                    echo "FAIL:verify" > "$sync_dir/$i"
+                fi
+            else
+                echo "FAIL:sync" > "$sync_dir/$i"
+            fi
+
+            # Clean up worktree
+            cleanup_worktree "$ppath" "$worktree_dir" "$created_worktree" "$pname" 2>/dev/null
+        ) &
+        sync_pids+=($!)
+    done
+
+    if [[ $projects_to_sync -gt 0 ]]; then
+        info "Syncing $projects_to_sync project(s) in parallel..."
+
+        # Wait for all syncs to complete
+        for pid in "${sync_pids[@]}"; do
+            wait "$pid" 2>/dev/null
+        done
+    fi
+
+    # Collect results
+    local success_count=0
+    local fail_count=0
+
+    echo ""
+    echo "Results:"
+    for i in "${!project_names[@]}"; do
+        local pname="${project_names[$i]}"
+        local status="${project_status[$i]}"
+
+        # Skip projects that weren't synced
+        if [[ "$status" == "SYNCED" ]] || [[ "$status" == "SKIP" ]]; then
             continue
         fi
 
-        # Verify source path is a git repo
-        if ! is_git_repo "$ppath"; then
-            error "Source is not a git repo: $ppath"
-            fail_count=$((fail_count + 1))
-            continue
-        fi
+        local result
+        result=$(cat "$sync_dir/$i" 2>/dev/null || echo "FAIL:unknown")
+        local res_status="${result%%:*}"
+        local res_detail="${result##*:}"
 
-        # Create worktree for target branch
-        local worktree_dir
-        worktree_dir=$(create_or_find_worktree "$ppath" "$target_branch" "$from_branch" "$pname")
-        if [[ $? -ne 0 ]]; then
-            error "Failed to create worktree for $pname"
-            fail_count=$((fail_count + 1))
-            continue
-        fi
-
-        # Perform bidirectional sync
-        info "Syncing $pname..."
-        if merge_session_project "$volume" "$pname" "$worktree_dir" "$git_image"; then
+        if [[ "$res_status" == "OK" ]]; then
+            echo "  [✓] $pname (${res_detail:0:7})"
             success_count=$((success_count + 1))
         else
+            echo "  [✗] $pname ($res_detail)"
             fail_count=$((fail_count + 1))
         fi
-
-        # Clean up temp worktree (branch remains)
-        cleanup_worktree "$ppath" "$worktree_dir" "$created_worktree" "$pname"
     done
+
+    rm -rf "$sync_dir"
 
     echo ""
     if [[ $fail_count -eq 0 ]]; then
