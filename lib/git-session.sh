@@ -235,6 +235,12 @@ create_git_session() {
     local source_dir="$2"
     local volume="claude-session-${name}"
 
+    # Check if source_dir is itself a Docker volume mount (DinD scenario)
+    local source_volume_name=""
+    if [[ -f /proc/self/mountinfo ]]; then
+        source_volume_name=$(grep " $source_dir " /proc/self/mountinfo 2>/dev/null | grep -oP '/var/lib/docker/volumes/\K[^/]+' | head -1 || echo "")
+    fi
+
     # Check for --discover-repos flags (highest priority)
     if [[ ${#DISCOVER_REPOS_DIRS[@]} -gt 0 ]]; then
         local discovered_config
@@ -295,9 +301,19 @@ create_git_session() {
     # Run clone as target UID so files have correct ownership (no chown needed)
     # Use git -c flags instead of --global config (no home dir for arbitrary UID)
     local clone_output
+
+    # Determine the correct mount argument for source
+    local source_mount_arg
+    if [[ -n "$source_volume_name" ]]; then
+        # DinD scenario: mount volume by name
+        source_mount_arg="$source_volume_name:/source:ro"
+    else
+        # Normal scenario: mount directory by path
+        source_mount_arg="$source_dir:/source:ro"
+    fi
     if ! clone_output=$(docker run --rm \
         --user "$host_uid:$host_uid" \
-        -v "$source_dir:/source:ro" \
+        -v "$source_mount_arg" \
         -v "$volume:/session" \
         "$git_image" \
         sh -c "
