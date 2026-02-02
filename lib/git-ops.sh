@@ -469,7 +469,8 @@ sync_local_to_session() {
     [[ -n "$project_name" ]] && session_path="/session/$project_name"
 
     # Mount both local and session, fetch and reset
-    docker run --rm \
+    local output
+    output=$(docker run --rm \
         -v "$volume:/session" \
         -v "$local_path:/local:ro" \
         ${IMAGE_NAME:-$DEFAULT_IMAGE} sh -c "
@@ -487,22 +488,35 @@ sync_local_to_session() {
             SESSION_HEAD=\$(git rev-parse HEAD 2>/dev/null)
 
             if [ \"\$LOCAL_HEAD\" = \"\$SESSION_HEAD\" ]; then
-                echo 'ALREADY_SYNCED'
+                echo 'ALREADY_SYNCED:0'
                 exit 0
             fi
 
-            # Reset session to match local
-            git reset --hard local/$branch
-            echo 'SYNCED'
-        " 2>/dev/null
+            # Count commits to push
+            COUNT=\$(git rev-list --count HEAD..\$LOCAL_HEAD 2>/dev/null || echo 0)
 
-    local result=$?
-    if [[ $result -eq 0 ]]; then
-        return 0
-    else
-        error "Failed to sync local to session"
-        return 1
-    fi
+            # Reset session to match local
+            git reset --hard local/$branch >/dev/null
+            echo \"SYNCED:\$COUNT\"
+        " 2>/dev/null)
+
+    local status="${output%%:*}"
+    local count="${output##*:}"
+
+    case "$status" in
+        ALREADY_SYNCED)
+            # Silent - nothing to do
+            return 0
+            ;;
+        SYNCED)
+            success "Pushed $count commit(s) to session"
+            return 0
+            ;;
+        *)
+            error "Failed to sync local to session"
+            return 1
+            ;;
+    esac
 }
 
 # Sync session changes to local using git fetch
@@ -709,10 +723,8 @@ merge_session_project() {
     local target_path="$3"
     local git_image="$4"  # unused but kept for API compatibility
 
-    local display_name="${project_name:-session}"
-
     # First sync local to session (so session has any local changes)
-    sync_local_to_session "$volume" "$project_name" "$target_path" >/dev/null 2>&1
+    sync_local_to_session "$volume" "$project_name" "$target_path"
 
     # Then sync session to local (pull any session changes)
     sync_session_to_local "$volume" "$project_name" "$target_path"
