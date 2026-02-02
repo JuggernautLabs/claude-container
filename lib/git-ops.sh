@@ -77,6 +77,22 @@ get_total_commits() {
     ' || echo "0"
 }
 
+# Get the tree hash of a session's HEAD
+# Used to compare session state against target branch
+# Arguments:
+#   $1 - volume name
+#   $2 - project_name (empty string for single-project)
+# Returns:
+#   Tree hash string on stdout
+get_session_tree_hash() {
+    local volume="$1"
+    local project_name="$2"
+
+    docker_run_git "$volume" "$project_name" '
+        git rev-parse HEAD^{tree} 2>/dev/null
+    '
+}
+
 # Show session commits with various formatting options
 # Arguments:
 #   $1 - volume: volume name (required)
@@ -420,43 +436,79 @@ cleanup_worktree() {
 }
 
 # Export patches from session volume for a project
+# Compares session against target branch to determine what needs merging:
+#   - If target tree == session HEAD tree: already caught up
+#   - If target tree matches a session ancestor: export patches from that point
+#   - If target tree matches no session commit: diverged, error
 # Arguments:
 #   $1 - volume name
 #   $2 - project name (path within volume, defaults to "" for single-project)
 #   $3 - git image
+#   $4 - target tree hash (from target branch HEAD)
 # Returns:
-#   Prints patch file path to stdout
-#   Returns 0 on success, 1 on failure, 2 if no changes
+#   Prints patch file path to stdout (on success)
+#   Returns 0 on success (patches to apply), 1 on failure, 2 if caught up, 3 if diverged
 export_session_patches() {
     local volume="$1"
     local project_name="$2"
     local git_image="$3"
+    local target_tree="$4"
 
     local patch_file
     patch_file=$(mktemp)
 
-    # Generate patches from container (all commits from initial to HEAD)
-    docker_run_git "$volume" "$project_name" '
-        # Get initial commit and count patches
-        INITIAL=$(git rev-list --max-parents=0 HEAD 2>/dev/null | tail -1)
-        PATCH_COUNT=$(git rev-list --count "$INITIAL..HEAD" 2>/dev/null || echo 0)
+    # Generate patches, comparing against target tree
+    docker_run_git "$volume" "$project_name" "
+        TARGET_TREE='$target_tree'
+        SESSION_HEAD_TREE=\$(git rev-parse HEAD^{tree} 2>/dev/null)
 
-        if [ "$PATCH_COUNT" = "0" ]; then
-            echo "NO_CHANGES:0"
+        # Case 1: Already caught up
+        if [ \"\$SESSION_HEAD_TREE\" = \"\$TARGET_TREE\" ]; then
+            echo 'CAUGHT_UP'
             exit 0
         fi
 
-        echo "PATCHES:$PATCH_COUNT"
-        git format-patch --stdout "$INITIAL..HEAD"
-    ' > "$patch_file"
+        # Case 2: Find where target tree matches in session history
+        # Walk through all commits from HEAD back to initial
+        MERGE_BASE=''
+        for commit in \$(git rev-list HEAD); do
+            commit_tree=\$(git rev-parse \"\$commit^{tree}\" 2>/dev/null)
+            if [ \"\$commit_tree\" = \"\$TARGET_TREE\" ]; then
+                MERGE_BASE=\"\$commit\"
+                break
+            fi
+        done
+
+        # Case 3: Target tree doesn't match any session commit - diverged
+        if [ -z \"\$MERGE_BASE\" ]; then
+            echo 'DIVERGED'
+            exit 0
+        fi
+
+        # Generate patches from merge base to HEAD
+        PATCH_COUNT=\$(git rev-list --count \"\$MERGE_BASE..HEAD\" 2>/dev/null || echo 0)
+
+        if [ \"\$PATCH_COUNT\" = \"0\" ]; then
+            echo 'CAUGHT_UP'
+            exit 0
+        fi
+
+        echo \"PATCHES:\$PATCH_COUNT\"
+        git format-patch --stdout \"\$MERGE_BASE..HEAD\"
+    " > "$patch_file"
 
     # Check first line for status
     local first_line
     first_line=$(head -1 "$patch_file")
 
-    if [[ "$first_line" == "NO_CHANGES:"* ]]; then
+    if [[ "$first_line" == "CAUGHT_UP" ]]; then
         rm -f "$patch_file"
         return 2
+    fi
+
+    if [[ "$first_line" == "DIVERGED" ]]; then
+        rm -f "$patch_file"
+        return 3
     fi
 
     if [[ "$first_line" != "PATCHES:"* ]]; then
@@ -515,14 +567,27 @@ merge_session_project() {
     local display_name="${project_name:-session}"
     info "Merging $display_name to $target_path"
 
-    # Export patches from session
+    # Get target branch tree hash for comparison
+    local target_tree
+    target_tree=$(git -C "$target_path" rev-parse HEAD^{tree} 2>/dev/null)
+    if [[ -z "$target_tree" ]]; then
+        error "  Failed to get target branch tree hash"
+        return 1
+    fi
+
+    # Export patches from session (comparing against target)
     local patch_file
-    patch_file=$(export_session_patches "$volume" "$project_name" "$git_image")
+    patch_file=$(export_session_patches "$volume" "$project_name" "$git_image" "$target_tree")
     local export_result=$?
 
     if [[ $export_result -eq 2 ]]; then
-        echo "  (no new commits)"
+        success "Already caught up"
         return 0
+    elif [[ $export_result -eq 3 ]]; then
+        error "Session and target branch have diverged"
+        echo "  The target branch contains changes not in the session."
+        echo "  This can happen if the branch was modified outside the session."
+        return 1
     elif [[ $export_result -ne 0 ]]; then
         error "  Failed to export patches"
         return 1

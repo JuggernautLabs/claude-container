@@ -9,9 +9,9 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
-info() { echo -e "${BLUE}→${NC} $*"; }
-success() { echo -e "${GREEN}✓${NC} $*"; }
-warn() { echo -e "${YELLOW}⚠${NC} $*"; }
+info() { echo -e "${BLUE}→${NC} $*" >&2; }
+success() { echo -e "${GREEN}✓${NC} $*" >&2; }
+warn() { echo -e "${YELLOW}⚠${NC} $*" >&2; }
 error() { echo -e "${RED}✗${NC} $*" >&2; }
 
 # Check if a directory is a git repository (handles both regular repos and worktrees)
