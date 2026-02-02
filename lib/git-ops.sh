@@ -10,72 +10,6 @@
 #   - CACHE_DIR: directory for caching temporary files
 #   - IMAGE_NAME or DEFAULT_IMAGE: Docker image for git operations
 
-# Direct merge from volume repo to target path
-# This mounts both in a single container and performs the merge directly
-merge_volume_to_target() {
-    local volume="$1"
-    local project_name="$2"
-    local target_path="$3"
-    local git_image="${IMAGE_NAME:-$DEFAULT_IMAGE}"
-
-    info "Merging $project_name from container to $target_path"
-
-    # Create temp file for patches
-    local patch_file
-    patch_file=$(mktemp)
-    trap "rm -f '$patch_file'" RETURN
-
-    # Generate patches from container (all commits from initial to HEAD)
-    local result
-    result=$(docker run --rm \
-        -v "$volume:/session:ro" \
-        --entrypoint sh \
-        "$git_image" \
-        -c '
-            git config --global --add safe.directory "*"
-            cd /session/'"$project_name"'
-
-            # Get initial commit and count patches
-            INITIAL=$(git rev-list --max-parents=0 HEAD 2>/dev/null | tail -1)
-            PATCH_COUNT=$(git rev-list --count "$INITIAL..HEAD" 2>/dev/null || echo 0)
-
-            if [ "$PATCH_COUNT" = "0" ]; then
-                echo "NO_CHANGES:0"
-                exit 0
-            fi
-
-            echo "PATCHES:$PATCH_COUNT"
-            git format-patch --stdout "$INITIAL..HEAD"
-        ' 2>/dev/null > "$patch_file")
-
-    # Check first line for status
-    local first_line
-    first_line=$(head -1 "$patch_file")
-
-    if [[ "$first_line" == "NO_CHANGES:"* ]]; then
-        echo "  (no new commits)"
-        return 0
-    fi
-
-    if [[ "$first_line" != "PATCHES:"* ]]; then
-        error "  Unexpected response from container"
-        return 1
-    fi
-
-    local patch_count="${first_line#PATCHES:}"
-    info "  Applying $patch_count patch(es)..."
-
-    # Remove the status line and apply patches
-    cd "$target_path"
-    if tail -n +2 "$patch_file" | git am --3way; then
-        success "  Merged $patch_count commit(s)"
-        return 0
-    else
-        error "  Merge failed - resolve conflicts and run: git am --continue"
-        return 1
-    fi
-}
-
 # Get session project status (commits pending merge)
 get_session_status() {
     local volume="$1"
@@ -326,6 +260,205 @@ diff_multi_project_session() {
     echo "Tip: Use --diff-session $name <project-name> to see detailed changes for a specific project"
 }
 
+# Create or find a worktree for the target branch
+# Arguments:
+#   $1 - target directory (main repo path)
+#   $2 - target branch name
+#   $3 - from branch (for new branches)
+#   $4 - project name (for temp worktree naming)
+# Returns:
+#   Prints the worktree path to stdout
+#   Returns 0 on success, 1 on failure
+# Sets global variable:
+#   created_worktree=true if a new temp worktree was created
+create_or_find_worktree() {
+    local target_dir="$1"
+    local target_branch="$2"
+    local from_branch="$3"
+    local project_name="$4"
+
+    local worktree_dir="$CACHE_DIR/worktree-$$-${project_name//\//-}"
+    local existing_worktree=""
+    created_worktree=false
+
+    # Check if branch already has a worktree
+    existing_worktree=$(cd "$target_dir" && git worktree list --porcelain 2>/dev/null | grep -A2 "^worktree " | grep -B2 "branch refs/heads/$target_branch" | head -1 | sed 's/worktree //' || true)
+
+    if [[ -n "$existing_worktree" && -d "$existing_worktree" ]]; then
+        # Use existing worktree for this branch
+        info "Using existing worktree: $existing_worktree (branch: $target_branch)"
+        echo "$existing_worktree"
+        return 0
+    elif (cd "$target_dir" && git show-ref --verify --quiet "refs/heads/$target_branch" 2>/dev/null); then
+        # Branch exists but no worktree - create temp worktree for it
+        info "Creating temp worktree for existing branch: $target_branch"
+        mkdir -p "$worktree_dir"
+        if ! (cd "$target_dir" && git worktree add "$worktree_dir" "$target_branch" 2>/dev/null); then
+            error "Failed to create worktree"
+            return 1
+        fi
+        created_worktree=true
+        echo "$worktree_dir"
+        return 0
+    else
+        # Branch doesn't exist - create new branch from from_branch in temp worktree
+        info "Creating branch '$target_branch' from $from_branch in temp worktree"
+        mkdir -p "$worktree_dir"
+        if ! (cd "$target_dir" && git worktree add "$worktree_dir" -b "$target_branch" "$from_branch" 2>/dev/null); then
+            error "Failed to create worktree (branch '$from_branch' may not exist)"
+            rm -rf "$worktree_dir"
+            return 1
+        fi
+        created_worktree=true
+        echo "$worktree_dir"
+        return 0
+    fi
+}
+
+# Clean up a worktree created by create_or_find_worktree
+# Arguments:
+#   $1 - target directory (main repo path)
+#   $2 - worktree directory
+#   $3 - created_worktree flag (true/false)
+#   $4 - project name (for logging)
+cleanup_worktree() {
+    local target_dir="$1"
+    local worktree_dir="$2"
+    local was_created="$3"
+    local project_name="$4"
+
+    if [[ "$was_created" == "true" ]]; then
+        info "Cleaning up temp worktree for $project_name"
+        (cd "$target_dir" && git worktree remove "$worktree_dir" 2>/dev/null) || rm -rf "$worktree_dir"
+    fi
+}
+
+# Export patches from session volume for a project
+# Arguments:
+#   $1 - volume name
+#   $2 - project name (path within volume, defaults to "" for single-project)
+#   $3 - git image
+# Returns:
+#   Prints patch file path to stdout
+#   Returns 0 on success, 1 on failure, 2 if no changes
+export_session_patches() {
+    local volume="$1"
+    local project_name="$2"
+    local git_image="$3"
+
+    local patch_file
+    patch_file=$(mktemp)
+
+    # Generate patches from container (all commits from initial to HEAD)
+    local project_path="${project_name:+/$project_name}"
+    docker run --rm \
+        -v "$volume:/session:ro" \
+        --entrypoint sh \
+        "$git_image" \
+        -c "
+            git config --global --add safe.directory '*'
+            cd /session$project_path
+
+            # Get initial commit and count patches
+            INITIAL=\$(git rev-list --max-parents=0 HEAD 2>/dev/null | tail -1)
+            PATCH_COUNT=\$(git rev-list --count \"\$INITIAL..HEAD\" 2>/dev/null || echo 0)
+
+            if [ \"\$PATCH_COUNT\" = \"0\" ]; then
+                echo \"NO_CHANGES:0\"
+                exit 0
+            fi
+
+            echo \"PATCHES:\$PATCH_COUNT\"
+            git format-patch --stdout \"\$INITIAL..HEAD\"
+        " 2>/dev/null > "$patch_file"
+
+    # Check first line for status
+    local first_line
+    first_line=$(head -1 "$patch_file")
+
+    if [[ "$first_line" == "NO_CHANGES:"* ]]; then
+        rm -f "$patch_file"
+        return 2
+    fi
+
+    if [[ "$first_line" != "PATCHES:"* ]]; then
+        error "Unexpected response from container"
+        rm -f "$patch_file"
+        return 1
+    fi
+
+    echo "$patch_file"
+    return 0
+}
+
+# Apply patches to a worktree using git am
+# Arguments:
+#   $1 - patch file path
+#   $2 - worktree directory (where to apply patches)
+# Returns:
+#   0 on success, 1 on failure
+apply_patches() {
+    local patch_file="$1"
+    local worktree_dir="$2"
+
+    # Extract patch count from first line
+    local first_line
+    first_line=$(head -1 "$patch_file")
+    local patch_count="${first_line#PATCHES:}"
+
+    info "Applying $patch_count patch(es)..."
+
+    # Remove the status line and apply patches
+    cd "$worktree_dir"
+    if tail -n +2 "$patch_file" | git am --3way; then
+        success "Merged $patch_count commit(s)"
+        return 0
+    else
+        error "Merge failed - resolve conflicts and run: git am --continue"
+        return 1
+    fi
+}
+
+# Merge a single project from session volume to target directory
+# This is the core merge logic shared by both single and multi-project merges
+# Arguments:
+#   $1 - volume name
+#   $2 - project name (empty string for single-project sessions)
+#   $3 - target directory (repo path or worktree path)
+#   $4 - git image
+# Returns:
+#   0 on success, 1 on failure
+merge_session_project() {
+    local volume="$1"
+    local project_name="$2"
+    local target_path="$3"
+    local git_image="$4"
+
+    local display_name="${project_name:-session}"
+    info "Merging $display_name to $target_path"
+
+    # Export patches from session
+    local patch_file
+    patch_file=$(export_session_patches "$volume" "$project_name" "$git_image")
+    local export_result=$?
+
+    if [[ $export_result -eq 2 ]]; then
+        echo "  (no new commits)"
+        return 0
+    elif [[ $export_result -ne 0 ]]; then
+        error "  Failed to export patches"
+        return 1
+    fi
+
+    # Apply patches to target
+    trap "rm -f '$patch_file'" RETURN
+    if apply_patches "$patch_file" "$target_path"; then
+        return 0
+    else
+        return 1
+    fi
+}
+
 # Show diff between git session and original repo
 diff_git_session() {
     local name="$1"
@@ -558,53 +691,23 @@ ${host_projects}"
         fi
 
         # Create worktree for target branch
-        local merge_branch="$target_branch"
-        local worktree_dir="$CACHE_DIR/worktree-$$-${pname//\//-}"
-        local existing_worktree=""
-        local created_worktree=false
-
-        # Check if branch already has a worktree
-        existing_worktree=$(cd "$ppath" && git worktree list --porcelain 2>/dev/null | grep -A2 "^worktree " | grep -B2 "branch refs/heads/$merge_branch" | head -1 | sed 's/worktree //' || true)
-
-        if [[ -n "$existing_worktree" && -d "$existing_worktree" ]]; then
-            # Use existing worktree for this branch
-            info "Using existing worktree: $existing_worktree (branch: $merge_branch)"
-            worktree_dir="$existing_worktree"
-        elif (cd "$ppath" && git show-ref --verify --quiet "refs/heads/$merge_branch" 2>/dev/null); then
-            # Branch exists but no worktree - create temp worktree for it
-            info "Creating temp worktree for existing branch: $merge_branch"
-            mkdir -p "$worktree_dir"
-            if ! (cd "$ppath" && git worktree add "$worktree_dir" "$merge_branch" 2>/dev/null); then
-                error "Failed to create worktree for $pname"
-                fail_count=$((fail_count + 1))
-                continue
-            fi
-            created_worktree=true
-        else
-            # Branch doesn't exist - create new branch from from_branch in temp worktree
-            info "Creating branch '$merge_branch' from $from_branch in temp worktree"
-            mkdir -p "$worktree_dir"
-            if ! (cd "$ppath" && git worktree add "$worktree_dir" -b "$merge_branch" "$from_branch" 2>/dev/null); then
-                error "Failed to create worktree for $pname (branch '$from_branch' may not exist)"
-                rm -rf "$worktree_dir"
-                fail_count=$((fail_count + 1))
-                continue
-            fi
-            created_worktree=true
+        local worktree_dir
+        worktree_dir=$(create_or_find_worktree "$ppath" "$target_branch" "$from_branch" "$pname")
+        if [[ $? -ne 0 ]]; then
+            error "Failed to create worktree for $pname"
+            fail_count=$((fail_count + 1))
+            continue
         fi
 
         # Perform the merge in the worktree
-        if merge_volume_to_target "$volume" "$pname" "$worktree_dir"; then
+        if merge_session_project "$volume" "$pname" "$worktree_dir" "$git_image"; then
             success_count=$((success_count + 1))
         else
             fail_count=$((fail_count + 1))
         fi
 
         # Clean up temp worktree (branch remains)
-        if $created_worktree; then
-            info "Cleaning up temp worktree for $pname"
-            (cd "$ppath" && git worktree remove "$worktree_dir" 2>/dev/null) || rm -rf "$worktree_dir"
-        fi
+        cleanup_worktree "$ppath" "$worktree_dir" "$created_worktree" "$pname"
     done
 
     echo ""
@@ -665,38 +768,10 @@ merge_git_session() {
     fi
 
     # Use worktree approach to avoid conflicts with uncommitted changes
-    local worktree_dir="$CACHE_DIR/worktree-$$-${repo_name}"
-    local merge_path=""
-    local created_worktree=false
-
-    # Check if branch already has a worktree
-    local existing_worktree=""
-    existing_worktree=$(cd "$target_dir" && git worktree list --porcelain 2>/dev/null | grep -A2 "^worktree " | grep -B2 "branch refs/heads/$target_branch" | head -1 | sed 's/worktree //' || true)
-
-    if [[ -n "$existing_worktree" && -d "$existing_worktree" ]]; then
-        info "Using existing worktree: $existing_worktree"
-        merge_path="$existing_worktree"
-    elif (cd "$target_dir" && git show-ref --verify --quiet "refs/heads/$target_branch" 2>/dev/null); then
-        # Branch exists but no worktree - create temp worktree
-        info "Creating temp worktree for existing branch: $target_branch"
-        mkdir -p "$worktree_dir"
-        if ! (cd "$target_dir" && git worktree add "$worktree_dir" "$target_branch" 2>/dev/null); then
-            error "Failed to create worktree"
-            exit 1
-        fi
-        merge_path="$worktree_dir"
-        created_worktree=true
-    else
-        # Branch doesn't exist - create from from_branch in temp worktree
-        info "Creating branch '$target_branch' from $from_branch in temp worktree"
-        mkdir -p "$worktree_dir"
-        if ! (cd "$target_dir" && git worktree add "$worktree_dir" -b "$target_branch" "$from_branch" 2>/dev/null); then
-            error "Failed to create worktree (branch '$from_branch' may not exist)"
-            rm -rf "$worktree_dir"
-            exit 1
-        fi
-        merge_path="$worktree_dir"
-        created_worktree=true
+    local merge_path
+    merge_path=$(create_or_find_worktree "$target_dir" "$target_branch" "$from_branch" "$repo_name")
+    if [[ $? -ne 0 ]]; then
+        exit 1
     fi
     echo ""
 
@@ -732,68 +807,15 @@ merge_git_session() {
 
     case "$choice" in
         y|Y)
-            info "Exporting and applying patches..."
-
-            # Create temp directory for patches
-            # Use Docker-accessible path (mktemp -d creates /var/folders/... on macOS which Docker can't mount)
-            local patch_cache="$CACHE_DIR"
-            mkdir -p "$patch_cache"
-            local patch_dir="$patch_cache/merge-$$-$(date +%s)"
-            mkdir -p "$patch_dir"
-            trap "rm -rf $patch_dir" RETURN
-
-            # Export patches from session (all commits from initial commit)
-            docker run --rm \
-                -v "$volume:/session:ro" \
-                -v "$patch_dir:/patches" \
-                "$git_image" \
-                sh -c '
-                    git config --global --add safe.directory "*"
-                    cd /session
-                    initial=$(git rev-list --max-parents=0 HEAD 2>/dev/null | tail -1)
-                    git format-patch -o /patches "$initial"..HEAD 2>/dev/null
-                '
-
-            # Apply patches to worktree
-            cd "$merge_path"
-            local patch_count
-            patch_count=$(ls -1 "$patch_dir"/*.patch 2>/dev/null | wc -l | tr -d ' ')
-
-            if [[ "$patch_count" -eq 0 ]]; then
-                warn "No patches to apply"
+            # Use shared merge function (empty project name for single-project)
+            if merge_session_project "$volume" "" "$merge_path" "$git_image"; then
+                success "Successfully merged to branch '$target_branch'"
                 # Clean up worktree if we created it
-                if $created_worktree; then
-                    (cd "$target_dir" && git worktree remove "$worktree_dir" 2>/dev/null) || rm -rf "$worktree_dir"
-                fi
-                return 0
-            fi
-
-            local apply_failed=false
-            for patch in "$patch_dir"/*.patch; do
-                if git am "$patch"; then
-                    success "Applied: $(basename "$patch")"
-                else
-                    error "Failed to apply: $(basename "$patch")"
-                    echo "Resolve conflicts in: $merge_path"
-                    echo "Then run: git am --continue"
-                    echo "Or skip: git am --skip"
-                    apply_failed=true
-                    break
-                fi
-            done
-
-            if $apply_failed; then
+                cleanup_worktree "$target_dir" "$merge_path" "$created_worktree" "$repo_name"
+            else
                 # Don't clean up worktree on failure - user needs to resolve
                 warn "Worktree preserved for conflict resolution: $merge_path"
                 return 1
-            fi
-
-            success "Successfully merged $patch_count commit(s) to branch '$target_branch'"
-
-            # Clean up worktree if we created it
-            if $created_worktree; then
-                info "Cleaning up temp worktree"
-                (cd "$target_dir" && git worktree remove "$worktree_dir" 2>/dev/null) || rm -rf "$worktree_dir"
             fi
 
             # In auto mode, don't prompt to delete (preserve session for --continue)
@@ -808,25 +830,16 @@ merge_git_session() {
             ;;
         n|N)
             echo "Cancelled"
-            # Clean up worktree if we created it
-            if $created_worktree; then
-                (cd "$target_dir" && git worktree remove "$worktree_dir" 2>/dev/null) || rm -rf "$worktree_dir"
-            fi
+            cleanup_worktree "$target_dir" "$merge_path" "$created_worktree" "$repo_name"
             ;;
         select|s|S)
             warn "Interactive selection not yet implemented"
             echo "Use 'git cherry-pick' manually after inspecting the session"
-            # Clean up worktree if we created it
-            if $created_worktree; then
-                (cd "$target_dir" && git worktree remove "$worktree_dir" 2>/dev/null) || rm -rf "$worktree_dir"
-            fi
+            cleanup_worktree "$target_dir" "$merge_path" "$created_worktree" "$repo_name"
             ;;
         *)
             echo "Invalid choice"
-            # Clean up worktree if we created it
-            if $created_worktree; then
-                (cd "$target_dir" && git worktree remove "$worktree_dir" 2>/dev/null) || rm -rf "$worktree_dir"
-            fi
+            cleanup_worktree "$target_dir" "$merge_path" "$created_worktree" "$repo_name"
             ;;
     esac
 }
