@@ -1076,6 +1076,8 @@ gh pr create
 
 Claude Code can help you configure and launch container sessions through an interactive skill. This provides a guided setup experience where Claude asks questions about your session needs, validates the configuration, and outputs the command to run.
 
+**Note:** This skill now works from within Claude Code sessions that have Docker socket access (Docker-in-Docker). The tool automatically detects volume-based mounts and handles them correctly.
+
 ### How It Works
 
 1. **Inside Claude Code**: Run the `/container-setup` skill (or ask Claude to set up a container session)
@@ -1130,6 +1132,39 @@ Since `--no-run` already clones all repos and sets up the session, the final com
 
 # Both sessions will have access to the same Claude conversation history
 ```
+
+## Docker-in-Docker Support
+
+You can run `claude-container` from within a Docker container that has Docker socket access (Docker-in-Docker). This is useful for:
+
+- Running `claude-container` from within a Claude Code session
+- Testing or developing `claude-container` itself in an isolated environment
+- Using `claude-container` in CI/CD pipelines
+
+**Requirements:**
+- The parent container must have the Docker socket mounted (`-v /var/run/docker.sock:/var/run/docker.sock`)
+- The source repository must be accessible to the Docker daemon (either a host path or a Docker volume)
+
+**How it works:**
+
+When you run `claude-container` from inside a container, it automatically detects if the current directory is mounted from a Docker volume. If so, it uses the volume name instead of the directory path when creating child containers, ensuring proper access.
+
+**Example from within a Claude Code session:**
+
+```bash
+# You're already inside a Claude Code container with Docker access
+cd /workspace  # Your project (a Docker volume)
+
+# Create a nested session - this works automatically
+./claude-container -s feature-branch --no-run
+
+# The session is created using volume-based mounting
+# Session ready: feature-branch
+```
+
+**Detection:**
+
+The tool checks `/proc/self/mountinfo` to detect if the source directory is a Docker volume mount. If detected, it automatically switches from path-based mounting (`-v /path:/source`) to volume-based mounting (`-v volume-name:/source`).
 
 ## Using a Custom Dockerfile
 
@@ -1215,6 +1250,32 @@ docker ps
 - **Git remotes**: Stripped from cloned repos (Claude can't push)
 - **Rootish mode**: Non-root user with passwordless sudo for package installs
 - **Isolation**: Changes stay in volumes until explicitly merged
+
+## Architecture
+
+`claude-container` uses a modular architecture with reusable library modules:
+
+**Core Modules:**
+- `lib/utils.sh` - Logging, output formatting, platform detection
+- `lib/config.sh` - YAML parsing, project configuration, iteration utilities
+- `lib/docker-utils.sh` - Docker operation wrappers and batch operations
+- `lib/git-ops.sh` - Git session diff and merge operations
+- `lib/git-session.sh` - Session creation and repository cloning
+- `lib/session-mgmt.sh` - Session lifecycle management (list, delete, restart)
+- `lib/auth.sh` - OAuth token management and verification
+- `lib/container-detect.sh` - Container environment detection
+
+**Key Features:**
+- **DRY Principles**: Consolidated 18+ duplicate Docker operations into reusable utilities
+- **Multi-Project Support**: Handles both single-repo and multi-repo configurations
+- **Docker-in-Docker**: Automatic volume detection for nested container scenarios
+- **Extensible**: Modular design allows easy addition of new features
+
+**Recent Improvements:**
+- Refactored to eliminate 82 lines of duplicate code
+- Added comprehensive utility functions for common operations
+- Improved error handling and validation throughout
+- Full Docker-in-Docker support for nested environments
 
 ## License
 
