@@ -12,8 +12,8 @@
 #   - IMAGE_NAME or DEFAULT_IMAGE: Docker image for git operations
 
 # Source docker utilities
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "$SCRIPT_DIR/docker-utils.sh"
+_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$_LIB_DIR/docker-utils.sh"
 
 # Show diff between session and source repository
 # Arguments:
