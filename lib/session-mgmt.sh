@@ -629,20 +629,40 @@ session_extract() {
         fi
     fi
 
-    info "Extracting session '$session_name' to worktree..."
-    info "Destination: $worktree_dir"
-
     # Create worktree directory
     mkdir -p "$worktree_dir"
 
     local git_image="${IMAGE_NAME:-$DEFAULT_IMAGE}"
 
+    # Get session size for progress display
+    local session_size
+    session_size=$(docker run --rm -v "$volume:/session:ro" "$git_image" \
+        du -sb /session 2>/dev/null | cut -f1)
+    local session_size_human
+    session_size_human=$(docker run --rm -v "$volume:/session:ro" "$git_image" \
+        du -sh /session 2>/dev/null | cut -f1)
+
+    info "Extracting session '$session_name' ($session_size_human)..."
+    info "Destination: $worktree_dir"
+
     # Extract using tar pipe (faster than cp -r through Docker VM)
-    # tar streams directly from container to host, avoiding double filesystem crossing
-    if ! docker run --rm \
-        -v "$volume:/session:ro" \
-        "$git_image" \
-        tar -C /session -cf - . 2>/dev/null | tar -C "$worktree_dir" -xf -; then
+    # Use pv for progress if available, otherwise just stream
+    local extract_status
+    if command -v pv &>/dev/null && [[ -n "$session_size" ]]; then
+        docker run --rm \
+            -v "$volume:/session:ro" \
+            "$git_image" \
+            tar -C /session -cf - . 2>/dev/null | pv -s "$session_size" | tar -C "$worktree_dir" -xf -
+        extract_status=$?
+    else
+        docker run --rm \
+            -v "$volume:/session:ro" \
+            "$git_image" \
+            tar -C /session -cf - . 2>/dev/null | tar -C "$worktree_dir" -xf -
+        extract_status=$?
+    fi
+
+    if [[ $extract_status -ne 0 ]]; then
         error "Failed to extract session"
         rm -rf "$worktree_dir" 2>/dev/null || true
         return 1
