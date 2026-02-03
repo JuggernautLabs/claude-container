@@ -545,6 +545,7 @@ sync_session_to_local() {
     [[ -n "$project_name" ]] && session_path="/session/$project_name"
 
     info "Syncing session → local ($branch)..."
+    echo "DEBUG: Using commit-based sync (fix applied)" >&2
 
     # Mount both session and local, fetch from session and merge
     local output
@@ -565,11 +566,17 @@ sync_session_to_local() {
             SESSION_HEAD=\$(git rev-parse FETCH_HEAD 2>/dev/null)
             LOCAL_HEAD=\$(git rev-parse HEAD 2>/dev/null)
 
+            # DEBUG: Output commit hashes to stderr so they're visible
+            echo \"DEBUG: SESSION_HEAD=\$SESSION_HEAD\" >&2
+            echo \"DEBUG: LOCAL_HEAD=\$LOCAL_HEAD\" >&2
+
             # Same commit = already synced
             if [ \"\$SESSION_HEAD\" = \"\$LOCAL_HEAD\" ]; then
+                echo \"DEBUG: Commits match - already synced\" >&2
                 echo 'ALREADY_SYNCED:0'
                 exit 0
             fi
+            echo \"DEBUG: Commits differ - need to sync\" >&2
 
             # Check if local is ancestor of session (can fast-forward)
             if git merge-base --is-ancestor HEAD FETCH_HEAD 2>/dev/null; then
@@ -595,7 +602,7 @@ sync_session_to_local() {
                 echo 'CONFLICT:0'
                 exit 1
             fi
-        " 2>/dev/null)
+        ")
 
     local result=$?
     local status="${output%%:*}"
