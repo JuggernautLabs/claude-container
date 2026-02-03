@@ -906,9 +906,9 @@ session_extract() {
         -v "$worktree_dir:/dest" \
         "$git_image" \
         sh -c "
-            # Copy everything except the .git directory metadata that might be stale
+            # Copy everything (use cp -r to avoid ownership preservation warnings)
             cd /session
-            cp -a . /dest/
+            cp -r . /dest/
 
             # Ensure git repo is in good state
             cd /dest

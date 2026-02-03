@@ -826,23 +826,12 @@ WRAPPER
     fi
 '
 
-# Session exit: remind user to extract changes if needed
-if $USE_GIT_SESSION && [[ -z "$AUTO_SYNC_BRANCH" ]]; then
+# Session exit: automatically extract changes
+if $USE_GIT_SESSION; then
     echo ""
     info "Session complete: $SESSION_NAME"
     echo ""
-    echo "To review and merge changes:"
-    echo "  claude-container --extract-session $SESSION_NAME"
-    echo ""
-fi
 
-# Legacy auto-sync if explicitly requested via --auto-sync flag
-if $USE_GIT_SESSION && [[ -n "$AUTO_SYNC_BRANCH" ]]; then
-    merge_branch="$AUTO_SYNC_BRANCH"
-    echo ""
-    warn "Auto-sync is deprecated - use --extract-session instead"
-    info "Attempting legacy merge to branch: $merge_branch"
-    "$0" --merge-session "$SESSION_NAME" --into "$merge_branch" --yes || {
-        warn "Merge failed - use: claude-container --extract-session $SESSION_NAME"
-    }
+    # Auto-extract session to worktree
+    "$0" --extract-session "$SESSION_NAME" --force
 fi
