@@ -235,22 +235,31 @@ def5678 Add unit tests for auth
 
 ## Merging Changes Back
 
+The merge system uses git-native sync operations that:
+- Preserve exact commit hashes (identical on both sides)
+- Support bidirectional sync (local ↔ session)
+- Automatically detect and handle diverged states
+- Verify sync completed successfully
+
 ### Merge All Commits
 
 ```bash
 ./claude-container --merge-session feature-name
 ```
 
-Interactive prompt:
+The system first checks the sync status:
 ```
-=== Commits to merge ===
-abc1234 Refactor authentication module
-def5678 Add unit tests for auth
+=== Merging session: feature-name ===
 
-Merge all commits? [y/n/select] y
-Applied: 0001-Refactor-authentication-module.patch
-Applied: 0002-Add-unit-tests-for-auth.patch
-Successfully merged 2 commit(s)
+Status: Session ahead by 2 commit(s)
+  abc1234 Refactor authentication module
+  def5678 Add unit tests for auth
+
+Merge? [y/n] y
+
+↓ Merging session changes to local...
+✓ Verified: local and session match
+✓ Synced successfully
 
 Delete session 'feature-name'? [y/n]
 ```
@@ -572,36 +581,40 @@ Output:
 ```
 === Merging multi-project session: feature-name ===
 
-Projects to merge:
-  [x] frontend (2 commits)
-  [x] backend (1 commit)
-  [x] shared (1 commit)
-  [ ] mobile (0 commits - skipped)
+Projects:
+  [↓] frontend (2 commit(s) to pull from session)
+  [↓] backend (1 commit(s) to pull from session)
+  [↓] shared (1 commit(s) to pull from session)
+  [✓] mobile (synced)
 
-Merge all selected? [y/n/select] y
+Merge? [y/n] y
 
-→ Merging project: frontend
-  Applied: 0001-Add-login-form.patch
-  Applied: 0002-Update-styles.patch
-✓ Merged 2 commit(s) to frontend
+→ Syncing project: frontend
+  ↓ Merging session changes to local...
+  ✓ Verified: local and session match
+✓ frontend synced
 
-→ Merging project: backend
-  Applied: 0001-Add-auth-endpoint.patch
-✓ Merged 1 commit(s) to backend
+→ Syncing project: backend
+  ↓ Merging session changes to local...
+  ✓ Verified: local and session match
+✓ backend synced
 
-→ Merging project: shared
-  Applied: 0001-Add-User-type.patch
-✓ Merged 1 commit(s) to shared
+→ Syncing project: shared
+  ↓ Merging session changes to local...
+  ✓ Verified: local and session match
+✓ shared synced
 
-✓ Successfully merged all projects (3 projects)
+✓ All projects synced successfully
 
 Delete session 'feature-name'? [y/n]
 ```
 
-**Auto-merge** (merge all projects with commits, no prompts):
+**Auto-merge** (sync all projects automatically, no prompts):
 ```bash
-./claude-container --merge-session feature-name --auto
+./claude-container --merge-session feature-name --yes
 ```
+
+This skips interactive prompts and syncs all projects that need it.
 
 **Merge to specific branch** (creates/switches branch in each project):
 ```bash
@@ -613,43 +626,68 @@ This will:
 - Apply commits to that branch
 - Leave you ready to review and push
 
-**Selective merge** (just one project):
-```bash
-# First, copy patches manually
-./claude-container-cp feature-name:/workspace/frontend/.git/patches ./frontend-patches
+**Selective sync** (just one project):
 
-# Then apply manually in your source repo
+The merge command syncs all projects by default. To manually sync a single project:
+```bash
+# Run bash inside the session to fetch from session volume
+./claude-container -s feature-name --bash-exec "cd /workspace/frontend && git log --oneline -5"
+
+# Or cherry-pick specific commits from session to local
 cd ~/dev/frontend
-git am ./frontend-patches/*.patch
+git fetch /path/to/session/volume/frontend
+git cherry-pick <commit-hash>
 ```
 
 ### Merge Behavior
 
+**Smart Sync System:**
+
+The merge system uses git-native operations (fetch/merge/reset) rather than patches, providing:
+- **Same commit hashes** - commits are identical on both sides after sync
+- **Bidirectional sync** - push local changes to session, then pull session changes back
+- **Automatic verification** - confirms both sides match after sync
+- **Parallel execution** - multi-project syncs run concurrently for speed
+
+**Status Detection:**
+
+Before syncing, the system compares git tree hashes to determine the relationship:
+
+| Status | Indicator | Meaning |
+|--------|-----------|---------|
+| Synced | `[✓]` | Local and session are identical |
+| Session Ahead | `[↓]` | Session has commits to pull (N commit(s) to pull) |
+| Local Ahead | `[↑]` | Local has commits to push (N commit(s) to push) |
+| Diverged | `[!]` | Both sides have different commits (needs sync) |
+| New Repo | `[+]` | Session has new repo not in local (will extract) |
+
+**Sync Process:**
+
+1. **Check status** - Compare trees to detect which side is ahead
+2. **Push local → session** - If local is ahead, push changes to session first
+3. **Merge session → local** - Pull session changes into local repository
+4. **Verify** - Confirm both HEADs match after sync
+
 **Per-project merging:**
-- Each project is merged independently to its source repository
-- Projects without commits are automatically skipped
-- Merge uses `git format-patch` and `git am` (preserves commit metadata)
+- Each project is synced independently to its source repository
+- Projects that are already synced are skipped
+- Uses git fetch/merge for clean operations
 - If a merge fails in one project, others continue
 - Failed merges show instructions for manual resolution
 
-**Conflict resolution:**
-```
-→ Merging project: frontend
-  Applied: 0001-Add-login-form.patch
-  Failed to apply: 0002-Update-styles.patch
-  Run 'git am --abort' to cancel in: /Users/you/dev/frontend
+**Handling diverged state:**
 
-✗ Merge completed with errors (1 succeeded, 1 failed)
+When local and session have diverged (both have unique commits):
+```
+[!] frontend (diverged - needs sync)
+
+→ Syncing project: frontend
+  ↑ Pushing local changes to session...
+  ↓ Merging session changes to local...
+  ✓ Verified: local and session match
 ```
 
-To resolve:
-```bash
-cd ~/dev/frontend
-git am --show-current-patch    # See what failed
-# Fix conflicts manually
-git add .
-git am --continue
-```
+The sync pushes local changes first, then merges session changes back, preserving all work from both sides.
 
 ### Requirements and Validation
 
@@ -872,13 +910,19 @@ done
 ```
 
 **Merge conflicts:**
+
+If a merge fails due to conflicts:
 ```bash
-# Per-project conflict resolution
 cd ~/dev/frontend
-git am --show-current-patch
-# Fix conflicts
+git status                    # See conflicting files
+# Edit files to resolve conflicts
 git add .
-git am --continue
+git commit -m "Resolve merge conflicts"
+```
+
+If you need to abort a failed merge:
+```bash
+git merge --abort
 ```
 
 **Want to exclude a project temporarily:**
@@ -906,7 +950,7 @@ projects:
 **Current limits:**
 - No hard limit on number of projects (tested with 10+)
 - Each project is cloned independently (disk space scales linearly)
-- Merge is sequential (not parallel)
+- Sync operations run in parallel for multi-project sessions
 
 ### Single vs Multi-Project Mode
 
@@ -1259,7 +1303,7 @@ docker ps
 - `lib/utils.sh` - Logging, output formatting, platform detection
 - `lib/config.sh` - YAML parsing, project configuration, iteration utilities
 - `lib/docker-utils.sh` - Docker operation wrappers and batch operations
-- `lib/git-ops.sh` - Git session diff and merge operations
+- `lib/git-ops.sh` - Git sync system: bidirectional fetch/merge, tree comparison, verification
 - `lib/git-session.sh` - Session creation and repository cloning
 - `lib/session-mgmt.sh` - Session lifecycle management (list, delete, restart)
 - `lib/auth.sh` - OAuth token management and verification
@@ -1272,9 +1316,11 @@ docker ps
 - **Extensible**: Modular design allows easy addition of new features
 
 **Recent Improvements:**
-- Refactored to eliminate 82 lines of duplicate code
-- Added comprehensive utility functions for common operations
-- Improved error handling and validation throughout
+- Git-native sync system using fetch/merge instead of patches (preserves commit hashes)
+- Bidirectional sync: push local changes to session, pull session changes to local
+- Smart status detection using git tree hash comparison
+- Parallel multi-project sync with live status output
+- Built-in sync verification to confirm both sides match
 - Full Docker-in-Docker support for nested environments
 
 ## License
