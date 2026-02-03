@@ -11,7 +11,7 @@
 #   - session_list: List all sessions with disk usage
 #   - session_delete: Delete a specific session and its volumes
 #   - session_restart: Restart a session with permission fixes
-#   - session_extract: Extract session to worktree for manual merge
+#   - session_extract: Extract session changes as branches in original repos
 #   - session_import: Import a claude session into container
 
 # Source docker-utils.sh if not already sourced
@@ -502,10 +502,10 @@ session_import() {
         echo ""
         echo "Examples:"
         echo "  # Import from local claude session"
-        echo "  claude-container --import-session ~/.claude my-session"
+        echo "  claude-container -s my-session --import ~/.claude"
         echo ""
         echo "  # Import from backup directory"
-        echo "  claude-container --import-session /backups/claude-session-2024 my-session"
+        echo "  claude-container -s my-session --import /backups/claude-session"
         return 1
     fi
 
@@ -586,7 +586,7 @@ session_import() {
     echo "  claude-container -s $session_name --continue"
 }
 
-# Extract session to a worktree (one-way copy)
+# Extract session changes as branches in original repos
 # Usage: session_extract <session_name> [--force]
 session_extract() {
     local session_name="$1"
