@@ -71,8 +71,8 @@ ln -s $(pwd)/claude-container-cp /usr/local/bin/
 - Docker (Docker Desktop, Colima, or native Docker)
 - A Claude Code OAuth token (set `CLAUDE_CODE_OAUTH_TOKEN`)
 
-**Required for multi-project sessions** (one of):
-- `yq` (YAML processor) - recommended
+**Required for multi-project sessions:**
+- `yq` (YAML processor)
   ```bash
   # macOS
   brew install yq
@@ -81,10 +81,6 @@ ln -s $(pwd)/claude-container-cp /usr/local/bin/
   sudo apt-get install yq
 
   # Other: https://github.com/mikefarah/yq#install
-  ```
-- OR `python3` with PyYAML:
-  ```bash
-  pip3 install pyyaml
   ```
 
 **Optional (recommended):**
@@ -832,19 +828,13 @@ ls -la .claude-projects.yml
 ```bash
 # Validate YAML syntax
 yq eval .claude-projects.yml
-
-# Or with Python
-python3 -c "import yaml; yaml.safe_load(open('.claude-projects.yml'))"
 ```
 
 **"No YAML parser found" error:**
 ```bash
-# Install yq (recommended)
+# Install yq
 brew install yq  # macOS
 sudo apt-get install yq  # Ubuntu/Debian
-
-# Or install PyYAML
-pip3 install pyyaml
 ```
 
 **Projects not cloning:**

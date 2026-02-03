@@ -13,24 +13,16 @@
 # Optional globals:
 #   - CONFIG_FILE: path to config file (set via --config flag)
 
-# Check if YAML parser is available (yq or python3 with yaml)
+# Check if YAML parser is available (yq)
 check_yaml_parser_available() {
-    if command -v yq &>/dev/null; then
-        return 0
-    elif command -v python3 &>/dev/null && python3 -c "import yaml" &>/dev/null; then
-        return 0
-    else
-        return 1
-    fi
+    command -v yq &>/dev/null
 }
 
 # Show helpful message for installing YAML parser
 show_yaml_parser_install_help() {
-    error "No YAML parser found. Multi-project sessions require 'yq' or 'python3' with PyYAML."
+    error "No YAML parser found. Multi-project sessions require 'yq'."
     echo ""
-    echo "Installation options:"
-    echo ""
-    echo "Option 1: Install yq (recommended)"
+    echo "Install yq:"
     case "$PLATFORM" in
         macos)
             echo "  brew install yq"
@@ -46,10 +38,6 @@ show_yaml_parser_install_help() {
             echo "  See: https://github.com/mikefarah/yq#install"
             ;;
     esac
-    echo ""
-    echo "Option 2: Install Python PyYAML"
-    echo "  pip3 install pyyaml"
-    echo "  # or: python3 -m pip install pyyaml"
     echo ""
 }
 
@@ -241,64 +229,26 @@ parse_config_file() {
     local config_dir
     config_dir="$(cd "$(dirname "$config_file")" && pwd)"
 
-    # Try yq first (most robust), fall back to Python
-    if command -v yq &>/dev/null; then
-        # Parse with yq: extract project names, paths, optional branch, track flag, and source
-        local yq_output
-        yq_output=$(yq eval '.projects | to_entries | .[] | .key + "|" + .value.path + "|" + (.value.branch // "") + "|" + ((.value.track // true) | tostring) + "|" + (.value.source // "")' "$config_file" 2>/dev/null) || {
-            error "Failed to parse config file with yq"
-            exit 1
-        }
-
-        # Resolve relative paths to absolute (but not for discovered repos - they specify destination)
-        while IFS='|' read -r proj_name proj_path proj_branch proj_track proj_source; do
-            # For discovered repos, path is the destination - don't resolve it
-            if [[ "$proj_source" != "discovered" && "$proj_path" != /* ]]; then
-                proj_path="$(cd "$config_dir" && cd "$proj_path" && pwd)"
-            fi
-            echo "$proj_name|$proj_path|$proj_branch|$proj_track|$proj_source"
-        done <<< "$yq_output"
-    elif command -v python3 &>/dev/null; then
-        # Fallback to Python
-        python3 -c "
-import sys, yaml, os
-
-try:
-    with open('$config_file', 'r') as f:
-        config = yaml.safe_load(f)
-
-    if not config or 'projects' not in config:
-        print('Error: Config must have \"projects\" key', file=sys.stderr)
-        sys.exit(1)
-
-    for name, info in config['projects'].items():
-        if not isinstance(info, dict) or 'path' not in info:
-            print(f'Error: Project \"{name}\" missing \"path\" field', file=sys.stderr)
-            sys.exit(1)
-
-        path = info['path']
-        branch = info.get('branch', '')
-        track = str(info.get('track', True)).lower()
-        source = info.get('source', '')
-        # Resolve relative paths (but not for discovered repos - they specify destination)
-        if source != 'discovered' and not os.path.isabs(path):
-            path = os.path.abspath(os.path.join('$config_dir', path))
-
-        print(f'{name}|{path}|{branch}|{track}|{source}')
-except yaml.YAMLError as e:
-    print(f'Error: Invalid YAML: {e}', file=sys.stderr)
-    sys.exit(1)
-except Exception as e:
-    print(f'Error: {e}', file=sys.stderr)
-    sys.exit(1)
-" || {
-            error "Failed to parse config file with Python"
-            exit 1
-        }
-    else
+    if ! command -v yq &>/dev/null; then
         show_yaml_parser_install_help
         exit 1
     fi
+
+    # Parse with yq: extract project names, paths, optional branch, track flag, and source
+    local yq_output
+    yq_output=$(yq eval '.projects | to_entries | .[] | .key + "|" + .value.path + "|" + (.value.branch // "") + "|" + ((.value.track // true) | tostring) + "|" + (.value.source // "")' "$config_file" 2>/dev/null) || {
+        error "Failed to parse config file with yq"
+        exit 1
+    }
+
+    # Resolve relative paths to absolute (but not for discovered repos - they specify destination)
+    while IFS='|' read -r proj_name proj_path proj_branch proj_track proj_source; do
+        # For discovered repos, path is the destination - don't resolve it
+        if [[ "$proj_source" != "discovered" && "$proj_path" != /* ]]; then
+            proj_path="$(cd "$config_dir" && cd "$proj_path" && pwd)"
+        fi
+        echo "$proj_name|$proj_path|$proj_branch|$proj_track|$proj_source"
+    done <<< "$yq_output"
 }
 
 # Validate config file and all project paths
@@ -376,32 +326,19 @@ validate_config() {
 get_main_project() {
     local config_file="$1"
 
-    if command -v yq &>/dev/null; then
-        # Try to find project with main: true
-        local main_proj
-        main_proj=$(yq eval '.projects | to_entries | .[] | select(.value.main == true) | .key' "$config_file" 2>/dev/null | head -1)
+    if ! command -v yq &>/dev/null; then
+        return 1
+    fi
 
-        if [[ -n "$main_proj" ]]; then
-            echo "$main_proj"
-        else
-            # Fall back to first project
-            yq eval '.projects | keys | .[0]' "$config_file" 2>/dev/null
-        fi
-    elif command -v python3 &>/dev/null; then
-        python3 -c "
-import yaml
-with open('$config_file', 'r') as f:
-    config = yaml.safe_load(f)
-projects = config.get('projects', {})
-# Find main project
-for name, info in projects.items():
-    if isinstance(info, dict) and info.get('main'):
-        print(name)
-        exit(0)
-# Fall back to first project
-if projects:
-    print(list(projects.keys())[0])
-" 2>/dev/null
+    # Try to find project with main: true
+    local main_proj
+    main_proj=$(yq eval '.projects | to_entries | .[] | select(.value.main == true) | .key' "$config_file" 2>/dev/null | head -1)
+
+    if [[ -n "$main_proj" ]]; then
+        echo "$main_proj"
+    else
+        # Fall back to first project
+        yq eval '.projects | keys | .[0]' "$config_file" 2>/dev/null
     fi
 }
 
