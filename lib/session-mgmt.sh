@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
-# claude-container session management module - List, delete, restart, diff, and merge sessions
-# Source this file after utils.sh and git-ops.sh
+# claude-container session management module - List, delete, restart, extract sessions
+# Source this file after utils.sh
 #
 # Dependencies:
 #   - utils.sh must be sourced first (provides: info, success, warn, error)
-#   - git-ops.sh must be sourced first (provides: diff_git_session)
 #   - docker-utils.sh must be sourced first (provides: docker_run_in_volume, get_volume_sizes_batch, etc.)
 #
 # This module provides functions for managing claude-container sessions:
@@ -12,8 +11,8 @@
 #   - session_list: List all sessions with disk usage
 #   - session_delete: Delete a specific session and its volumes
 #   - session_restart: Restart a session with permission fixes
-#   - session_diff: Show diff between session and source repo
-#   - session_merge: Merge session commits back to source repo
+#   - session_extract: Extract session to worktree for manual merge
+#   - session_import: Import a claude session into container
 
 # Source docker-utils.sh if not already sourced
 if [[ -z "$(type -t docker_run_in_volume)" ]]; then
@@ -23,17 +22,11 @@ fi
 # ============================================================================
 # Volume Utility Functions
 # ============================================================================
-# These functions provide reusable patterns for extracting session names
-# from volume names and performing set operations on volume/session lists.
 
 # Extract session name from a Docker volume name
 # Arguments:
 #   $1 - volume name (e.g., "claude-session-foo", "claude-state-bar")
 # Returns: session name without prefix, or empty string
-# Examples:
-#   extract_session_name "claude-session-myproject" => "myproject"
-#   extract_session_name "claude-state-test" => "test"
-#   extract_session_name "unrelated-volume" => ""
 extract_session_name() {
     local volume="$1"
     case "$volume" in
@@ -51,9 +44,6 @@ extract_session_name() {
 # Arguments:
 #   $1 - newline-separated volume names
 # Returns: unique session names, sorted
-# Examples:
-#   map_volumes_to_sessions "claude-session-foo\nclaude-state-foo\nclaude-session-bar"
-#   => "bar\nfoo"
 map_volumes_to_sessions() {
     local volumes="$1"
 
@@ -69,8 +59,6 @@ map_volumes_to_sessions() {
 #   $1 - items (newline-separated)
 #   $2 - exclude set (newline-separated)
 # Returns: items not in exclude set
-# Examples:
-#   filter_not_in_set "a\nb\nc" "b\nd" => "a\nc"
 filter_not_in_set() {
     local items="$1"
     local exclude_set="$2"
@@ -135,7 +123,7 @@ session_cleanup_unused() {
         grep -oE '"Name": "claude-[^"]+"|"Name": "session-data-[^"]+"' | \
         cut -d'"' -f4 | sort -u || true)
 
-    # Find unused volumes using utility function
+    # Find unused volumes
     local unused_volumes_str
     unused_volumes_str=$(filter_not_in_set "$all_volumes" "$used_volumes")
 
@@ -159,7 +147,7 @@ session_cleanup_unused() {
     echo ""
     echo "Calculating sizes..."
 
-    # Get all sizes in one container run using docker-utils function
+    # Get all sizes in one container run
     local unused_volumes_list
     unused_volumes_list=$(printf "%s\n" "${unused_volumes[@]}")
     local sizes
@@ -212,7 +200,7 @@ session_list() {
         return 0
     fi
 
-    # Extract unique session names using utility function
+    # Extract unique session names
     declare -A sessions
     while read -r vol; do
         [[ -z "$vol" ]] && continue
@@ -220,12 +208,12 @@ session_list() {
         [[ -n "$session_name" ]] && sessions[$session_name]=1
     done <<< "$all_volumes"
 
-    # Get all sizes in one container run using docker-utils function
+    # Get all sizes in one container run
     echo "Scanning $(echo "$all_volumes" | wc -l | tr -d ' ') volumes..."
     local sizes
     sizes=$(get_volume_sizes_batch "$all_volumes")
 
-    # Parse sizes into associative array (format: name|size)
+    # Parse sizes into associative array
     declare -A vol_sizes
     while IFS='|' read -r vol size; do
         [[ -z "$vol" ]] && continue
@@ -246,11 +234,10 @@ session_list() {
         printf "%-30s %10s %10s %10s %10s %10s\n" "$session" "$ws" "$st" "$ca" "$np" "$pi"
     done
 
-    # Calculate total size across all volumes using docker-utils function
+    # Calculate total size
     local total_human="?"
     local sizes_with_total
     sizes_with_total=$(get_volume_sizes_batch_with_total "$all_volumes")
-    # Extract TOTAL line
     total_human=$(echo "$sizes_with_total" | grep "^TOTAL|" | cut -d'|' -f2)
     [[ -z "$total_human" ]] && total_human="?"
 
@@ -258,8 +245,8 @@ session_list() {
     echo "Total disk usage: $total_human"
     echo ""
     echo "Commands:"
-    echo "  Delete session:  ./claude-container --delete-session <name>"
-    echo "  Delete all:      ./claude-container --cleanup"
+    echo "  Delete session:  claude-container --delete <name>"
+    echo "  Extract session: claude-container --extract <name>"
 }
 
 # Delete a specific session and all its volumes
@@ -342,7 +329,6 @@ session_delete() {
 
 # Restart a session with permission fixes
 # Usage: session_restart <session_name> <script_path> [extra_args...]
-# Note: script_path is the path to claude-container script for re-exec
 session_restart() {
     local session="$1"
     local script_path="$2"
@@ -370,7 +356,6 @@ session_restart() {
 
     # Fix permissions on existing volumes before restart
     info "Fixing volume permissions..."
-    # Mount multiple cache/state volumes and fix ownership
     docker run --rm \
         -v "claude-cargo-${session}:/cargo" \
         -v "claude-npm-${session}:/npm" \
@@ -380,32 +365,11 @@ session_restart() {
 
     # Re-exec with same session + continue + any extra args
     info "Restarting session: $session"
-    exec "$script_path" --git-session "$session" --continue "${extra_args[@]}"
-}
-
-# Show diff between git session and original repo
-# Usage: session_diff <session_name> [source_dir] [project_filter]
-# Note: Calls diff_git_session from git-ops.sh
-session_diff() {
-    local session_name="$1"
-    local source_dir="${2:-$(pwd)}"
-    local project_filter="${3:-}"
-
-    if [[ -z "$session_name" ]]; then
-        echo "Error: session_diff requires a session name"
-        echo "Usage: session_diff <name> [source_dir] [project-name]"
-        return 1
-    fi
-
-    diff_git_session "$session_name" "$source_dir" "$project_filter"
+    exec "$script_path" --session "$session" --continue "${extra_args[@]}"
 }
 
 # Add a new repo to an existing session
 # Usage: session_add_repo <session_name> <repo_path> [workspace_path]
-# Arguments:
-#   $1 - session name
-#   $2 - path to git repository to add
-#   $3 - optional workspace path (defaults to repo basename)
 session_add_repo() {
     local session="$1"
     local repo_path="$2"
@@ -423,7 +387,7 @@ session_add_repo() {
         return 1
     fi
 
-    # Verify repo exists and is a git repo (handles worktrees too)
+    # Verify repo exists and is a git repo
     if ! is_git_repo "$repo_path"; then
         error "Not a git repository: $repo_path"
         return 1
@@ -464,7 +428,7 @@ session_add_repo() {
 
     info "Adding repo to session: $workspace_path"
 
-    # Build clone command - with optional branch checkout for worktrees
+    # Build clone command
     local clone_cmd="
         mkdir -p /session/$(dirname "$workspace_path") && \
         git -c safe.directory='*' clone --depth 1 /source '/session/$workspace_path'"
@@ -483,7 +447,6 @@ session_add_repo() {
         du -sh '/session/$workspace_path' | cut -f1"
 
     # Clone the repo into the session
-    # Note: Uses direct docker run due to --user flag and dual volume mounts
     local clone_output
     if ! clone_output=$(docker run --rm \
         --user "$host_uid:$host_uid" \
@@ -500,12 +463,9 @@ session_add_repo() {
     success "Added: $workspace_path ($size)"
 
     # Update .claude-projects.yml if it exists
-    # For worktrees, store main repo path + branch so merge works correctly
     local config_path="$source_repo_path"
     local config_branch="$branch_to_checkout"
 
-    # Update .claude-projects.yml
-    # Note: Uses direct docker run due to --user flag requirement
     docker run --rm \
         --user "$host_uid:$host_uid" \
         -v "$volume:/session" \
@@ -521,56 +481,8 @@ session_add_repo() {
         " 2>/dev/null || true
 }
 
-# Merge session commits back to original repo (DEPRECATED)
-# Usage: session_merge <session_name> [--force]
-# Note: Redirects to session_extract (one-way extraction)
-session_merge() {
-    local session_name="$1"
-    shift
-
-    if [[ -z "$session_name" ]]; then
-        echo "Error: session_merge requires a session name"
-        echo "Usage: session_merge <name> [--force]"
-        return 1
-    fi
-
-    local force=false
-
-    # Parse options
-    while [[ $# -gt 0 ]]; do
-        case $1 in
-            --force|-f|--yes|-y|--auto)
-                force=true
-                shift
-                ;;
-            --into|--from)
-                # Deprecated options - ignore with warning
-                warn "Option $1 is deprecated. Use --extract-session for one-way extraction."
-                shift 2
-                ;;
-            *)
-                shift
-                ;;
-        esac
-    done
-
-    # Redirect to the new extraction workflow
-    warn "--merge-session is deprecated. Use --extract-session instead."
-    echo ""
-
-    if $force; then
-        session_extract "$session_name" --force
-    else
-        session_extract "$session_name"
-    fi
-}
-
 # Import a claude-code session into a container session
 # Usage: session_import <source_path> <session_name> [--force]
-# Arguments:
-#   $1 - source path (e.g., ~/.claude or path to session backup)
-#   $2 - target session name
-#   --force - overwrite existing session state
 session_import() {
     local source_path="$1"
     local session_name="$2"
@@ -590,10 +502,10 @@ session_import() {
         echo ""
         echo "Examples:"
         echo "  # Import from local claude session"
-        echo "  ./claude-container --import-session ~/.claude my-session"
+        echo "  claude-container --import-session ~/.claude my-session"
         echo ""
         echo "  # Import from backup directory"
-        echo "  ./claude-container --import-session /backups/claude-session-2024 my-session"
+        echo "  claude-container --import-session /backups/claude-session-2024 my-session"
         return 1
     fi
 
@@ -644,8 +556,6 @@ session_import() {
     info "Importing session data from: $abs_source_path"
     info "Target: $state_volume"
 
-    # Copy session data into volume using tar to handle nested containers
-    # Note: Uses direct docker run with -i flag for stdin piping
     local git_image="${IMAGE_NAME:-$DEFAULT_IMAGE}"
     local copy_output
 
@@ -673,185 +583,11 @@ session_import() {
     success "Session imported successfully!"
     echo ""
     echo "To use this session, run:"
-    echo "  ./claude-container -s $session_name --continue"
-    echo ""
-    echo "The --continue flag will load the conversation history from the imported session."
+    echo "  claude-container -s $session_name --continue"
 }
 
-# Scan session for new repos not in config
-# Usage: session_scan <session_name>
-# Discovers git repos in session volume, compares against config,
-# prompts for destination paths for new repos, updates config
-session_scan() {
-    local session_name="$1"
-    local volume="claude-session-${session_name}"
-
-    if [[ -z "$session_name" ]]; then
-        error "session_scan requires a session name"
-        echo "Usage: session_scan <name>"
-        return 1
-    fi
-
-    # Verify session exists
-    if ! docker volume inspect "$volume" &>/dev/null; then
-        error "Session not found: $session_name"
-        return 1
-    fi
-
-    info "Scanning session: $session_name"
-
-    # Get list of all git repos in the session
-    local repos_in_session
-    repos_in_session=$(docker_run_in_volume "$volume" "/workspace" "alpine" \
-        'cd /workspace && for dir in */; do [ -d "$dir/.git" ] && echo "${dir%/}"; done' "ro" | sort)
-
-    if [[ -z "$repos_in_session" ]]; then
-        warn "No git repositories found in session"
-        return 0
-    fi
-
-    # Get list of repos from session config
-    local config_repos=""
-    local config_file=""
-
-    # Check for config in session volume
-    local has_config
-    has_config=$(docker_run_in_volume "$volume" "/workspace" "alpine" \
-        'test -f /workspace/.claude-projects.yml && echo "yes" || echo "no"' "ro")
-
-    if [[ "$has_config" == "yes" ]]; then
-        # Extract repo names from config
-        config_repos=$(docker_run_in_volume "$volume" "/workspace" "alpine" \
-            'grep -E "^  [a-zA-Z0-9_/-]+:" /workspace/.claude-projects.yml 2>/dev/null | sed "s/://g" | sed "s/^ *//" | sort' "ro" || echo "")
-        config_file="/workspace/.claude-projects.yml"
-    fi
-
-    # Also check session config dir on host
-    local host_config=""
-    local host_config_path="$SESSIONS_CONFIG_DIR/${session_name}.yml"
-    if [[ -f "$host_config_path" ]]; then
-        host_config="$host_config_path"
-        local host_repos
-        host_repos=$(grep -E "^  [a-zA-Z0-9_/-]+:" "$host_config" 2>/dev/null | \
-            sed 's/://g' | sed 's/^ *//' | sort || echo "")
-        if [[ -n "$host_repos" ]]; then
-            config_repos=$(echo -e "${config_repos}\n${host_repos}" | sort -u | grep -v '^$')
-            config_file="$host_config"
-        fi
-    fi
-
-    # Compare and categorize using utility function
-    local new_repos_str
-    new_repos_str=$(filter_not_in_set "$repos_in_session" "$config_repos")
-
-    local known_repos=()
-    local new_repos=()
-
-    # Split into arrays
-    while read -r repo; do
-        [[ -n "$repo" ]] && new_repos+=("$repo")
-    done <<< "$new_repos_str"
-
-    # Known repos are those in session but not in new_repos
-    while read -r repo; do
-        [[ -z "$repo" ]] && continue
-        echo "$new_repos_str" | grep -q "^${repo}$" || known_repos+=("$repo")
-    done <<< "$repos_in_session"
-
-    # Display results
-    echo ""
-    echo "=== Known repos (in config) ==="
-    if [[ ${#known_repos[@]} -eq 0 ]]; then
-        echo "  (none)"
-    else
-        for repo in "${known_repos[@]}"; do
-            echo "  ✓ $repo"
-        done
-    fi
-
-    echo ""
-    echo "=== New repos (not in config) ==="
-    if [[ ${#new_repos[@]} -eq 0 ]]; then
-        echo "  (none)"
-        return 0
-    fi
-
-    for repo in "${new_repos[@]}"; do
-        echo "  + $repo"
-    done
-
-    echo ""
-
-    # Prompt for each new repo
-    local updated_config=false
-    for repo in "${new_repos[@]}"; do
-        echo ""
-        echo "New repo: $repo"
-        read -p "  Destination path (empty to skip): " dest_path
-
-        if [[ -z "$dest_path" ]]; then
-            echo "  Skipped"
-            continue
-        fi
-
-        # Expand ~ to home directory
-        dest_path="${dest_path/#\~/$HOME}"
-
-        # Make absolute if relative
-        if [[ ! "$dest_path" = /* ]]; then
-            dest_path="$(pwd)/$dest_path"
-        fi
-
-        # Confirm
-        echo "  Will extract to: $dest_path"
-        read -p "  Confirm? [y/N] " confirm
-        if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
-            echo "  Skipped"
-            continue
-        fi
-
-        # Add to config file
-        if [[ -n "$host_config" ]]; then
-            # Append to existing host config
-            echo "" >> "$host_config"
-            echo "  # Discovered from session" >> "$host_config"
-            echo "  $repo:" >> "$host_config"
-            echo "    path: $dest_path" >> "$host_config"
-            echo "    source: discovered" >> "$host_config"
-            success "Added $repo -> $dest_path to config"
-            updated_config=true
-        else
-            # Create new config file
-            host_config="$host_config_path"
-            mkdir -p "$SESSIONS_CONFIG_DIR"
-            cat > "$host_config" << EOF
-version: "1"
-projects:
-  # Discovered from session scan
-  $repo:
-    path: $dest_path
-    source: discovered
-EOF
-            success "Created config: $host_config"
-            success "Added $repo -> $dest_path"
-            updated_config=true
-        fi
-    done
-
-    if $updated_config; then
-        echo ""
-        success "Config updated: $host_config"
-        echo ""
-        echo "To extract new repos, run:"
-        echo "  claude-container --merge-session $session_name"
-    fi
-}
-
-# Extract session to a worktree (one-way: session → worktree, forced)
+# Extract session to a worktree (one-way copy)
 # Usage: session_extract <session_name> [--force]
-# Arguments:
-#   $1 - session name
-#   --force - overwrite existing worktree
 session_extract() {
     local session_name="$1"
     local force=false
@@ -899,29 +635,21 @@ session_extract() {
 
     local git_image="${IMAGE_NAME:-$DEFAULT_IMAGE}"
 
-    # Extract the entire session repo to worktree (simple copy)
-    # This is a one-way forced extraction - no syncing, just copy
+    # Extract the entire session to worktree (simple copy)
     if ! docker run --rm \
         -v "$volume:/session:ro" \
         -v "$worktree_dir:/dest" \
         "$git_image" \
         sh -c "
-            # Copy everything (use cp -r to avoid ownership preservation warnings)
-            cd /session
-            cp -r . /dest/
-
-            # Ensure git repo is in good state
+            cp -r /session/. /dest/
             cd /dest
             git config --global --add safe.directory '*'
-
-            # Show what we extracted
             echo '---'
             echo 'Extracted:'
             git log --oneline -5 2>/dev/null || echo 'No git history'
             echo '---'
             echo 'Branch:'
             git rev-parse --abbrev-ref HEAD 2>/dev/null || echo 'detached HEAD'
-            echo '---'
         " 2>&1; then
         error "Failed to extract session"
         rm -rf "$worktree_dir"
@@ -934,9 +662,8 @@ session_extract() {
     echo "  1. Review changes:"
     echo "     cd $worktree_dir"
     echo "     git log"
-    echo "     git diff <target-branch>"
     echo ""
-    echo "  2. Merge manually (from main repo):"
+    echo "  2. Merge manually (from your repo):"
     echo "     git fetch $worktree_dir"
     echo "     git merge FETCH_HEAD"
     echo ""
@@ -984,86 +711,4 @@ session_cleanup_worktree() {
 
     rm -rf "$worktree_dir"
     success "Worktree deleted: $worktree_dir"
-}
-
-# Check if worktree exists and has changes, offer to load them into session
-# Usage: session_check_worktree <session_name>
-# Returns: 0 if no action needed, 1 if user cancelled load
-session_check_worktree() {
-    local session_name="$1"
-    local worktree_dir="$CONFIG_DIR/worktrees/$session_name"
-    local volume="claude-session-${session_name}"
-
-    # Skip if worktree doesn't exist
-    [[ ! -d "$worktree_dir" ]] && return 0
-
-    # Check if worktree is a valid git repo
-    if ! git -C "$worktree_dir" rev-parse --git-dir &>/dev/null; then
-        return 0
-    fi
-
-    local git_image="${IMAGE_NAME:-$DEFAULT_IMAGE}"
-
-    # Get session HEAD and worktree HEAD
-    local session_head
-    session_head=$(docker run --rm -v "$volume:/session:ro" "$git_image" \
-        sh -c "git -C /session rev-parse HEAD 2>/dev/null" 2>/dev/null)
-
-    local worktree_head
-    worktree_head=$(git -C "$worktree_dir" rev-parse HEAD 2>/dev/null)
-
-    # If same commit, nothing to do
-    if [[ "$session_head" == "$worktree_head" ]]; then
-        return 0
-    fi
-
-    # Check if worktree has new commits
-    local worktree_is_ahead=false
-    if git -C "$worktree_dir" merge-base --is-ancestor "$session_head" "$worktree_head" 2>/dev/null; then
-        worktree_is_ahead=true
-    fi
-
-    if ! $worktree_is_ahead; then
-        # Worktree is behind or diverged - just note it
-        warn "Worktree exists but is behind or diverged from session"
-        echo "  Worktree: $worktree_dir"
-        echo "  Consider cleaning up: claude-container --cleanup-worktree $session_name"
-        return 0
-    fi
-
-    # Worktree has new commits - offer to load them
-    local commit_count
-    commit_count=$(git -C "$worktree_dir" rev-list --count "$session_head..$worktree_head" 2>/dev/null || echo "?")
-
-    echo ""
-    info "Worktree has $commit_count new commit(s)"
-    echo "  Location: $worktree_dir"
-    read -p "Load worktree changes into session? [y/N] " confirm
-
-    if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
-        echo "Skipped - starting session as-is"
-        return 0
-    fi
-
-    # Load worktree changes into session
-    info "Loading worktree changes into session..."
-
-    if ! docker run --rm \
-        -v "$worktree_dir:/worktree:ro" \
-        -v "$volume:/session" \
-        "$git_image" \
-        sh -c "
-            git config --global --add safe.directory '*'
-            cd /session
-            git remote add worktree /worktree 2>/dev/null || git remote set-url worktree /worktree
-            git fetch worktree --quiet
-            git merge --ff-only FETCH_HEAD --quiet 2>&1
-        " 2>&1; then
-        error "Failed to load worktree changes (may need manual merge)"
-        return 1
-    fi
-
-    success "Loaded $commit_count commit(s) from worktree"
-    echo ""
-    return 0
 }

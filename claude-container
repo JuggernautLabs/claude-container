@@ -2,18 +2,17 @@
 # Spawn into a Docker container with Claude Code ready to execute
 #
 # Usage:
-#   claude-container [dockerfile] [--build] [--dir <path>]
-#   claude-container                    # Use ./Dockerfile or ./.devcontainer/Dockerfile
-#   claude-container path/to/Dockerfile # Use specific Dockerfile
-#   claude-container --build            # Force rebuild image
-#   claude-container --dir ./myproject  # Use overlay for myproject directory
+#   claude-container -s <session> [options]
+#   claude-container -s myproj                    # Single project from cwd
+#   claude-container -s myproj -a ~/repo1 -a ~/repo2  # Multiple projects
+#   claude-container -s myproj --discover-repos ~/dev  # Auto-discover repos
 #
 # Environment:
 #   CLAUDE_CODE_OAUTH_TOKEN  OAuth token for authentication (required)
 
 set -e
 
-VERSION="0.1.0"
+VERSION="0.2.0"
 DEFAULT_IMAGE="ghcr.io/hypermemetic/claude-container:latest"
 
 # Config and cache directories
@@ -33,7 +32,6 @@ source "$SCRIPT_DIR/lib/config.sh"
 source "$SCRIPT_DIR/lib/auth.sh"
 source "$SCRIPT_DIR/lib/docker.sh"
 source "$SCRIPT_DIR/lib/git-session.sh"
-source "$SCRIPT_DIR/lib/git-ops.sh"
 source "$SCRIPT_DIR/lib/session-mgmt.sh"
 
 # Global state variables
@@ -47,13 +45,11 @@ USE_GIT_SESSION=true  # Default: use git-based session isolation
 CONTINUE_SESSION=false
 RUN_AS_USER=false
 RUN_AS_ROOTISH=true  # Default: run as user with passwordless sudo for package installs
-AUTO_SYNC_BRANCH=""
 NO_RUN=false
 SHELL_ONLY=false
 BASH_EXEC=""  # Command to execute instead of claude
 ENABLE_DOCKER=false  # Mount Docker socket for host Docker access
 CONFIG_ONLY=false    # Just generate config, don't create session
-SCAN_SESSION=false   # Scan session for new repos
 DISCOVER_REPOS_DIRS=()  # Array for multiple --discover-repos
 ADD_REPOS=()  # Array for repos to add via --add-repo
 SESSIONS_CONFIG_DIR="$CONFIG_DIR/sessions"  # Where session configs are stored
@@ -63,7 +59,7 @@ NO_INTERACTIVE=false  # Fail fast if no token found (don't start OAuth flow)
 # Docker args accumulator
 declare -a DOCKER_ARGS
 
-# Handle cleanup commands (before main argument parsing)
+# Handle management commands (before main argument parsing)
 case "${1:-}" in
     --cleanup)
         session_cleanup
@@ -81,7 +77,7 @@ case "${1:-}" in
         exit 0
         ;;
 
-    --delete-session)
+    --delete-session|--delete)
         shift
         session_delete "$@"
         exit 0
@@ -93,24 +89,13 @@ case "${1:-}" in
         exit 0
         ;;
 
-    --diff-session)
-        session_diff "$2" "$(pwd)" "${3:-}"
-        exit 0
-        ;;
-
-    --merge-session)
-        shift
-        session_merge "$@"
-        exit 0
-        ;;
-
     --import-session)
         shift
         session_import "$@"
         exit 0
         ;;
 
-    --extract-session)
+    --extract-session|--extract)
         shift
         session_extract "$@"
         exit 0
@@ -151,10 +136,6 @@ while [[ $# -gt 0 ]]; do
             CONFIG_ONLY=true
             shift
             ;;
-        --scan)
-            SCAN_SESSION=true
-            shift
-            ;;
         --continue|-c)
             CONTINUE_SESSION=true
             shift
@@ -176,10 +157,6 @@ while [[ $# -gt 0 ]]; do
             RUN_AS_ROOTISH=false
             RUN_AS_USER=false
             shift
-            ;;
-        --auto-sync)
-            AUTO_SYNC_BRANCH="$2"
-            shift 2
             ;;
         --discover-repos)
             DISCOVER_REPOS_DIRS+=("$2")
@@ -239,27 +216,25 @@ Usage: claude-container [options] [-- <claude-args>]
 Spawn into a Docker container with Claude Code ready.
 
 Options:
-  --build, -b              Force rebuild the image
-  --dockerfile, -f [path]  Specify Dockerfile path (auto-detected from ./Dockerfile if present)
-  --dir, -d <path>         Directory to use with overlay (DEPRECATED)
-  --session, -s <name>     Session name (required, identifies the session)
-  --no-git-session         Disable git-based isolation (mount cwd directly)
-  --config-only            Generate config file only, don't create session (outputs path)
-  --scan                   Scan session for new repos, prompt for destinations, update config
-  --continue, -c           Continue the most recent Claude conversation
-  --token, -t <token>      Provide OAuth token directly (alternative to env var)
-  --as-user                Run as non-root developer user (no sudo)
-  --as-rootish             Run as developer with passwordless sudo for installs (default)
-  --as-root, --no-rootish  Run as actual root user
-  --auto-sync <branch>     Override branch name for auto-merge on exit (default: session name)
+  --session, -s <name>     Session name (required for git sessions)
+  --add-repo, -a <path>    Add a git repository to the session (can use multiple times)
   --discover-repos <dir>   Auto-discover all git repos in directory
-  --add-repo, -a <path>    Add a git repository to the session (works during init and for existing sessions)
-  --config, -C <path>      Explicit path to .claude-projects.yml config file
-  --verify, -v             Verify container setup works (run checks and exit)
+  --config, -C <path>      Path to .claude-projects.yml config file
+  --continue, -c           Continue the most recent Claude conversation
+  --no-git-session         Disable git-based isolation (mount cwd directly)
+  --config-only            Generate config file only, don't create session
+  --build, -b              Force rebuild the image
+  --dockerfile, -f [path]  Specify Dockerfile path (auto-detected if present)
+  --token, -t <token>      Provide OAuth token directly
+  --as-user                Run as non-root developer user (no sudo)
+  --as-rootish             Run as developer with passwordless sudo (default)
+  --as-root, --no-rootish  Run as actual root user
   --shell, --bash          Start bash shell instead of claude
   --bash-exec <cmd>        Execute a bash command and exit
-  --docker                 Mount Docker socket for host Docker access (security risk on Linux)
-  --no-interactive         Exit with error if no token found (don't start OAuth flow)
+  --docker                 Mount Docker socket for host Docker access
+  --no-interactive         Exit with error if no token found
+  --no-run                 Set up session but don't start container
+  --verify, -v             Verify container setup works
   --version, -V            Show version
   --help, -h               Show this help
 
@@ -267,47 +242,41 @@ Arguments:
   -- <claude-args>         Pass remaining arguments to claude (e.g., -p, --print)
 
 Session Management:
-  --cleanup                List and optionally delete all claude-related volumes
-  --cleanup-unused [--yes] Delete volumes not used by running containers
-  --list-sessions, --sessions  List all sessions with disk usage per volume
-  --delete-session <name> [--regex] [--yes]  Delete session(s) with confirmation
-  --restart-session <name> Restart a session (fixes permissions, continues conversation)
-  --extract-session <name> [--force]  Extract session to worktree for review/merge
-  --cleanup-worktree <name> [--yes]   Remove worktree after merging
-  --diff-session <name>    Show changes made in a git session vs original repo
-  --merge-session <name>   (DEPRECATED) Use --extract-session instead
-                           Merge session commits back to repo
-                           Options: --into <branch> (target branch, default: session name)
-                                    --from <branch> (create new branch from this, default: HEAD)
-
-Environment:
-  CLAUDE_CODE_OAUTH_TOKEN   OAuth token for authentication (required)
-                            Get one with: claude setup-token
+  --sessions               List all sessions with disk usage
+  --delete <name>          Delete session volumes [--regex] [--yes]
+  --extract <name>         Extract session to worktree for review/merge [--force]
+  --cleanup-worktree <name>  Remove extracted worktree [--yes]
+  --import-session <path> <name>  Import claude session data [--force]
+  --cleanup                List and optionally delete all volumes
+  --cleanup-unused         Delete volumes not used by running containers [--yes]
+  --restart-session <name> Restart a session (fixes permissions)
 
 Examples:
-  # Basic workflow
-  claude-container -s myproj                           # Start git session "myproj"
-  claude-container -s myproj --continue                # Resume session AND continue conversation
-  claude-container --extract-session myproj            # Extract session to review/merge
+  # Single project
+  claude-container -s myproj
 
-  # Advanced setup
-  claude-container -s myproj --discover-repos ~/dev    # Discover repos and start session
-  claude-container -s myproj -a ~/repo1 -a ~/repo2     # Add specific repos to session
-  claude-container -s myproj -a ~/repo --no-run        # Add repo during init (before starting)
-  claude-container -s myproj --scan                    # Find new repos created in session
+  # Multiple projects
+  claude-container -s myproj -a ~/repo1 -a ~/repo2
 
-  # Other modes
-  claude-container --no-git-session                    # Direct mount cwd (no isolation)
-  claude-container -s myproj -- -p "What is this?"     # Run claude in print mode
-  claude-container -s myproj --continue -- -p "Status" # Continue session and print
+  # Auto-discover repos in a directory
+  claude-container -s myproj --discover-repos ~/dev
+
+  # Resume session and continue conversation
+  claude-container -s myproj --continue
+
+  # Extract changes after working
+  claude-container --extract myproj
+
+  # Run claude in print mode
+  claude-container -s myproj -- -p "What is this?"
 
 Workflow:
   1. Start session:     claude-container -s myproj
   2. Do work in container...
   3. Exit container:    exit
-  4. Extract changes:   claude-container --extract-session myproj
-  5. Review worktree:   cd ~/.config/claude-container/worktrees/myproj && git log
-  6. Merge manually:    git merge (from your main repo)
+  4. Extract changes:   claude-container --extract myproj
+  5. Review worktree:   cd ~/.config/claude-container/worktrees/myproj
+  6. Merge manually:    git fetch <worktree-path> && git merge FETCH_HEAD
   7. Cleanup:           claude-container --cleanup-worktree myproj
 EOF
             exit 0
@@ -321,7 +290,7 @@ EOF
 done
 
 # Validate session name is provided when required
-if ($USE_GIT_SESSION || $CONFIG_ONLY || $SCAN_SESSION || [[ ${#ADD_REPOS[@]} -gt 0 ]]) && [[ -z "$SESSION_NAME" ]]; then
+if ($USE_GIT_SESSION || $CONFIG_ONLY || [[ ${#ADD_REPOS[@]} -gt 0 ]]) && [[ -z "$SESSION_NAME" ]]; then
     error "Session name required: use --session <name>"
     exit 1
 fi
@@ -334,12 +303,6 @@ fi
 
 # Ensure session config directory exists
 mkdir -p "$SESSIONS_CONFIG_DIR"
-
-# Handle --scan: scan session for new repos and exit
-if $SCAN_SESSION; then
-    session_scan "$SESSION_NAME"
-    exit 0
-fi
 
 # Ensure token is available (from config, keychain, or interactive auth)
 ensure_token
@@ -431,7 +394,7 @@ USE_OVERLAY=false
 # Handle session directory with overlay (deprecated)
 SESSION_VOLUME=""
 if [[ -n "$SESSION_DIR" ]]; then
-    warn "The --dir option is deprecated. Consider using --git-session instead."
+    warn "The --dir option is deprecated. Use --session instead."
     SESSION_DIR="$(cd "$SESSION_DIR" && pwd)"
     SESSION_UUID="$(uuidgen | tr '[:upper:]' '[:lower:]')"
     SESSION_VOLUME="session-data-${SESSION_UUID}"
@@ -487,11 +450,6 @@ if $USE_GIT_SESSION; then
         for repo_path in "${ADD_REPOS[@]}"; do
             session_add_repo "$SESSION_NAME" "$repo_path"
         done
-    fi
-
-    # Check if worktree exists with changes and offer to load them
-    if ! $NO_RUN; then
-        session_check_worktree "$SESSION_NAME"
     fi
 
     if $NO_RUN; then
@@ -605,7 +563,6 @@ if $ENABLE_DOCKER; then
 
     if $DOCKER_AVAILABLE; then
         # Mount the VM-side socket (works for Colima/Docker Desktop on macOS)
-        # Containers run inside the VM, so they access /var/run/docker.sock directly
         DOCKER_ARGS+=("-v" "/var/run/docker.sock:/var/run/docker.sock")
         DOCKER_ARGS+=("-e" "DOCKER_HOST=unix:///var/run/docker.sock")
         if [[ "$PLATFORM" == "linux" ]]; then
@@ -772,7 +729,7 @@ WRAPPER
     # Shell-only mode - just run bash in working directory
     if [[ "${SHELL_ONLY:-}" == "1" ]]; then
         if [[ "${RUN_AS_USER:-}" == "1" ]] || [[ "${RUN_AS_ROOTISH:-}" == "1" ]]; then
-            exec gosu developer bash -c "export CLAUDE_CODE_OAUTH_TOKEN='$CLAUDE_CODE_OAUTH_TOKEN' && cd $WORK_DIR && exec bash"
+            exec gosu developer bash -c "export CLAUDE_CODE_OAUTH_TOKEN='\''$CLAUDE_CODE_OAUTH_TOKEN'\'' && cd $WORK_DIR && exec bash"
         else
             exec bash -c "cd $WORK_DIR && exec bash"
         fi
@@ -826,12 +783,11 @@ WRAPPER
     fi
 '
 
-# Session exit: automatically extract changes
+# Session exit message
 if $USE_GIT_SESSION; then
     echo ""
     info "Session complete: $SESSION_NAME"
     echo ""
-
-    # Auto-extract session to worktree
-    "$0" --extract-session "$SESSION_NAME" --force
+    echo "To extract changes:"
+    echo "  claude-container --extract $SESSION_NAME"
 fi
