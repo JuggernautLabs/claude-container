@@ -233,49 +233,61 @@ def5678 Add unit tests for auth
 ./claude-container-cp --list feature-name /workspace/src
 ```
 
-## Merging Changes Back
+## Extracting and Merging Changes
 
-The merge system uses git-native sync operations that:
-- Preserve exact commit hashes (identical on both sides)
-- Support bidirectional sync (local ↔ session)
-- Automatically detect and handle diverged states
-- Verify sync completed successfully
+When you exit a Claude session, changes are **automatically extracted** to a worktree for review:
 
-### Merge All Commits
+```
+→ Session complete: feature-name
+
+→ Extracting session 'feature-name' to worktree...
+→ Destination: ~/.config/claude-container/worktrees/feature-name
+✓ Session extracted
+
+Next steps:
+  1. cd ~/.config/claude-container/worktrees/feature-name
+  2. Review changes, then merge to your repo
+  3. claude-container --cleanup-worktree feature-name
+```
+
+### Manual Extraction
+
+If you need to extract manually (or re-extract):
 
 ```bash
+./claude-container --extract-session feature-name
+# Use --force to overwrite existing worktree
+./claude-container --extract-session feature-name --force
+```
+
+### Merging to Your Repository
+
+From your main repository, fetch and merge from the worktree:
+
+```bash
+cd ~/your-project
+git fetch ~/.config/claude-container/worktrees/feature-name
+git merge FETCH_HEAD
+# Or cherry-pick specific commits
+git cherry-pick <commit-hash>
+```
+
+### Cleanup
+
+After merging, clean up the worktree:
+
+```bash
+./claude-container --cleanup-worktree feature-name
+```
+
+### Legacy --merge-session (Deprecated)
+
+The `--merge-session` command now redirects to `--extract-session`:
+
+```bash
+# These are equivalent:
 ./claude-container --merge-session feature-name
-```
-
-The system first checks the sync status:
-```
-=== Merging session: feature-name ===
-
-Status: Session ahead by 2 commit(s)
-  abc1234 Refactor authentication module
-  def5678 Add unit tests for auth
-
-Merge? [y/n] y
-
-↓ Merging session changes to local...
-✓ Verified: local and session match
-✓ Synced successfully
-
-Delete session 'feature-name'? [y/n]
-```
-
-### Merge to a New Branch
-
-```bash
-# Create/switch to branch and apply commits there
-./claude-container --merge-session feature-name --into claude/feature-name
-```
-
-### Auto-Sync on Exit
-
-```bash
-# Automatically merge to a branch when the container exits
-./claude-container -s feature-name --auto-sync claude/feature-name
+./claude-container --extract-session feature-name
 ```
 
 ## Multi-Project Sessions
@@ -572,122 +584,39 @@ def5678 Update styles
 
 ### Merging Changes
 
-**Interactive merge** (select which projects to merge):
+### Multi-Project Extraction
+
+For multi-project sessions (created with `--discover-repos` or `.claude-projects.yml`), extraction works the same way - all projects are extracted together:
+
 ```bash
-./claude-container --merge-session feature-name
+./claude-container --extract-session feature-name
 ```
 
-Output:
+The worktree will contain all projects in their original directory structure:
 ```
-=== Merging multi-project session: feature-name ===
-
-Projects:
-  [↓] frontend (2 commit(s) to pull from session)
-  [↓] backend (1 commit(s) to pull from session)
-  [↓] shared (1 commit(s) to pull from session)
-  [✓] mobile (synced)
-
-Merge? [y/n] y
-
-→ Syncing project: frontend
-  ↓ Merging session changes to local...
-  ✓ Verified: local and session match
-✓ frontend synced
-
-→ Syncing project: backend
-  ↓ Merging session changes to local...
-  ✓ Verified: local and session match
-✓ backend synced
-
-→ Syncing project: shared
-  ↓ Merging session changes to local...
-  ✓ Verified: local and session match
-✓ shared synced
-
-✓ All projects synced successfully
-
-Delete session 'feature-name'? [y/n]
+~/.config/claude-container/worktrees/feature-name/
+├── frontend/
+├── backend/
+└── shared/
 ```
 
-**Auto-merge** (sync all projects automatically, no prompts):
+**Merging each project:**
 ```bash
-./claude-container --merge-session feature-name --yes
-```
-
-This skips interactive prompts and syncs all projects that need it.
-
-**Merge to specific branch** (creates/switches branch in each project):
-```bash
-./claude-container --merge-session feature-name --into claude/feature-name
-```
-
-This will:
-- Create or switch to branch `claude/feature-name` in each project
-- Apply commits to that branch
-- Leave you ready to review and push
-
-**Selective sync** (just one project):
-
-The merge command syncs all projects by default. To manually sync a single project:
-```bash
-# Run bash inside the session to fetch from session volume
-./claude-container -s feature-name --bash-exec "cd /workspace/frontend && git log --oneline -5"
-
-# Or cherry-pick specific commits from session to local
+# Merge frontend changes
 cd ~/dev/frontend
-git fetch /path/to/session/volume/frontend
-git cherry-pick <commit-hash>
+git fetch ~/.config/claude-container/worktrees/feature-name/frontend
+git merge FETCH_HEAD
+
+# Merge backend changes
+cd ~/dev/backend
+git fetch ~/.config/claude-container/worktrees/feature-name/backend
+git merge FETCH_HEAD
 ```
 
-### Merge Behavior
-
-**Smart Sync System:**
-
-The merge system uses git-native operations (fetch/merge/reset) rather than patches, providing:
-- **Same commit hashes** - commits are identical on both sides after sync
-- **Bidirectional sync** - push local changes to session, then pull session changes back
-- **Automatic verification** - confirms both sides match after sync
-- **Parallel execution** - multi-project syncs run concurrently for speed
-
-**Status Detection:**
-
-Before syncing, the system compares git tree hashes to determine the relationship:
-
-| Status | Indicator | Meaning |
-|--------|-----------|---------|
-| Synced | `[✓]` | Local and session are identical |
-| Session Ahead | `[↓]` | Session has commits to pull (N commit(s) to pull) |
-| Local Ahead | `[↑]` | Local has commits to push (N commit(s) to push) |
-| Diverged | `[!]` | Both sides have different commits (needs sync) |
-| New Repo | `[+]` | Session has new repo not in local (will extract) |
-
-**Sync Process:**
-
-1. **Check status** - Compare trees to detect which side is ahead
-2. **Push local → session** - If local is ahead, push changes to session first
-3. **Merge session → local** - Pull session changes into local repository
-4. **Verify** - Confirm both HEADs match after sync
-
-**Per-project merging:**
-- Each project is synced independently to its source repository
-- Projects that are already synced are skipped
-- Uses git fetch/merge for clean operations
-- If a merge fails in one project, others continue
-- Failed merges show instructions for manual resolution
-
-**Handling diverged state:**
-
-When local and session have diverged (both have unique commits):
+**Cleanup after merging all projects:**
+```bash
+./claude-container --cleanup-worktree feature-name
 ```
-[!] frontend (diverged - needs sync)
-
-→ Syncing project: frontend
-  ↑ Pushing local changes to session...
-  ↓ Merging session changes to local...
-  ✓ Verified: local and session match
-```
-
-The sync pushes local changes first, then merges session changes back, preserving all work from both sides.
 
 ### Requirements and Validation
 
@@ -1303,7 +1232,7 @@ docker ps
 - `lib/utils.sh` - Logging, output formatting, platform detection
 - `lib/config.sh` - YAML parsing, project configuration, iteration utilities
 - `lib/docker-utils.sh` - Docker operation wrappers and batch operations
-- `lib/git-ops.sh` - Git sync system: bidirectional fetch/merge, tree comparison, verification
+- `lib/git-ops.sh` - Git session diff and comparison utilities
 - `lib/git-session.sh` - Session creation and repository cloning
 - `lib/session-mgmt.sh` - Session lifecycle management (list, delete, restart)
 - `lib/auth.sh` - OAuth token management and verification
@@ -1316,12 +1245,11 @@ docker ps
 - **Extensible**: Modular design allows easy addition of new features
 
 **Recent Improvements:**
-- Git-native sync system using fetch/merge instead of patches (preserves commit hashes)
-- Bidirectional sync: push local changes to session, pull session changes to local
-- Smart status detection using git tree hash comparison
-- Parallel multi-project sync with live status output
-- Built-in sync verification to confirm both sides match
+- One-way extraction model: session → worktree (simple, reliable)
+- Auto-extract on session exit (no manual step needed)
+- Manual merge workflow (you control how changes are merged)
 - Full Docker-in-Docker support for nested environments
+- Comprehensive test suite (14 tests covering all workflows)
 
 ## License
 
