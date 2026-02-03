@@ -71,12 +71,34 @@ ln -s $(pwd)/claude-container-cp /usr/local/bin/
 - Docker (Docker Desktop, Colima, or native Docker)
 - A Claude Code OAuth token (set `CLAUDE_CODE_OAUTH_TOKEN`)
 
-**Optional (for multi-project sessions):**
+**Required for multi-project sessions** (one of):
 - `yq` (YAML processor) - recommended
-  - macOS: `brew install yq`
-  - Ubuntu/Debian: `sudo apt-get install yq`
-  - Other: See https://github.com/mikefarah/yq#install
-- OR `python3` with PyYAML: `pip3 install pyyaml`
+  ```bash
+  # macOS
+  brew install yq
+
+  # Ubuntu/Debian
+  sudo apt-get install yq
+
+  # Other: https://github.com/mikefarah/yq#install
+  ```
+- OR `python3` with PyYAML:
+  ```bash
+  pip3 install pyyaml
+  ```
+
+**Optional (recommended):**
+- `pv` (pipe viewer) - shows progress during session extraction
+  ```bash
+  # macOS
+  brew install pv
+
+  # Ubuntu/Debian
+  sudo apt-get install pv
+
+  # Other Linux
+  # Available in most package managers as 'pv'
+  ```
 
 **Verify your setup:**
 ```bash
