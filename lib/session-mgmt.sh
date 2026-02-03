@@ -772,3 +772,66 @@ _extract_multi_project() {
         warn "$fail_count repo(s) skipped or failed"
     fi
 }
+
+# Repair corrupted session config (fixes paths with ||true| suffix)
+# Usage: session_repair <session_name>
+session_repair() {
+    local session_name="$1"
+    local volume="claude-session-${session_name}"
+    local git_image="${IMAGE_NAME:-$DEFAULT_IMAGE}"
+
+    if [[ -z "$session_name" ]]; then
+        error "Usage: session_repair <session_name>"
+        return 1
+    fi
+
+    # Verify session exists
+    if ! docker volume inspect "$volume" &>/dev/null; then
+        error "Session not found: $session_name"
+        return 1
+    fi
+
+    info "Checking session config..."
+
+    # Check if config has corrupted paths
+    local config_content
+    config_content=$(docker run --rm -v "$volume:/session:ro" "$git_image" \
+        cat /session/.claude-projects.yml 2>/dev/null || echo "")
+
+    if [[ -z "$config_content" ]]; then
+        info "No .claude-projects.yml found (single-project session)"
+        return 0
+    fi
+
+    if ! echo "$config_content" | grep -q '||'; then
+        info "Config appears valid (no ||true| corruption detected)"
+        return 0
+    fi
+
+    info "Found corrupted paths, repairing..."
+
+    # Fix the config by removing ||...| suffix from paths
+    local host_uid
+    host_uid=$(get_host_uid)
+
+    docker run --rm \
+        --user "$host_uid:$host_uid" \
+        -v "$volume:/session" \
+        "$git_image" \
+        sh -c "sed -i 's/||[^|]*|$//' /session/.claude-projects.yml"
+
+    # Verify the fix
+    local fixed_content
+    fixed_content=$(docker run --rm -v "$volume:/session:ro" "$git_image" \
+        cat /session/.claude-projects.yml 2>/dev/null || echo "")
+
+    if echo "$fixed_content" | grep -q '||'; then
+        error "Repair incomplete - some paths may still be corrupted"
+        return 1
+    fi
+
+    success "Config repaired successfully"
+    echo ""
+    echo "Fixed config:"
+    echo "$fixed_content" | head -20
+}
