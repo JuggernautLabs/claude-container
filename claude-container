@@ -59,54 +59,12 @@ NO_INTERACTIVE=false  # Fail fast if no token found (don't start OAuth flow)
 # Docker args accumulator
 declare -a DOCKER_ARGS
 
-# Handle management commands (before main argument parsing)
-case "${1:-}" in
-    --cleanup)
-        session_cleanup
-        exit 0
-        ;;
-
-    --cleanup-unused)
-        shift
-        session_cleanup_unused "$@"
-        exit 0
-        ;;
-
-    --list-sessions|--sessions)
-        session_list
-        exit 0
-        ;;
-
-    --delete-session|--delete)
-        shift
-        session_delete "$@"
-        exit 0
-        ;;
-
-    --restart-session)
-        shift
-        session_restart "$@"
-        exit 0
-        ;;
-
-    --import-session)
-        shift
-        session_import "$@"
-        exit 0
-        ;;
-
-    --extract-session|--extract)
-        shift
-        session_extract "$@"
-        exit 0
-        ;;
-
-    --repair)
-        shift
-        session_repair "$@"
-        exit 0
-        ;;
-esac
+# Action flags (only one action can be performed at a time)
+ACTION=""
+ACTION_FORCE=false
+ACTION_YES=false
+ACTION_REGEX=false
+IMPORT_SOURCE=""
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -190,7 +148,59 @@ while [[ $# -gt 0 ]]; do
             NO_INTERACTIVE=true
             shift
             ;;
-        --dockerfile|-f)
+
+        # Session management actions (use with --session)
+        --extract)
+            ACTION="extract"
+            shift
+            ;;
+        --delete)
+            ACTION="delete"
+            shift
+            ;;
+        --repair)
+            ACTION="repair"
+            shift
+            ;;
+        --restart)
+            ACTION="restart"
+            shift
+            ;;
+        --import)
+            ACTION="import"
+            IMPORT_SOURCE="$2"
+            shift 2
+            ;;
+
+        # Actions without session requirement
+        --sessions|--list-sessions)
+            ACTION="list"
+            shift
+            ;;
+        --cleanup)
+            ACTION="cleanup"
+            shift
+            ;;
+        --cleanup-unused)
+            ACTION="cleanup-unused"
+            shift
+            ;;
+
+        # Action modifiers
+        --force|-f)
+            ACTION_FORCE=true
+            shift
+            ;;
+        --yes|-y)
+            ACTION_YES=true
+            shift
+            ;;
+        --regex|-r)
+            ACTION_REGEX=true
+            shift
+            ;;
+
+        --dockerfile)
             # Specify explicit Dockerfile path (auto-detected if not provided)
             if [[ -n "${2:-}" ]] && [[ ! "$2" =~ ^- ]]; then
                 DOCKERFILE="$2"
@@ -224,7 +234,7 @@ Options:
   --no-git-session         Disable git-based isolation (mount cwd directly)
   --config-only            Generate config file only, don't create session
   --build, -b              Force rebuild the image
-  --dockerfile, -f [path]  Specify Dockerfile path (auto-detected if present)
+  --dockerfile [path]      Specify Dockerfile path (auto-detected if present)
   --token, -t <token>      Provide OAuth token directly
   --as-user                Run as non-root developer user (no sudo)
   --as-rootish             Run as developer with passwordless sudo (default)
@@ -241,14 +251,19 @@ Options:
 Arguments:
   -- <claude-args>         Pass remaining arguments to claude (e.g., -p, --print)
 
-Session Management:
+Session Management (use with -s <session>):
+  --extract                Extract session as branch
+  --delete                 Delete session volumes
+  --repair                 Fix corrupted session config
+  --restart                Restart session (fixes permissions)
+  --import <path>          Import claude session data from path
+
+  Modifiers: --force/-f, --yes/-y, --regex/-r
+
+Global Commands (no session required):
   --sessions               List all sessions with disk usage
-  --delete <name>          Delete session volumes [--regex] [--yes]
-  --extract <name>         Extract session as branch [--force]
-  --import-session <path> <name>  Import claude session data [--force]
   --cleanup                List and optionally delete all volumes
-  --cleanup-unused         Delete volumes not used by running containers [--yes]
-  --restart-session <name> Restart a session (fixes permissions)
+  --cleanup-unused         Delete unused volumes [--yes]
 
 Examples:
   # Single project
@@ -264,7 +279,10 @@ Examples:
   claude-container -s myproj --continue
 
   # Extract changes as a branch
-  claude-container --extract myproj
+  claude-container -s myproj --extract
+
+  # Delete a session
+  claude-container -s myproj --delete --yes
 
   # Run claude in print mode
   claude-container -s myproj -- -p "What is this?"
@@ -273,7 +291,7 @@ Workflow:
   1. Start session:     claude-container -s myproj
   2. Do work in container...
   3. Exit container:    exit
-  4. Extract as branch: claude-container --extract myproj
+  4. Extract as branch: claude-container -s myproj --extract
   5. Use git normally:  git checkout myproj  OR  git merge myproj
 EOF
             exit 0
@@ -285,6 +303,60 @@ EOF
             ;;
     esac
 done
+
+# Handle actions that don't require a session
+case "$ACTION" in
+    list)
+        session_list
+        exit 0
+        ;;
+    cleanup)
+        session_cleanup
+        exit 0
+        ;;
+    cleanup-unused)
+        $ACTION_YES && session_cleanup_unused --yes || session_cleanup_unused
+        exit 0
+        ;;
+esac
+
+# Handle actions that require a session name
+if [[ -n "$ACTION" ]]; then
+    if [[ -z "$SESSION_NAME" ]]; then
+        error "Session name required: use --session <name> with --$ACTION"
+        exit 1
+    fi
+
+    case "$ACTION" in
+        extract)
+            $ACTION_FORCE && session_extract "$SESSION_NAME" --force || session_extract "$SESSION_NAME"
+            exit 0
+            ;;
+        delete)
+            delete_args=("$SESSION_NAME")
+            $ACTION_REGEX && delete_args+=(--regex)
+            $ACTION_YES && delete_args+=(--yes)
+            session_delete "${delete_args[@]}"
+            exit 0
+            ;;
+        repair)
+            session_repair "$SESSION_NAME"
+            exit 0
+            ;;
+        restart)
+            session_restart "$SESSION_NAME" "$0"
+            exit 0
+            ;;
+        import)
+            if [[ -z "$IMPORT_SOURCE" ]]; then
+                error "--import requires a source path"
+                exit 1
+            fi
+            $ACTION_FORCE && session_import "$IMPORT_SOURCE" "$SESSION_NAME" --force || session_import "$IMPORT_SOURCE" "$SESSION_NAME"
+            exit 0
+            ;;
+    esac
+fi
 
 # Validate session name is provided when required
 if ($USE_GIT_SESSION || $CONFIG_ONLY || [[ ${#ADD_REPOS[@]} -gt 0 ]]) && [[ -z "$SESSION_NAME" ]]; then
