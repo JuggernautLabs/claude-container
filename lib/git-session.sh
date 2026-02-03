@@ -86,10 +86,11 @@ create_multi_project_session() {
     mkdir -p "$CACHE_DIR"
 
     # Write config to temp file (streaming, not accumulating in memory)
+    # Format from parse_config_file: name|path|branch|track|source
     {
         echo 'version: "1"'
         echo 'projects:'
-        while IFS='|' read -r proj_name proj_path; do
+        while IFS='|' read -r proj_name proj_path proj_branch proj_track proj_source; do
             [[ -z "$proj_name" ]] && continue
             echo "  ${proj_name}:"
             echo "    path: ${proj_path}"
@@ -132,7 +133,7 @@ create_multi_project_session() {
     local log_dir="$CACHE_DIR/clone-logs-$$"
     mkdir -p "$log_dir"
 
-    while IFS='|' read -r project_name source_path source_branch source_track; do
+    while IFS='|' read -r project_name source_path source_branch source_track source_source; do
         [[ -z "$project_name" ]] && continue
         project_count=$((project_count + 1))
         project_names+=("$project_name")
