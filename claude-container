@@ -55,6 +55,7 @@ ENABLE_DOCKER=false  # Mount Docker socket for host Docker access
 CONFIG_ONLY=false    # Just generate config, don't create session
 SCAN_SESSION=false   # Scan session for new repos
 DISCOVER_REPOS_DIRS=()  # Array for multiple --discover-repos
+ADD_REPOS=()  # Array for repos to add via --add-repo
 SESSIONS_CONFIG_DIR="$CONFIG_DIR/sessions"  # Where session configs are stored
 CLAUDE_ARGS=()  # Arguments to pass through to claude
 NO_INTERACTIVE=false  # Fail fast if no token found (don't start OAuth flow)
@@ -106,13 +107,6 @@ case "${1:-}" in
     --import-session)
         shift
         session_import "$@"
-        exit 0
-        ;;
-
-    --add-repo)
-        # Usage: --add-repo <session> <repo-path> [workspace-path]
-        shift
-        session_add_repo "$@"
         exit 0
         ;;
 esac
@@ -179,6 +173,10 @@ while [[ $# -gt 0 ]]; do
             DISCOVER_REPOS_DIRS+=("$2")
             shift 2
             ;;
+        --add-repo|-a)
+            ADD_REPOS+=("$2")
+            shift 2
+            ;;
         --config|-C)
             CONFIG_FILE="$2"
             shift 2
@@ -243,6 +241,7 @@ Options:
   --as-root, --no-rootish  Run as actual root user
   --auto-sync <branch>     Override branch name for auto-merge on exit (default: session name)
   --discover-repos <dir>   Auto-discover all git repos in directory
+  --add-repo, -a <path>    Add a git repository to the session (works during init and for existing sessions)
   --config, -C <path>      Explicit path to .claude-projects.yml config file
   --verify, -v             Verify container setup works (run checks and exit)
   --shell, --bash          Start bash shell instead of claude
@@ -265,7 +264,6 @@ Session Management:
   --merge-session <name>   Merge session commits back to repo
                            Options: --into <branch> (target branch, default: session name)
                                     --from <branch> (create new branch from this, default: HEAD)
-  --add-repo <session> <path> [name]  Add a repo to an existing session
 
 Environment:
   CLAUDE_CODE_OAUTH_TOKEN   OAuth token for authentication (required)
@@ -274,6 +272,8 @@ Environment:
 Examples:
   claude-container -s myproj                           # Start git session "myproj"
   claude-container -s myproj --discover-repos ~/dev    # Discover repos and start session
+  claude-container -s myproj -a ~/repo1 -a ~/repo2     # Add specific repos to session
+  claude-container -s myproj -a ~/repo --no-run        # Add repo during init (before starting)
   claude-container -s myproj --continue                # Resume session AND continue conversation
   claude-container -s myproj --scan                    # Find new repos created in session
   claude-container --no-git-session                    # Direct mount cwd (no isolation)
@@ -291,8 +291,14 @@ EOF
 done
 
 # Validate session name is provided when required
-if ($USE_GIT_SESSION || $CONFIG_ONLY || $SCAN_SESSION) && [[ -z "$SESSION_NAME" ]]; then
+if ($USE_GIT_SESSION || $CONFIG_ONLY || $SCAN_SESSION || [[ ${#ADD_REPOS[@]} -gt 0 ]]) && [[ -z "$SESSION_NAME" ]]; then
     error "Session name required: use --session <name>"
+    exit 1
+fi
+
+# Validate --add-repo requires git session mode
+if [[ ${#ADD_REPOS[@]} -gt 0 ]] && ! $USE_GIT_SESSION; then
+    error "--add-repo requires git session mode (use --session)"
     exit 1
 fi
 
@@ -445,6 +451,13 @@ if $USE_GIT_SESSION; then
     fi
 
     create_git_session "$SESSION_NAME" "$WORKSPACE_DIR"
+
+    # Handle --add-repo: add repos to session (works for both new and existing sessions)
+    if [[ ${#ADD_REPOS[@]} -gt 0 ]]; then
+        for repo_path in "${ADD_REPOS[@]}"; do
+            session_add_repo "$SESSION_NAME" "$repo_path"
+        done
+    fi
 
     if $NO_RUN; then
         success "Session ready: $SESSION_NAME"

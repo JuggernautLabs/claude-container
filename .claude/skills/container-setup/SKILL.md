@@ -41,9 +41,11 @@ Ask how they want to specify repositories:
 
 1. **Current directory** (default) - Clone the repo in the current working directory
 2. **Discover repos** - Auto-discover all git repos in a parent directory (e.g., `~/dev/myproject`)
-3. **Config file** - Use an existing `.claude-projects.yml` for multi-project setup
+3. **Specific repos** - Add specific repos one at a time with `--add-repo` / `-a` flag
+4. **Config file** - Use an existing `.claude-projects.yml` for multi-project setup
 
 If they choose "Discover repos", ask for the directory path.
+If they choose "Specific repos", ask for repo paths (can specify multiple with `-a <path1> -a <path2>`).
 If they choose "Config file", ask for the path (or use auto-detection).
 
 ### Optional: Tracked vs Untracked
@@ -105,6 +107,7 @@ Options to include based on answers:
 - `--import-session <path> <session-name>` - if importing an existing session (run this FIRST, before other setup)
 - `--token <token>` or `-t <token>` - if providing OAuth token directly
 - `--discover-repos <path>` - if they chose repo discovery
+- `--add-repo <path>` or `-a <path>` - if they want to add specific repos (can repeat for multiple repos)
 - `--config <path>` - if they specified a config file
 - `--as-rootish` - rootish mode (default, can omit)
 - `--as-user` - if they chose user mode
@@ -163,6 +166,18 @@ claude-container -s my-feature
 ### Multi-Project with Discovery
 ```bash
 claude-container -s my-feature --discover-repos ~/dev/myproject
+```
+
+### Specific Repos (Manual Selection)
+```bash
+# Add specific repos one at a time
+claude-container -s my-feature -a ~/dev/app -a ~/dev/shared-lib
+
+# Add repos during init (with --no-run)
+claude-container -s my-feature -a ~/dev/app --no-run
+
+# Add repos to existing session
+claude-container -s existing-session -a ~/dev/new-repo
 ```
 
 ### Multi-Project with Config File
