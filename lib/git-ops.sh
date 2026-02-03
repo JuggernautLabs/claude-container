@@ -468,7 +468,57 @@ sync_local_to_session() {
     local session_path="/session"
     [[ -n "$project_name" ]] && session_path="/session/$project_name"
 
-    # Mount both local and session, fetch and reset
+    # Check if local_path is a worktree (has .git file instead of .git directory)
+    # Worktrees can't be mounted in docker because their .git points to host paths
+    local is_worktree=false
+    if [[ -f "$local_path/.git" ]]; then
+        is_worktree=true
+    fi
+
+    if $is_worktree; then
+        # For worktrees: create bundle on host, pipe via stdin to container
+        local temp_bundle=$(mktemp)
+        trap "rm -f '$temp_bundle'" RETURN
+
+        # Get session HEAD for comparison
+        local session_head
+        session_head=$(docker run --rm -v "$volume:/session:ro" \
+            ${IMAGE_NAME:-$DEFAULT_IMAGE} sh -c "
+                git config --global --add safe.directory '*'
+                cd $session_path
+                git rev-parse HEAD
+            " 2>/dev/null)
+
+        # Same commit = already synced
+        if [[ "$local_head" == "$session_head" ]]; then
+            return 0
+        fi
+
+        # Create bundle from local (on host)
+        git -C "$local_path" bundle create "$temp_bundle" HEAD 2>/dev/null
+
+        # Count commits to push
+        local count=0
+        if [[ -n "$session_head" ]]; then
+            count=$(git -C "$local_path" rev-list --count "$session_head..HEAD" 2>/dev/null || echo 0)
+        fi
+
+        # Pipe bundle via stdin (volume mounts don't work reliably for temp files on macOS)
+        cat "$temp_bundle" | docker run --rm -i \
+            -v "$volume:/session" \
+            ${IMAGE_NAME:-$DEFAULT_IMAGE} sh -c "
+                git config --global --add safe.directory '*'
+                cat > /tmp/bundle.pack
+                cd $session_path
+                git fetch /tmp/bundle.pack HEAD:refs/remotes/local/HEAD 2>/dev/null
+                git reset --hard refs/remotes/local/HEAD
+            " >/dev/null 2>&1
+
+        success "Pushed $count commit(s) to session"
+        return 0
+    fi
+
+    # Regular repo (not worktree) - mount in container
     local output
     output=$(docker run --rm \
         -v "$volume:/session" \
@@ -545,9 +595,83 @@ sync_session_to_local() {
     [[ -n "$project_name" ]] && session_path="/session/$project_name"
 
     info "Syncing session → local ($branch)..."
-    echo "DEBUG: Using commit-based sync (fix applied)" >&2
 
-    # Mount both session and local, fetch from session and merge
+    # Check if local_path is a worktree (has .git file instead of .git directory)
+    # Worktrees can't be mounted in docker because their .git points to host paths
+    local is_worktree=false
+    if [[ -f "$local_path/.git" ]]; then
+        is_worktree=true
+    fi
+
+    if $is_worktree; then
+        # For worktrees: extract session commits to temp bundle, apply on host
+        local temp_bundle=$(mktemp)
+        trap "rm -f '$temp_bundle'" RETURN
+
+        # Get session HEAD
+        local session_head
+        session_head=$(docker run --rm -v "$volume:/session:ro" \
+            ${IMAGE_NAME:-$DEFAULT_IMAGE} sh -c "
+                git config --global --add safe.directory '*'
+                cd $session_path
+                git rev-parse HEAD
+            " 2>/dev/null)
+
+        local local_head
+        local_head=$(git -C "$local_path" rev-parse HEAD 2>/dev/null)
+
+        # Same commit = already synced
+        if [[ "$session_head" == "$local_head" ]]; then
+            success "Already synced"
+            echo "ALREADY_SYNCED:0"
+            return 0
+        fi
+
+        # Create bundle from session and pipe via stdout (volume mounts don't work for temp files on macOS)
+        docker run --rm -v "$volume:/session:ro" \
+            ${IMAGE_NAME:-$DEFAULT_IMAGE} sh -c "
+                git config --global --add safe.directory '*'
+                cd $session_path
+                git bundle create /tmp/bundle.pack HEAD >&2
+                cat /tmp/bundle.pack
+            " > "$temp_bundle" 2>/dev/null
+
+        # Fetch from bundle on host
+        git -C "$local_path" fetch "$temp_bundle" HEAD:refs/remotes/session/HEAD 2>/dev/null
+
+        # Check if local is ancestor of session (can fast-forward)
+        if git -C "$local_path" merge-base --is-ancestor HEAD refs/remotes/session/HEAD 2>/dev/null; then
+            local commit_count
+            commit_count=$(git -C "$local_path" rev-list --count HEAD..refs/remotes/session/HEAD)
+            git -C "$local_path" merge --ff-only refs/remotes/session/HEAD --quiet 2>/dev/null
+            success "Merged $commit_count commit(s) from session"
+            echo "SYNCED:$commit_count"
+            return 0
+        fi
+
+        # Check if session is ancestor of local (local is ahead)
+        if git -C "$local_path" merge-base --is-ancestor refs/remotes/session/HEAD HEAD 2>/dev/null; then
+            success "Local is ahead of session"
+            echo "LOCAL_AHEAD:0"
+            return 0
+        fi
+
+        # Diverged - try to merge
+        local commit_count
+        commit_count=$(git -C "$local_path" rev-list --count HEAD..refs/remotes/session/HEAD)
+        if git -C "$local_path" merge refs/remotes/session/HEAD -m 'Merge session changes' --quiet 2>/dev/null; then
+            success "Merged $commit_count commit(s) from session (diverged)"
+            echo "MERGED:$commit_count"
+            return 0
+        else
+            git -C "$local_path" merge --abort 2>/dev/null
+            error "Merge conflict - manual resolution required"
+            echo "CONFLICT:0"
+            return 1
+        fi
+    fi
+
+    # Regular repo (not worktree) - mount in container
     local output
     output=$(docker run --rm \
         -v "$volume:/session:ro" \
@@ -566,17 +690,11 @@ sync_session_to_local() {
             SESSION_HEAD=\$(git rev-parse FETCH_HEAD 2>/dev/null)
             LOCAL_HEAD=\$(git rev-parse HEAD 2>/dev/null)
 
-            # DEBUG: Output commit hashes to stderr so they're visible
-            echo \"DEBUG: SESSION_HEAD=\$SESSION_HEAD\" >&2
-            echo \"DEBUG: LOCAL_HEAD=\$LOCAL_HEAD\" >&2
-
             # Same commit = already synced
             if [ \"\$SESSION_HEAD\" = \"\$LOCAL_HEAD\" ]; then
-                echo \"DEBUG: Commits match - already synced\" >&2
                 echo 'ALREADY_SYNCED:0'
                 exit 0
             fi
-            echo \"DEBUG: Commits differ - need to sync\" >&2
 
             # Check if local is ancestor of session (can fast-forward)
             if git merge-base --is-ancestor HEAD FETCH_HEAD 2>/dev/null; then
@@ -733,6 +851,9 @@ merge_session_project() {
 
     # Then sync session to local (pull any session changes)
     sync_session_to_local "$volume" "$project_name" "$target_path" || return 1
+
+    # If merge created a new commit (diverged case), push it back to session
+    sync_local_to_session "$volume" "$project_name" "$target_path" || return 1
 
     # Verify sync succeeded
     verify_sync "$volume" "$project_name" "$target_path"
