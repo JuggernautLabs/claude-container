@@ -238,7 +238,7 @@ Extraction creates branches in each original repository that had changes.
 | **Git-session container** | **Medium** | **Branch-based** | **Review before merge** |
 
 Claude Container optimizes for the **development workflow** where:
-- Iteration speed matters (container startup < 2s)
+- Iteration speed matters 
 - Changes need review before integration
 - Multiple experimental branches are common
 - Package caches should be reusable
