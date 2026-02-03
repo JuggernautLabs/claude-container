@@ -685,33 +685,35 @@ _extract_single_project() {
         git -C "$target_repo" branch -D "$session_name" 2>/dev/null || true
     fi
 
-    # Fetch from temp and create branch
-    info "Creating branch '$session_name'..."
+    # Fetch from temp to check for changes
     git -C "$target_repo" fetch "$temp_dir" HEAD 2>/dev/null
-    git -C "$target_repo" branch "$session_name" FETCH_HEAD 2>/dev/null
 
-    # Get change summary
+    # Compare FETCH_HEAD to current HEAD
     local current_head
     current_head=$(git -C "$target_repo" rev-parse HEAD 2>/dev/null)
-    local session_head
-    session_head=$(git -C "$target_repo" rev-parse "$session_name" 2>/dev/null)
+    local fetched_head
+    fetched_head=$(git -C "$target_repo" rev-parse FETCH_HEAD 2>/dev/null)
 
-    if [[ "$current_head" == "$session_head" ]]; then
-        success "Created branch: $session_name (no changes)"
-    else
-        local commit_count
-        commit_count=$(git -C "$target_repo" rev-list --count "$current_head".."$session_name" 2>/dev/null || echo "0")
-        local files_changed
-        files_changed=$(git -C "$target_repo" diff --stat --name-only "$current_head".."$session_name" 2>/dev/null | wc -l | tr -d ' ')
-
-        success "Created branch: $session_name ($commit_count commit(s), $files_changed file(s) changed)"
-        echo ""
-        echo "Commits:"
-        git -C "$target_repo" log --oneline "$current_head".."$session_name" 2>/dev/null | head -10 || true
-        echo ""
-        echo "Files changed:"
-        git -C "$target_repo" diff --stat "$current_head".."$session_name" 2>/dev/null | tail -20 || true
+    if [[ "$current_head" == "$fetched_head" ]]; then
+        info "No changes in session (matches current HEAD)"
+        return 0
     fi
+
+    # Create branch since there are changes
+    git -C "$target_repo" branch "$session_name" FETCH_HEAD 2>/dev/null
+
+    local commit_count
+    commit_count=$(git -C "$target_repo" rev-list --count "$current_head".."$session_name" 2>/dev/null || echo "0")
+    local files_changed
+    files_changed=$(git -C "$target_repo" diff --stat --name-only "$current_head".."$session_name" 2>/dev/null | wc -l | tr -d ' ')
+
+    success "Created branch: $session_name ($commit_count commit(s), $files_changed file(s) changed)"
+    echo ""
+    echo "Commits:"
+    git -C "$target_repo" log --oneline "$current_head".."$session_name" 2>/dev/null | head -10 || true
+    echo ""
+    echo "Files changed:"
+    git -C "$target_repo" diff --stat "$current_head".."$session_name" 2>/dev/null | tail -20 || true
 
     echo ""
     echo "To see changes:  git log HEAD..$session_name"
@@ -771,39 +773,39 @@ _extract_multi_project() {
             git -C "$proj_path" branch -D "$session_name" 2>/dev/null || true
         fi
 
-        # Fetch and create branch
-        if git -C "$proj_path" fetch "$session_proj_dir" HEAD 2>/dev/null && \
-           git -C "$proj_path" branch "$session_name" FETCH_HEAD 2>/dev/null; then
-
-            # Get change summary comparing session branch to current HEAD
-            local current_head
-            current_head=$(git -C "$proj_path" rev-parse HEAD 2>/dev/null)
-            local session_head
-            session_head=$(git -C "$proj_path" rev-parse "$session_name" 2>/dev/null)
-
-            local change_info=""
-            if [[ "$current_head" == "$session_head" ]]; then
-                change_info="(no changes)"
-            else
-                # Count commits and changed files
-                local commit_count
-                commit_count=$(git -C "$proj_path" rev-list --count "$current_head".."$session_name" 2>/dev/null || echo "0")
-                local files_changed
-                files_changed=$(git -C "$proj_path" diff --stat --name-only "$current_head".."$session_name" 2>/dev/null | wc -l | tr -d ' ')
-
-                if [[ "$commit_count" == "0" && "$files_changed" == "0" ]]; then
-                    change_info="(no changes)"
-                else
-                    change_info="($commit_count commit(s), $files_changed file(s))"
-                fi
-            fi
-
-            success "  $proj_name → branch '$session_name' $change_info"
-            success_count=$((success_count + 1))
-        else
-            error "  $proj_name failed"
+        # Fetch to check for changes
+        if ! git -C "$proj_path" fetch "$session_proj_dir" HEAD 2>/dev/null; then
+            error "  $proj_name fetch failed"
             fail_count=$((fail_count + 1))
+            continue
         fi
+
+        # Compare FETCH_HEAD to current HEAD
+        local current_head
+        current_head=$(git -C "$proj_path" rev-parse HEAD 2>/dev/null)
+        local fetched_head
+        fetched_head=$(git -C "$proj_path" rev-parse FETCH_HEAD 2>/dev/null)
+
+        if [[ "$current_head" == "$fetched_head" ]]; then
+            echo "  $proj_name (no changes)"
+            continue
+        fi
+
+        # Create branch since there are changes
+        if ! git -C "$proj_path" branch "$session_name" FETCH_HEAD 2>/dev/null; then
+            error "  $proj_name branch creation failed"
+            fail_count=$((fail_count + 1))
+            continue
+        fi
+
+        # Count commits and changed files
+        local commit_count
+        commit_count=$(git -C "$proj_path" rev-list --count "$current_head".."$session_name" 2>/dev/null || echo "0")
+        local files_changed
+        files_changed=$(git -C "$proj_path" diff --stat --name-only "$current_head".."$session_name" 2>/dev/null | wc -l | tr -d ' ')
+
+        success "  $proj_name → branch '$session_name' ($commit_count commit(s), $files_changed file(s))"
+        success_count=$((success_count + 1))
     done <<< "$projects"
 
     echo ""
