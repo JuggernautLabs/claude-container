@@ -564,11 +564,9 @@ sync_session_to_local() {
             # Get commit info
             SESSION_HEAD=\$(git rev-parse FETCH_HEAD 2>/dev/null)
             LOCAL_HEAD=\$(git rev-parse HEAD 2>/dev/null)
-            SESSION_TREE=\$(git rev-parse FETCH_HEAD^{tree} 2>/dev/null)
-            LOCAL_TREE=\$(git rev-parse HEAD^{tree} 2>/dev/null)
 
-            # Same tree = already synced
-            if [ \"\$SESSION_TREE\" = \"\$LOCAL_TREE\" ]; then
+            # Same commit = already synced
+            if [ \"\$SESSION_HEAD\" = \"\$LOCAL_HEAD\" ]; then
                 echo 'ALREADY_SYNCED:0'
                 exit 0
             fi
