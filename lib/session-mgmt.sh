@@ -4,7 +4,7 @@
 #
 # Dependencies:
 #   - utils.sh must be sourced first (provides: info, success, warn, error)
-#   - git-ops.sh must be sourced first (provides: diff_git_session, merge_git_session)
+#   - git-ops.sh must be sourced first (provides: diff_git_session)
 #   - docker-utils.sh must be sourced first (provides: docker_run_in_volume, get_volume_sizes_batch, etc.)
 #
 # This module provides functions for managing claude-container sessions:
@@ -521,55 +521,48 @@ session_add_repo() {
         " 2>/dev/null || true
 }
 
-# Merge session commits back to original repo
-# Usage: session_merge <session_name> [source_dir] [--into <branch>] [--from <branch>] [--auto] [--no-run]
-# Note: Calls merge_git_session from git-ops.sh
+# Merge session commits back to original repo (DEPRECATED)
+# Usage: session_merge <session_name> [--force]
+# Note: Redirects to session_extract (one-way extraction)
 session_merge() {
     local session_name="$1"
     shift
 
     if [[ -z "$session_name" ]]; then
         echo "Error: session_merge requires a session name"
-        echo "Usage: session_merge <name> [--into <branch>] [--from <branch>] [--auto] [--no-run]"
+        echo "Usage: session_merge <name> [--force]"
         return 1
     fi
 
-    local source_dir="$(pwd)"
-    local target_branch=""
-    local from_branch=""
-    local auto_mode=false
-    local no_run=false
+    local force=false
 
     # Parse options
     while [[ $# -gt 0 ]]; do
         case $1 in
-            --into)
-                target_branch="$2"
-                shift 2
-                ;;
-            --from)
-                from_branch="$2"
-                shift 2
-                ;;
-            --auto|--yes|-y)
-                auto_mode=true
+            --force|-f|--yes|-y|--auto)
+                force=true
                 shift
                 ;;
-            --no-run|--dry-run)
-                no_run=true
-                shift
+            --into|--from)
+                # Deprecated options - ignore with warning
+                warn "Option $1 is deprecated. Use --extract-session for one-way extraction."
+                shift 2
                 ;;
             *)
-                # Assume it's the source directory if not an option
-                if [[ ! "$1" =~ ^-- ]]; then
-                    source_dir="$1"
-                fi
                 shift
                 ;;
         esac
     done
 
-    merge_git_session "$session_name" "$source_dir" "$target_branch" "$auto_mode" "$no_run" "$from_branch"
+    # Redirect to the new extraction workflow
+    warn "--merge-session is deprecated. Use --extract-session instead."
+    echo ""
+
+    if $force; then
+        session_extract "$session_name" --force
+    else
+        session_extract "$session_name"
+    fi
 }
 
 # Import a claude-code session into a container session
