@@ -623,7 +623,9 @@ session_extract() {
             return 1
         else
             warn "Removing existing worktree: $worktree_dir"
-            rm -rf "$worktree_dir"
+            # Use docker to remove in case files are root-owned
+            docker run --rm -v "$worktree_dir:/dest" alpine rm -rf /dest/* /dest/.[!.]* 2>/dev/null || true
+            rm -rf "$worktree_dir" 2>/dev/null || true
         fi
     fi
 
@@ -634,9 +636,13 @@ session_extract() {
     mkdir -p "$worktree_dir"
 
     local git_image="${IMAGE_NAME:-$DEFAULT_IMAGE}"
+    local host_uid
+    host_uid=$(get_host_uid)
 
     # Extract the entire session to worktree (simple copy)
+    # Run as host user so files have correct ownership
     if ! docker run --rm \
+        --user "$host_uid:$host_uid" \
         -v "$volume:/session:ro" \
         -v "$worktree_dir:/dest" \
         "$git_image" \
@@ -652,7 +658,9 @@ session_extract() {
             git rev-parse --abbrev-ref HEAD 2>/dev/null || echo 'detached HEAD'
         " 2>&1; then
         error "Failed to extract session"
-        rm -rf "$worktree_dir"
+        # Cleanup with docker in case files are root-owned
+        docker run --rm -v "$worktree_dir:/dest" alpine rm -rf /dest/* /dest/.[!.]* 2>/dev/null || true
+        rmdir "$worktree_dir" 2>/dev/null || true
         return 1
     fi
 
@@ -709,6 +717,13 @@ session_cleanup_worktree() {
         fi
     fi
 
-    rm -rf "$worktree_dir"
+    # Use docker to remove in case files are root-owned
+    docker run --rm -v "$worktree_dir:/dest" alpine rm -rf /dest/* /dest/.[!.]* 2>/dev/null || true
+    rm -rf "$worktree_dir" 2>/dev/null || true
+
+    if [[ -d "$worktree_dir" ]]; then
+        error "Failed to delete worktree (may need sudo): $worktree_dir"
+        return 1
+    fi
     success "Worktree deleted: $worktree_dir"
 }
