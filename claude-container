@@ -370,27 +370,25 @@ mkdir -p "$SESSIONS_CONFIG_DIR"
 # Ensure token is available (from config, keychain, or interactive auth)
 ensure_token
 
-# Check for YAML parser if we'll need it (multi-project mode)
-if $USE_GIT_SESSION || [[ -n "$CONFIG_FILE" ]]; then
-    will_use_config=false
-    if [[ -n "$CONFIG_FILE" ]]; then
-        will_use_config=true
-    elif $USE_GIT_SESSION; then
-        workspace="${WORKSPACE_DIR:-$(pwd)}"
-        for candidate in \
-            "$workspace/.claude-projects.yml" \
-            "$workspace/.devcontainer/claude-projects.yml" \
-            "$workspace/claude-projects.yml"; do
-            if [[ -f "$candidate" ]]; then
-                will_use_config=true
-                break
-            fi
-        done
-    fi
+# Auto-discover config file if not explicitly set
+if [[ -z "$CONFIG_FILE" ]] && $USE_GIT_SESSION; then
+    workspace="${WORKSPACE_DIR:-$(pwd)}"
+    for candidate in \
+        "$workspace/.claude-projects.yml" \
+        "$workspace/.devcontainer/claude-projects.yml" \
+        "$workspace/claude-projects.yml"; do
+        if [[ -f "$candidate" ]]; then
+            CONFIG_FILE="$candidate"
+            break
+        fi
+    done
+fi
 
-    if $will_use_config && ! check_yaml_parser_available; then
+# Check for YAML parser if we'll need it (multi-project mode)
+if [[ -n "$CONFIG_FILE" ]]; then
+    if ! check_yaml_parser_available; then
         echo ""
-        warn "Multi-project config detected but YAML parser not available"
+        warn "Config file found but YAML parser not available"
         show_yaml_parser_install_help
         exit 1
     fi
