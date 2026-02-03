@@ -36,7 +36,6 @@ source "$SCRIPT_DIR/lib/session-mgmt.sh"
 
 # Global state variables
 DOCKERFILE=""
-FORCE_BUILD=false
 SESSION_DIR=""
 VERIFY_MODE=false
 SESSION_NAME=""
@@ -69,10 +68,6 @@ IMPORT_SOURCE=""
 # Parse arguments
 while [[ $# -gt 0 ]]; do
     case $1 in
-        --build|-b)
-            FORCE_BUILD=true
-            shift
-            ;;
         --dir|-d)
             SESSION_DIR="$2"
             shift 2
@@ -233,8 +228,7 @@ Options:
   --continue, -c           Continue the most recent Claude conversation
   --no-git-session         Disable git-based isolation (mount cwd directly)
   --config-only            Generate config file only, don't create session
-  --build, -b              Force rebuild the image
-  --dockerfile [path]      Specify Dockerfile path (auto-detected if present)
+  --dockerfile [path]      Use Dockerfile (auto-detected, or set in config)
   --token, -t <token>      Provide OAuth token directly
   --as-user                Run as non-root developer user (no sudo)
   --as-rootish             Run as developer with passwordless sudo (default)
@@ -403,7 +397,23 @@ if $USE_GIT_SESSION || [[ -n "$CONFIG_FILE" ]]; then
 fi
 
 # Determine image to use
-# Auto-detect local Dockerfile unless explicit path given via --dockerfile
+# Priority: 1. --dockerfile flag, 2. config file dockerfile field, 3. local Dockerfile, 4. default image
+if [[ -z "$DOCKERFILE" ]]; then
+    # Check config file for dockerfile field
+    if [[ -n "${CONFIG_FILE:-}" ]] && command -v yq &>/dev/null; then
+        config_dockerfile=$(yq eval '.dockerfile // ""' "$CONFIG_FILE" 2>/dev/null || echo "")
+        if [[ -n "$config_dockerfile" ]]; then
+            # Resolve relative to config file location
+            if [[ "$config_dockerfile" != /* ]]; then
+                config_dir=$(dirname "$CONFIG_FILE")
+                DOCKERFILE="$config_dir/$config_dockerfile"
+            else
+                DOCKERFILE="$config_dockerfile"
+            fi
+        fi
+    fi
+fi
+
 if [[ -z "$DOCKERFILE" ]]; then
     # Search for Dockerfile in standard locations
     for candidate in "./Dockerfile" "./.devcontainer/Dockerfile" "./docker/Dockerfile"; do
@@ -428,7 +438,7 @@ fi
 
 if $USE_DEFAULT_IMAGE; then
     IMAGE_EXISTS=$(docker images -q "$IMAGE_NAME" 2>/dev/null)
-    if [[ -z "$IMAGE_EXISTS" ]] || $FORCE_BUILD; then
+    if [[ -z "$IMAGE_EXISTS" ]]; then
         info "Pulling image: $IMAGE_NAME"
         docker pull "$IMAGE_NAME" &
         spin $!
@@ -445,8 +455,21 @@ else
     PROJECT_NAME="$(basename "$(pwd)" | tr '[:upper:]' '[:lower:]' | tr -cd '[:alnum:]-')"
     IMAGE_NAME="claude-dev-${PROJECT_NAME}"
 
+    # Check if image needs rebuilding (doesn't exist or Dockerfile is newer)
     IMAGE_EXISTS=$(docker images -q "$IMAGE_NAME" 2>/dev/null)
-    if [[ -z "$IMAGE_EXISTS" ]] || $FORCE_BUILD; then
+    NEEDS_BUILD=false
+    if [[ -z "$IMAGE_EXISTS" ]]; then
+        NEEDS_BUILD=true
+    else
+        # Check if Dockerfile is newer than image
+        IMAGE_CREATED=$(docker inspect -f '{{.Created}}' "$IMAGE_NAME" 2>/dev/null | cut -d'T' -f1 | tr -d '-')
+        DOCKERFILE_MODIFIED=$(stat -f %Sm -t %Y%m%d "$DOCKERFILE" 2>/dev/null || stat -c %Y "$DOCKERFILE" 2>/dev/null | xargs -I{} date -d @{} +%Y%m%d 2>/dev/null || echo "0")
+        if [[ "$DOCKERFILE_MODIFIED" > "$IMAGE_CREATED" ]]; then
+            NEEDS_BUILD=true
+        fi
+    fi
+
+    if $NEEDS_BUILD; then
         info "Building image: $IMAGE_NAME"
         docker build -t "$IMAGE_NAME" -f "$DOCKERFILE" "$CONTEXT_DIR" &
         spin $!

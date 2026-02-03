@@ -173,8 +173,7 @@ claude-container --cleanup-unused --yes
 | `--no-git-session` | Mount cwd directly (no isolation) |
 | `--shell, --bash` | Start bash instead of Claude |
 | `--docker` | Mount Docker socket |
-| `--dockerfile [path]` | Use custom Dockerfile |
-| `-b, --build` | Force rebuild image |
+| `--dockerfile [path]` | Use Dockerfile (auto-detected or from config) |
 | `--no-run` | Set up session without starting |
 
 ### Action Modifiers
@@ -193,6 +192,7 @@ Work across multiple repositories in a single session:
 # .claude-projects.yml
 version: "1"
 main: backend/api
+dockerfile: ./Dockerfile.dev    # Optional: custom Dockerfile
 projects:
   backend/api:
     path: ~/dev/api

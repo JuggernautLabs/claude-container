@@ -188,6 +188,7 @@ claude-container -s my-feature --import ~/.claude
 ```yaml
 version: "1"
 main: my-app
+dockerfile: ./Dockerfile.dev    # Optional: auto-builds when changed
 projects:
   my-app:
     path: ./my-app
