@@ -607,7 +607,8 @@ session_extract() {
     fi
 
     local volume="claude-session-${session_name}"
-    local worktree_dir="$CONFIG_DIR/worktrees/$session_name"
+    local temp_dir="$CACHE_DIR/extract-$$"
+    local git_image="${IMAGE_NAME:-$DEFAULT_IMAGE}"
 
     # Verify session exists
     if ! docker volume inspect "$volume" &>/dev/null; then
@@ -615,24 +616,9 @@ session_extract() {
         return 1
     fi
 
-    # Check if worktree already exists
-    if [[ -d "$worktree_dir" ]]; then
-        if ! $force; then
-            error "Worktree already exists: $worktree_dir"
-            echo "Use --force to overwrite"
-            return 1
-        else
-            warn "Removing existing worktree: $worktree_dir"
-            # Use docker to remove in case files are root-owned
-            docker run --rm -v "$worktree_dir:/dest" alpine rm -rf /dest/* /dest/.[!.]* 2>/dev/null || true
-            rm -rf "$worktree_dir" 2>/dev/null || true
-        fi
-    fi
-
-    # Create worktree directory
-    mkdir -p "$worktree_dir"
-
-    local git_image="${IMAGE_NAME:-$DEFAULT_IMAGE}"
+    # Create temp extraction directory
+    mkdir -p "$temp_dir"
+    trap "rm -rf '$temp_dir'" EXIT
 
     # Get session size for progress display
     local session_size
@@ -643,99 +629,146 @@ session_extract() {
         du -sh /session 2>/dev/null | cut -f1)
 
     info "Extracting session '$session_name' ($session_size_human)..."
-    info "Destination: $worktree_dir"
 
-    # Extract using tar pipe (faster than cp -r through Docker VM)
-    # Use pv for progress if available, otherwise just stream
+    # Extract using tar pipe
     local extract_status
     if command -v pv &>/dev/null && [[ -n "$session_size" ]]; then
         docker run --rm \
             -v "$volume:/session:ro" \
             "$git_image" \
-            tar -C /session -cf - . 2>/dev/null | pv -s "$session_size" | tar -C "$worktree_dir" -xf -
+            tar -C /session -cf - . 2>/dev/null | pv -s "$session_size" | tar -C "$temp_dir" -xf -
         extract_status=$?
     else
         docker run --rm \
             -v "$volume:/session:ro" \
             "$git_image" \
-            tar -C /session -cf - . 2>/dev/null | tar -C "$worktree_dir" -xf -
+            tar -C /session -cf - . 2>/dev/null | tar -C "$temp_dir" -xf -
         extract_status=$?
     fi
 
     if [[ $extract_status -ne 0 ]]; then
         error "Failed to extract session"
-        rm -rf "$worktree_dir" 2>/dev/null || true
         return 1
     fi
 
-    # Show extraction info
-    echo "---"
-    echo "Extracted:"
-    git -C "$worktree_dir" log --oneline -5 2>/dev/null || echo "No git history"
-    echo "---"
-    echo "Branch:"
-    git -C "$worktree_dir" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "detached HEAD"
-
-    success "Session extracted to: $worktree_dir"
-    echo ""
-    echo "Next steps:"
-    echo "  1. Review changes:"
-    echo "     cd $worktree_dir"
-    echo "     git log"
-    echo ""
-    echo "  2. Merge manually (from your repo):"
-    echo "     git fetch $worktree_dir"
-    echo "     git merge FETCH_HEAD"
-    echo ""
-    echo "  3. Cleanup when done:"
-    echo "     claude-container --cleanup-worktree $session_name"
+    # Check if multi-project (has .claude-projects.yml)
+    if [[ -f "$temp_dir/.claude-projects.yml" ]]; then
+        _extract_multi_project "$session_name" "$temp_dir" "$force"
+    else
+        _extract_single_project "$session_name" "$temp_dir" "$force"
+    fi
 }
 
-# Cleanup worktree for a session
-# Usage: session_cleanup_worktree <session_name> [--yes]
-session_cleanup_worktree() {
+# Extract single-project session into original repo as branch
+_extract_single_project() {
     local session_name="$1"
-    local skip_confirm=false
+    local temp_dir="$2"
+    local force="$3"
 
-    # Parse flags
-    shift
-    while [[ $# -gt 0 ]]; do
-        case "$1" in
-            --yes|-y) skip_confirm=true; shift ;;
-            *) shift ;;
-        esac
-    done
+    # For single project, we need to know where the original repo is
+    # The user should run this from the original repo directory
+    local target_repo
+    target_repo=$(pwd)
 
-    if [[ -z "$session_name" ]]; then
-        error "Usage: session_cleanup_worktree <session_name> [--yes]"
+    if ! is_git_repo "$target_repo"; then
+        error "Run this from your git repository directory"
         return 1
     fi
 
-    local worktree_dir="$CONFIG_DIR/worktrees/$session_name"
-
-    if [[ ! -d "$worktree_dir" ]]; then
-        warn "Worktree does not exist: $worktree_dir"
-        return 0
-    fi
-
-    info "Worktree: $worktree_dir"
-
-    # Confirm unless --yes
-    if ! $skip_confirm; then
-        read -p "Delete this worktree? [y/N] " confirm
-        if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
-            echo "Cancelled"
-            return 0
+    # Check if branch already exists
+    if git -C "$target_repo" show-ref --verify --quiet "refs/heads/$session_name" 2>/dev/null; then
+        if [[ "$force" != "true" ]]; then
+            error "Branch '$session_name' already exists. Use --force to overwrite."
+            return 1
         fi
+        warn "Overwriting existing branch: $session_name"
+        git -C "$target_repo" branch -D "$session_name" 2>/dev/null || true
     fi
 
-    # Use docker to remove in case files are root-owned
-    docker run --rm -v "$worktree_dir:/dest" alpine rm -rf /dest/* /dest/.[!.]* 2>/dev/null || true
-    rm -rf "$worktree_dir" 2>/dev/null || true
+    # Fetch from temp and create branch
+    info "Creating branch '$session_name'..."
+    git -C "$target_repo" fetch "$temp_dir" HEAD 2>/dev/null
+    git -C "$target_repo" branch "$session_name" FETCH_HEAD 2>/dev/null
 
-    if [[ -d "$worktree_dir" ]]; then
-        error "Failed to delete worktree (may need sudo): $worktree_dir"
+    success "Created branch: $session_name"
+    echo ""
+    git -C "$target_repo" log --oneline "$session_name" -5 2>/dev/null || true
+    echo ""
+    echo "Checkout: git checkout $session_name"
+    echo "Merge:    git merge $session_name"
+}
+
+# Extract multi-project session into original repos as branches
+_extract_multi_project() {
+    local session_name="$1"
+    local temp_dir="$2"
+    local force="$3"
+
+    info "Multi-project session detected"
+    echo ""
+
+    # Parse the config to get project paths
+    local config_file="$temp_dir/.claude-projects.yml"
+
+    if ! command -v yq &>/dev/null; then
+        error "yq required for multi-project extraction"
         return 1
     fi
-    success "Worktree deleted: $worktree_dir"
+
+    # Get project names and their original paths
+    local projects
+    projects=$(yq eval '.projects | to_entries | .[] | .key + "|" + .value.path' "$config_file" 2>/dev/null)
+
+    local success_count=0
+    local fail_count=0
+
+    while IFS='|' read -r proj_name proj_path; do
+        [[ -z "$proj_name" ]] && continue
+
+        local session_proj_dir="$temp_dir/$proj_name"
+
+        # Skip if project dir doesn't exist in session
+        if [[ ! -d "$session_proj_dir" ]]; then
+            warn "Skipping $proj_name (not in session)"
+            continue
+        fi
+
+        # Check if original repo exists
+        if [[ ! -d "$proj_path" ]]; then
+            warn "Skipping $proj_name (original repo not found: $proj_path)"
+            fail_count=$((fail_count + 1))
+            continue
+        fi
+
+        # Check if branch already exists
+        if git -C "$proj_path" show-ref --verify --quiet "refs/heads/$session_name" 2>/dev/null; then
+            if [[ "$force" != "true" ]]; then
+                warn "Skipping $proj_name (branch '$session_name' exists, use --force)"
+                fail_count=$((fail_count + 1))
+                continue
+            fi
+            git -C "$proj_path" branch -D "$session_name" 2>/dev/null || true
+        fi
+
+        # Fetch and create branch
+        if git -C "$proj_path" fetch "$session_proj_dir" HEAD 2>/dev/null && \
+           git -C "$proj_path" branch "$session_name" FETCH_HEAD 2>/dev/null; then
+            success "  $proj_name → branch '$session_name'"
+            success_count=$((success_count + 1))
+        else
+            error "  $proj_name failed"
+            fail_count=$((fail_count + 1))
+        fi
+    done <<< "$projects"
+
+    echo ""
+    if [[ $success_count -gt 0 ]]; then
+        success "Created branch '$session_name' in $success_count repo(s)"
+        echo ""
+        echo "Checkout: git checkout $session_name"
+        echo "Merge:    git merge $session_name"
+    fi
+    if [[ $fail_count -gt 0 ]]; then
+        warn "$fail_count repo(s) skipped or failed"
+    fi
 }

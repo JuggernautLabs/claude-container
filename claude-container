@@ -100,12 +100,6 @@ case "${1:-}" in
         session_extract "$@"
         exit 0
         ;;
-
-    --cleanup-worktree)
-        shift
-        session_cleanup_worktree "$@"
-        exit 0
-        ;;
 esac
 
 # Parse arguments
@@ -244,8 +238,7 @@ Arguments:
 Session Management:
   --sessions               List all sessions with disk usage
   --delete <name>          Delete session volumes [--regex] [--yes]
-  --extract <name>         Extract session to worktree for review/merge [--force]
-  --cleanup-worktree <name>  Remove extracted worktree [--yes]
+  --extract <name>         Extract session as branch [--force]
   --import-session <path> <name>  Import claude session data [--force]
   --cleanup                List and optionally delete all volumes
   --cleanup-unused         Delete volumes not used by running containers [--yes]
@@ -264,7 +257,7 @@ Examples:
   # Resume session and continue conversation
   claude-container -s myproj --continue
 
-  # Extract changes after working
+  # Extract changes as a branch
   claude-container --extract myproj
 
   # Run claude in print mode
@@ -274,10 +267,8 @@ Workflow:
   1. Start session:     claude-container -s myproj
   2. Do work in container...
   3. Exit container:    exit
-  4. Extract changes:   claude-container --extract myproj
-  5. Review worktree:   cd ~/.config/claude-container/worktrees/myproj
-  6. Merge manually:    git fetch <worktree-path> && git merge FETCH_HEAD
-  7. Cleanup:           claude-container --cleanup-worktree myproj
+  4. Extract as branch: claude-container --extract myproj
+  5. Use git normally:  git checkout myproj  OR  git merge myproj
 EOF
             exit 0
             ;;
