@@ -636,33 +636,25 @@ session_extract() {
     mkdir -p "$worktree_dir"
 
     local git_image="${IMAGE_NAME:-$DEFAULT_IMAGE}"
-    local host_uid
-    host_uid=$(get_host_uid)
 
-    # Extract the entire session to worktree (simple copy)
-    # Run as host user so files have correct ownership
+    # Extract using tar pipe (faster than cp -r through Docker VM)
+    # tar streams directly from container to host, avoiding double filesystem crossing
     if ! docker run --rm \
-        --user "$host_uid:$host_uid" \
         -v "$volume:/session:ro" \
-        -v "$worktree_dir:/dest" \
         "$git_image" \
-        sh -c "
-            cp -r /session/. /dest/
-            cd /dest
-            git config --global --add safe.directory '*'
-            echo '---'
-            echo 'Extracted:'
-            git log --oneline -5 2>/dev/null || echo 'No git history'
-            echo '---'
-            echo 'Branch:'
-            git rev-parse --abbrev-ref HEAD 2>/dev/null || echo 'detached HEAD'
-        " 2>&1; then
+        tar -C /session -cf - . 2>/dev/null | tar -C "$worktree_dir" -xf -; then
         error "Failed to extract session"
-        # Cleanup with docker in case files are root-owned
-        docker run --rm -v "$worktree_dir:/dest" alpine rm -rf /dest/* /dest/.[!.]* 2>/dev/null || true
-        rmdir "$worktree_dir" 2>/dev/null || true
+        rm -rf "$worktree_dir" 2>/dev/null || true
         return 1
     fi
+
+    # Show extraction info
+    echo "---"
+    echo "Extracted:"
+    git -C "$worktree_dir" log --oneline -5 2>/dev/null || echo "No git history"
+    echo "---"
+    echo "Branch:"
+    git -C "$worktree_dir" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "detached HEAD"
 
     success "Session extracted to: $worktree_dir"
     echo ""
