@@ -460,6 +460,70 @@ test_help_command() {
     return 0
 }
 
+test_discover_repos_extract() {
+    # Test that we can extract a discover-repos (multi-project) session
+    local base_dir="$HOME/.cache/claude-container-tests/discover-extract-$$"
+    mkdir -p "$base_dir"
+    TEST_REPOS+=("$base_dir")
+
+    # Create multiple repos in directory
+    for name in proj-alpha proj-beta; do
+        mkdir -p "$base_dir/$name"
+        cd "$base_dir/$name"
+        git init -q
+        git config user.email "test@test.com"
+        git config user.name "Test"
+        echo "# $name" > README.md
+        echo "content for $name" > content.txt
+        git add README.md content.txt
+        git commit -q -m "Initial commit for $name"
+    done
+
+    local session="test-discover-extract-$$"
+    TEST_SESSIONS+=("$session")
+
+    # Create discover-repos session
+    $CC -s "$session" --no-run --discover-repos "$base_dir" >/dev/null 2>&1 || {
+        echo "Failed to create discover-repos session"
+        return 1
+    }
+
+    # Verify session volume exists (discover-repos creates nested structure: /session/<parent-dir>/<repo>)
+    local parent_name=$(basename "$base_dir")
+    local session_files
+    session_files=$(docker run --rm -v "claude-session-$session:/session:ro" alpine ls -la "/session/$parent_name" 2>/dev/null)
+    if ! echo "$session_files" | grep -q "proj-alpha"; then
+        echo "proj-alpha not in session at /session/$parent_name"
+        echo "Session contents:"
+        docker run --rm -v "claude-session-$session:/session:ro" alpine find /session -type d 2>/dev/null
+        return 1
+    fi
+
+    # Extract the session
+    local output
+    output=$($CC --extract-session "$session" --force 2>&1)
+    if ! echo "$output" | grep -qi "extracted"; then
+        echo "Extract failed"
+        echo "Output: $output"
+        return 1
+    fi
+
+    # Verify worktree contains both projects (nested under parent dir name)
+    local worktree="$HOME/.config/claude-container/worktrees/$session"
+    if [[ ! -f "$worktree/$parent_name/proj-alpha/content.txt" ]]; then
+        echo "proj-alpha content not extracted"
+        echo "Worktree contents:"
+        find "$worktree" -type f 2>&1 | head -20
+        return 1
+    fi
+    if [[ ! -f "$worktree/$parent_name/proj-beta/content.txt" ]]; then
+        echo "proj-beta content not extracted"
+        return 1
+    fi
+
+    return 0
+}
+
 test_dind_session() {
     # Test that we can create a session from inside a container (Docker-in-Docker)
     # Skip if no token available
@@ -538,6 +602,9 @@ run_test "Branch name matching" test_branch_matching
 
 # Help
 run_test "Help command" test_help_command
+
+# Discover repos extraction
+run_test "Discover repos extraction" test_discover_repos_extract
 
 # Docker-in-Docker
 run_test "Docker-in-Docker session creation" test_dind_session
