@@ -690,12 +690,33 @@ _extract_single_project() {
     git -C "$target_repo" fetch "$temp_dir" HEAD 2>/dev/null
     git -C "$target_repo" branch "$session_name" FETCH_HEAD 2>/dev/null
 
-    success "Created branch: $session_name"
+    # Get change summary
+    local current_head
+    current_head=$(git -C "$target_repo" rev-parse HEAD 2>/dev/null)
+    local session_head
+    session_head=$(git -C "$target_repo" rev-parse "$session_name" 2>/dev/null)
+
+    if [[ "$current_head" == "$session_head" ]]; then
+        success "Created branch: $session_name (no changes)"
+    else
+        local commit_count
+        commit_count=$(git -C "$target_repo" rev-list --count "$current_head".."$session_name" 2>/dev/null || echo "0")
+        local files_changed
+        files_changed=$(git -C "$target_repo" diff --stat --name-only "$current_head".."$session_name" 2>/dev/null | wc -l | tr -d ' ')
+
+        success "Created branch: $session_name ($commit_count commit(s), $files_changed file(s) changed)"
+        echo ""
+        echo "Commits:"
+        git -C "$target_repo" log --oneline "$current_head".."$session_name" 2>/dev/null | head -10 || true
+        echo ""
+        echo "Files changed:"
+        git -C "$target_repo" diff --stat "$current_head".."$session_name" 2>/dev/null | tail -20 || true
+    fi
+
     echo ""
-    git -C "$target_repo" log --oneline "$session_name" -5 2>/dev/null || true
-    echo ""
-    echo "Checkout: git checkout $session_name"
-    echo "Merge:    git merge $session_name"
+    echo "To see changes:  git log HEAD..$session_name"
+    echo "Checkout:        git checkout $session_name"
+    echo "Merge:           git merge $session_name"
 }
 
 # Extract multi-project session into original repos as branches
@@ -753,7 +774,31 @@ _extract_multi_project() {
         # Fetch and create branch
         if git -C "$proj_path" fetch "$session_proj_dir" HEAD 2>/dev/null && \
            git -C "$proj_path" branch "$session_name" FETCH_HEAD 2>/dev/null; then
-            success "  $proj_name → branch '$session_name'"
+
+            # Get change summary comparing session branch to current HEAD
+            local current_head
+            current_head=$(git -C "$proj_path" rev-parse HEAD 2>/dev/null)
+            local session_head
+            session_head=$(git -C "$proj_path" rev-parse "$session_name" 2>/dev/null)
+
+            local change_info=""
+            if [[ "$current_head" == "$session_head" ]]; then
+                change_info="(no changes)"
+            else
+                # Count commits and changed files
+                local commit_count
+                commit_count=$(git -C "$proj_path" rev-list --count "$current_head".."$session_name" 2>/dev/null || echo "0")
+                local files_changed
+                files_changed=$(git -C "$proj_path" diff --stat --name-only "$current_head".."$session_name" 2>/dev/null | wc -l | tr -d ' ')
+
+                if [[ "$commit_count" == "0" && "$files_changed" == "0" ]]; then
+                    change_info="(no changes)"
+                else
+                    change_info="($commit_count commit(s), $files_changed file(s))"
+                fi
+            fi
+
+            success "  $proj_name → branch '$session_name' $change_info"
             success_count=$((success_count + 1))
         else
             error "  $proj_name failed"
@@ -765,8 +810,9 @@ _extract_multi_project() {
     if [[ $success_count -gt 0 ]]; then
         success "Created branch '$session_name' in $success_count repo(s)"
         echo ""
-        echo "Checkout: git checkout $session_name"
-        echo "Merge:    git merge $session_name"
+        echo "To see changes:  git log main..$session_name"
+        echo "Checkout:        git checkout $session_name"
+        echo "Merge:           git merge $session_name"
     fi
     if [[ $fail_count -gt 0 ]]; then
         warn "$fail_count repo(s) skipped or failed"
