@@ -853,3 +853,224 @@ EOF
         echo "  claude-container --merge-session $session_name"
     fi
 }
+
+# Extract session to a worktree (one-way: session → worktree, forced)
+# Usage: session_extract <session_name> [--force]
+# Arguments:
+#   $1 - session name
+#   --force - overwrite existing worktree
+session_extract() {
+    local session_name="$1"
+    local force=false
+
+    # Parse flags
+    shift
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --force|-f) force=true; shift ;;
+            *) shift ;;
+        esac
+    done
+
+    if [[ -z "$session_name" ]]; then
+        error "Usage: session_extract <session_name> [--force]"
+        return 1
+    fi
+
+    local volume="claude-session-${session_name}"
+    local worktree_dir="$CONFIG_DIR/worktrees/$session_name"
+
+    # Verify session exists
+    if ! docker volume inspect "$volume" &>/dev/null; then
+        error "Session not found: $session_name"
+        return 1
+    fi
+
+    # Check if worktree already exists
+    if [[ -d "$worktree_dir" ]]; then
+        if ! $force; then
+            error "Worktree already exists: $worktree_dir"
+            echo "Use --force to overwrite"
+            return 1
+        else
+            warn "Removing existing worktree: $worktree_dir"
+            rm -rf "$worktree_dir"
+        fi
+    fi
+
+    info "Extracting session '$session_name' to worktree..."
+    info "Destination: $worktree_dir"
+
+    # Create worktree directory
+    mkdir -p "$worktree_dir"
+
+    local git_image="${IMAGE_NAME:-$DEFAULT_IMAGE}"
+
+    # Extract the entire session repo to worktree (simple copy)
+    # This is a one-way forced extraction - no syncing, just copy
+    if ! docker run --rm \
+        -v "$volume:/session:ro" \
+        -v "$worktree_dir:/dest" \
+        "$git_image" \
+        sh -c "
+            # Copy everything except the .git directory metadata that might be stale
+            cd /session
+            cp -a . /dest/
+
+            # Ensure git repo is in good state
+            cd /dest
+            git config --global --add safe.directory '*'
+
+            # Show what we extracted
+            echo '---'
+            echo 'Extracted:'
+            git log --oneline -5 2>/dev/null || echo 'No git history'
+            echo '---'
+            echo 'Branch:'
+            git rev-parse --abbrev-ref HEAD 2>/dev/null || echo 'detached HEAD'
+            echo '---'
+        " 2>&1; then
+        error "Failed to extract session"
+        rm -rf "$worktree_dir"
+        return 1
+    fi
+
+    success "Session extracted to: $worktree_dir"
+    echo ""
+    echo "Next steps:"
+    echo "  1. Review changes:"
+    echo "     cd $worktree_dir"
+    echo "     git log"
+    echo "     git diff <target-branch>"
+    echo ""
+    echo "  2. Merge manually (from main repo):"
+    echo "     git fetch $worktree_dir"
+    echo "     git merge FETCH_HEAD"
+    echo ""
+    echo "  3. Cleanup when done:"
+    echo "     claude-container --cleanup-worktree $session_name"
+}
+
+# Cleanup worktree for a session
+# Usage: session_cleanup_worktree <session_name> [--yes]
+session_cleanup_worktree() {
+    local session_name="$1"
+    local skip_confirm=false
+
+    # Parse flags
+    shift
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --yes|-y) skip_confirm=true; shift ;;
+            *) shift ;;
+        esac
+    done
+
+    if [[ -z "$session_name" ]]; then
+        error "Usage: session_cleanup_worktree <session_name> [--yes]"
+        return 1
+    fi
+
+    local worktree_dir="$CONFIG_DIR/worktrees/$session_name"
+
+    if [[ ! -d "$worktree_dir" ]]; then
+        warn "Worktree does not exist: $worktree_dir"
+        return 0
+    fi
+
+    info "Worktree: $worktree_dir"
+
+    # Confirm unless --yes
+    if ! $skip_confirm; then
+        read -p "Delete this worktree? [y/N] " confirm
+        if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
+            echo "Cancelled"
+            return 0
+        fi
+    fi
+
+    rm -rf "$worktree_dir"
+    success "Worktree deleted: $worktree_dir"
+}
+
+# Check if worktree exists and has changes, offer to load them into session
+# Usage: session_check_worktree <session_name>
+# Returns: 0 if no action needed, 1 if user cancelled load
+session_check_worktree() {
+    local session_name="$1"
+    local worktree_dir="$CONFIG_DIR/worktrees/$session_name"
+    local volume="claude-session-${session_name}"
+
+    # Skip if worktree doesn't exist
+    [[ ! -d "$worktree_dir" ]] && return 0
+
+    # Check if worktree is a valid git repo
+    if ! git -C "$worktree_dir" rev-parse --git-dir &>/dev/null; then
+        return 0
+    fi
+
+    local git_image="${IMAGE_NAME:-$DEFAULT_IMAGE}"
+
+    # Get session HEAD and worktree HEAD
+    local session_head
+    session_head=$(docker run --rm -v "$volume:/session:ro" "$git_image" \
+        sh -c "git -C /session rev-parse HEAD 2>/dev/null" 2>/dev/null)
+
+    local worktree_head
+    worktree_head=$(git -C "$worktree_dir" rev-parse HEAD 2>/dev/null)
+
+    # If same commit, nothing to do
+    if [[ "$session_head" == "$worktree_head" ]]; then
+        return 0
+    fi
+
+    # Check if worktree has new commits
+    local worktree_is_ahead=false
+    if git -C "$worktree_dir" merge-base --is-ancestor "$session_head" "$worktree_head" 2>/dev/null; then
+        worktree_is_ahead=true
+    fi
+
+    if ! $worktree_is_ahead; then
+        # Worktree is behind or diverged - just note it
+        warn "Worktree exists but is behind or diverged from session"
+        echo "  Worktree: $worktree_dir"
+        echo "  Consider cleaning up: claude-container --cleanup-worktree $session_name"
+        return 0
+    fi
+
+    # Worktree has new commits - offer to load them
+    local commit_count
+    commit_count=$(git -C "$worktree_dir" rev-list --count "$session_head..$worktree_head" 2>/dev/null || echo "?")
+
+    echo ""
+    info "Worktree has $commit_count new commit(s)"
+    echo "  Location: $worktree_dir"
+    read -p "Load worktree changes into session? [y/N] " confirm
+
+    if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
+        echo "Skipped - starting session as-is"
+        return 0
+    fi
+
+    # Load worktree changes into session
+    info "Loading worktree changes into session..."
+
+    if ! docker run --rm \
+        -v "$worktree_dir:/worktree:ro" \
+        -v "$volume:/session" \
+        "$git_image" \
+        sh -c "
+            git config --global --add safe.directory '*'
+            cd /session
+            git remote add worktree /worktree 2>/dev/null || git remote set-url worktree /worktree
+            git fetch worktree --quiet
+            git merge --ff-only FETCH_HEAD --quiet 2>&1
+        " 2>&1; then
+        error "Failed to load worktree changes (may need manual merge)"
+        return 1
+    fi
+
+    success "Loaded $commit_count commit(s) from worktree"
+    echo ""
+    return 0
+}

@@ -55,6 +55,7 @@ ENABLE_DOCKER=false  # Mount Docker socket for host Docker access
 CONFIG_ONLY=false    # Just generate config, don't create session
 SCAN_SESSION=false   # Scan session for new repos
 DISCOVER_REPOS_DIRS=()  # Array for multiple --discover-repos
+ADD_REPOS=()  # Array for repos to add via --add-repo
 SESSIONS_CONFIG_DIR="$CONFIG_DIR/sessions"  # Where session configs are stored
 CLAUDE_ARGS=()  # Arguments to pass through to claude
 NO_INTERACTIVE=false  # Fail fast if no token found (don't start OAuth flow)
@@ -109,10 +110,15 @@ case "${1:-}" in
         exit 0
         ;;
 
-    --add-repo)
-        # Usage: --add-repo <session> <repo-path> [workspace-path]
+    --extract-session)
         shift
-        session_add_repo "$@"
+        session_extract "$@"
+        exit 0
+        ;;
+
+    --cleanup-worktree)
+        shift
+        session_cleanup_worktree "$@"
         exit 0
         ;;
 esac
@@ -179,6 +185,10 @@ while [[ $# -gt 0 ]]; do
             DISCOVER_REPOS_DIRS+=("$2")
             shift 2
             ;;
+        --add-repo|-a)
+            ADD_REPOS+=("$2")
+            shift 2
+            ;;
         --config|-C)
             CONFIG_FILE="$2"
             shift 2
@@ -243,6 +253,7 @@ Options:
   --as-root, --no-rootish  Run as actual root user
   --auto-sync <branch>     Override branch name for auto-merge on exit (default: session name)
   --discover-repos <dir>   Auto-discover all git repos in directory
+  --add-repo, -a <path>    Add a git repository to the session (works during init and for existing sessions)
   --config, -C <path>      Explicit path to .claude-projects.yml config file
   --verify, -v             Verify container setup works (run checks and exit)
   --shell, --bash          Start bash shell instead of claude
@@ -261,24 +272,43 @@ Session Management:
   --list-sessions, --sessions  List all sessions with disk usage per volume
   --delete-session <name> [--regex] [--yes]  Delete session(s) with confirmation
   --restart-session <name> Restart a session (fixes permissions, continues conversation)
+  --extract-session <name> [--force]  Extract session to worktree for review/merge
+  --cleanup-worktree <name> [--yes]   Remove worktree after merging
   --diff-session <name>    Show changes made in a git session vs original repo
-  --merge-session <name>   Merge session commits back to repo
+  --merge-session <name>   (DEPRECATED) Use --extract-session instead
+                           Merge session commits back to repo
                            Options: --into <branch> (target branch, default: session name)
                                     --from <branch> (create new branch from this, default: HEAD)
-  --add-repo <session> <path> [name]  Add a repo to an existing session
 
 Environment:
   CLAUDE_CODE_OAUTH_TOKEN   OAuth token for authentication (required)
                             Get one with: claude setup-token
 
 Examples:
+  # Basic workflow
   claude-container -s myproj                           # Start git session "myproj"
-  claude-container -s myproj --discover-repos ~/dev    # Discover repos and start session
   claude-container -s myproj --continue                # Resume session AND continue conversation
+  claude-container --extract-session myproj            # Extract session to review/merge
+
+  # Advanced setup
+  claude-container -s myproj --discover-repos ~/dev    # Discover repos and start session
+  claude-container -s myproj -a ~/repo1 -a ~/repo2     # Add specific repos to session
+  claude-container -s myproj -a ~/repo --no-run        # Add repo during init (before starting)
   claude-container -s myproj --scan                    # Find new repos created in session
+
+  # Other modes
   claude-container --no-git-session                    # Direct mount cwd (no isolation)
   claude-container -s myproj -- -p "What is this?"     # Run claude in print mode
   claude-container -s myproj --continue -- -p "Status" # Continue session and print
+
+Workflow:
+  1. Start session:     claude-container -s myproj
+  2. Do work in container...
+  3. Exit container:    exit
+  4. Extract changes:   claude-container --extract-session myproj
+  5. Review worktree:   cd ~/.config/claude-container/worktrees/myproj && git log
+  6. Merge manually:    git merge (from your main repo)
+  7. Cleanup:           claude-container --cleanup-worktree myproj
 EOF
             exit 0
             ;;
@@ -291,8 +321,14 @@ EOF
 done
 
 # Validate session name is provided when required
-if ($USE_GIT_SESSION || $CONFIG_ONLY || $SCAN_SESSION) && [[ -z "$SESSION_NAME" ]]; then
+if ($USE_GIT_SESSION || $CONFIG_ONLY || $SCAN_SESSION || [[ ${#ADD_REPOS[@]} -gt 0 ]]) && [[ -z "$SESSION_NAME" ]]; then
     error "Session name required: use --session <name>"
+    exit 1
+fi
+
+# Validate --add-repo requires git session mode
+if [[ ${#ADD_REPOS[@]} -gt 0 ]] && ! $USE_GIT_SESSION; then
+    error "--add-repo requires git session mode (use --session)"
     exit 1
 fi
 
@@ -445,6 +481,18 @@ if $USE_GIT_SESSION; then
     fi
 
     create_git_session "$SESSION_NAME" "$WORKSPACE_DIR"
+
+    # Handle --add-repo: add repos to session (works for both new and existing sessions)
+    if [[ ${#ADD_REPOS[@]} -gt 0 ]]; then
+        for repo_path in "${ADD_REPOS[@]}"; do
+            session_add_repo "$SESSION_NAME" "$repo_path"
+        done
+    fi
+
+    # Check if worktree exists with changes and offer to load them
+    if ! $NO_RUN; then
+        session_check_worktree "$SESSION_NAME"
+    fi
 
     if $NO_RUN; then
         success "Session ready: $SESSION_NAME"
@@ -778,13 +826,23 @@ WRAPPER
     fi
 '
 
-# Auto-merge on exit: merge any new commits to branch named after session (or specified branch)
-if $USE_GIT_SESSION; then
-    merge_branch="${AUTO_SYNC_BRANCH:-$SESSION_NAME}"
+# Session exit: remind user to extract changes if needed
+if $USE_GIT_SESSION && [[ -z "$AUTO_SYNC_BRANCH" ]]; then
     echo ""
-    info "Merging session commits to branch: $merge_branch"
+    info "Session complete: $SESSION_NAME"
+    echo ""
+    echo "To review and merge changes:"
+    echo "  claude-container --extract-session $SESSION_NAME"
+    echo ""
+fi
+
+# Legacy auto-sync if explicitly requested via --auto-sync flag
+if $USE_GIT_SESSION && [[ -n "$AUTO_SYNC_BRANCH" ]]; then
+    merge_branch="$AUTO_SYNC_BRANCH"
+    echo ""
+    warn "Auto-sync is deprecated - use --extract-session instead"
+    info "Attempting legacy merge to branch: $merge_branch"
     "$0" --merge-session "$SESSION_NAME" --into "$merge_branch" --yes || {
-        warn "Merge had issues - session preserved for manual merge"
-        echo "  To retry: claude-container --merge-session $SESSION_NAME --into $merge_branch"
+        warn "Merge failed - use: claude-container --extract-session $SESSION_NAME"
     }
 fi
