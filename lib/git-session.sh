@@ -284,11 +284,42 @@ create_git_session() {
     local host_uid
     host_uid=$(get_host_uid)
 
+    # Get project name from directory basename
+    local project_name
+    project_name=$(basename "$source_dir")
+    local abs_source_dir
+    abs_source_dir=$(cd "$source_dir" && pwd)
+
     # Initialize volume with correct ownership (volumes are created as root)
     docker run --rm \
         -v "$volume:/session" \
         "$git_image" \
         chown "$host_uid:$host_uid" /session
+
+    # Store config file for consistent structure (even single-project uses /session/{name}/)
+    local temp_config="$CACHE_DIR/session-config-$$.yml"
+    mkdir -p "$CACHE_DIR"
+    cat > "$temp_config" << EOF
+version: "1"
+projects:
+  ${project_name}:
+    path: ${abs_source_dir}
+EOF
+
+    docker run --rm \
+        --user "$host_uid:$host_uid" \
+        -v "$temp_config:/tmp/config.yml:ro" \
+        -v "$volume:/session" \
+        "$git_image" \
+        cp /tmp/config.yml /session/.claude-projects.yml 2>/dev/null
+    rm -f "$temp_config"
+
+    # Store main project name for container startup
+    docker run --rm \
+        --user "$host_uid:$host_uid" \
+        -v "$volume:/session" \
+        "$git_image" \
+        sh -c "echo '$project_name' > /session/.main-project" 2>/dev/null
 
     # Check if a branch matching session name exists, use it if so
     local branch_flag=""
@@ -312,14 +343,16 @@ create_git_session() {
         # Normal scenario: mount directory by path
         source_mount_arg="$source_dir:/source:ro"
     fi
+
+    # Clone into /session/{project_name}/ for consistent structure
     if ! clone_output=$(docker run --rm \
         --user "$host_uid:$host_uid" \
         -v "$source_mount_arg" \
         -v "$volume:/session" \
         "$git_image" \
         sh -c "
-            git -c safe.directory='*' clone --depth 1 $branch_flag /source /session &&
-            cd /session &&
+            git -c safe.directory='*' clone --depth 1 $branch_flag /source '/session/$project_name' &&
+            cd '/session/$project_name' &&
             git remote remove origin 2>/dev/null || true &&
             git config user.email 'claude@container' &&
             git config user.name 'Claude'
