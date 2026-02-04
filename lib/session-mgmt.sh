@@ -587,6 +587,7 @@ session_import() {
 }
 
 # Extract session changes as branches in original repos
+# Uses git bundle to extract only git data (ignores build artifacts)
 # Usage: session_extract <session_name> [--force]
 session_extract() {
     local session_name="$1"
@@ -607,7 +608,6 @@ session_extract() {
     fi
 
     local volume="claude-session-${session_name}"
-    local temp_dir="$CACHE_DIR/extract-$$"
     local git_image="${IMAGE_NAME:-$DEFAULT_IMAGE}"
 
     # Verify session exists
@@ -616,50 +616,207 @@ session_extract() {
         return 1
     fi
 
-    # Create temp extraction directory
-    mkdir -p "$temp_dir"
-    trap "rm -rf '$temp_dir'" EXIT
-
-    # Get session size for progress display
-    local session_size
-    session_size=$(docker run --rm -v "$volume:/session:ro" "$git_image" \
-        du -sb /session 2>/dev/null | cut -f1)
-    local session_size_human
-    session_size_human=$(docker run --rm -v "$volume:/session:ro" "$git_image" \
-        du -sh /session 2>/dev/null | cut -f1)
-
-    info "Extracting session '$session_name' ($session_size_human)..."
-
-    # Extract using tar pipe
-    local extract_status
-    if command -v pv &>/dev/null && [[ -n "$session_size" ]]; then
-        docker run --rm \
-            -v "$volume:/session:ro" \
-            "$git_image" \
-            tar -C /session -cf - . 2>/dev/null | pv -s "$session_size" | tar -C "$temp_dir" -xf -
-        extract_status=$?
-    else
-        docker run --rm \
-            -v "$volume:/session:ro" \
-            "$git_image" \
-            tar -C /session -cf - . 2>/dev/null | tar -C "$temp_dir" -xf -
-        extract_status=$?
-    fi
-
-    if [[ $extract_status -ne 0 ]]; then
-        error "Failed to extract session"
-        return 1
-    fi
+    info "Extracting session '$session_name'..."
 
     # Check if multi-project (has .claude-projects.yml)
-    if [[ -f "$temp_dir/.claude-projects.yml" ]]; then
-        _extract_multi_project "$session_name" "$temp_dir" "$force"
+    local has_config
+    has_config=$(docker run --rm -v "$volume:/session:ro" "$git_image" \
+        sh -c 'test -f /session/.claude-projects.yml && echo yes || echo no' 2>/dev/null)
+
+    if [[ "$has_config" == "yes" ]]; then
+        # Extract just the config file (tiny)
+        local config_content
+        config_content=$(docker run --rm -v "$volume:/session:ro" "$git_image" \
+            cat /session/.claude-projects.yml 2>/dev/null)
+        _extract_multi_project_direct "$session_name" "$volume" "$git_image" "$config_content" "$force"
     else
-        _extract_single_project "$session_name" "$temp_dir" "$force"
+        _extract_single_project_direct "$session_name" "$volume" "$git_image" "$force"
     fi
 }
 
-# Extract single-project session into original repo as branch
+# Extract multi-project session directly from volume (no full extraction)
+# Uses git bundle to transfer only git data, ignoring build artifacts
+_extract_multi_project_direct() {
+    local session_name="$1"
+    local volume="$2"
+    local git_image="$3"
+    local config_content="$4"
+    local force="$5"
+
+    info "Multi-project session detected"
+    echo ""
+
+    if ! command -v yq &>/dev/null; then
+        error "yq required for multi-project extraction"
+        return 1
+    fi
+
+    # Parse config from content (no temp file needed)
+    local projects
+    projects=$(echo "$config_content" | yq eval '.projects | to_entries | .[] | .key + "|" + .value.path' - 2>/dev/null)
+
+    local success_count=0
+    local fail_count=0
+    local bundle_dir="$CACHE_DIR/bundles-$$"
+    mkdir -p "$bundle_dir"
+    trap "rm -rf '$bundle_dir'" EXIT
+
+    while IFS='|' read -r proj_name proj_path; do
+        [[ -z "$proj_name" ]] && continue
+
+        # Check if original repo exists
+        if [[ ! -d "$proj_path" ]]; then
+            warn "Skipping $proj_name (original repo not found: $proj_path)"
+            fail_count=$((fail_count + 1))
+            continue
+        fi
+
+        # Check if branch already exists
+        if git -C "$proj_path" show-ref --verify --quiet "refs/heads/$session_name" 2>/dev/null; then
+            if [[ "$force" != "true" ]]; then
+                warn "Skipping $proj_name (branch '$session_name' exists, use --force)"
+                fail_count=$((fail_count + 1))
+                continue
+            fi
+            git -C "$proj_path" branch -D "$session_name" 2>/dev/null || true
+        fi
+
+        # Create git bundle in container (only transfers git objects, not working tree)
+        local bundle_file="$bundle_dir/${proj_name//\//_}.bundle"
+        if ! docker run --rm -v "$volume:/session:ro" "$git_image" \
+            sh -c "cd '/session/$proj_name' 2>/dev/null && git bundle create /dev/stdout HEAD 2>/dev/null" > "$bundle_file" 2>/dev/null; then
+            warn "  $proj_name (no git data)"
+            continue
+        fi
+
+        # Check bundle is valid
+        if [[ ! -s "$bundle_file" ]]; then
+            warn "  $proj_name (empty bundle)"
+            continue
+        fi
+
+        # Fetch from bundle
+        if ! git -C "$proj_path" fetch "$bundle_file" HEAD 2>/dev/null; then
+            error "  $proj_name fetch failed"
+            fail_count=$((fail_count + 1))
+            continue
+        fi
+
+        # Compare FETCH_HEAD to current HEAD
+        local current_head
+        current_head=$(git -C "$proj_path" rev-parse HEAD 2>/dev/null)
+        local fetched_head
+        fetched_head=$(git -C "$proj_path" rev-parse FETCH_HEAD 2>/dev/null)
+
+        if [[ "$current_head" == "$fetched_head" ]]; then
+            echo "  $proj_name (no changes)"
+            continue
+        fi
+
+        # Create branch
+        if ! git -C "$proj_path" branch "$session_name" FETCH_HEAD 2>/dev/null; then
+            error "  $proj_name branch creation failed"
+            fail_count=$((fail_count + 1))
+            continue
+        fi
+
+        # Count commits and files
+        local commit_count
+        commit_count=$(git -C "$proj_path" rev-list --count "$current_head".."$session_name" 2>/dev/null || echo "0")
+        local files_changed
+        files_changed=$(git -C "$proj_path" diff --stat --name-only "$current_head".."$session_name" 2>/dev/null | wc -l | tr -d ' ')
+
+        success "  $proj_name → branch '$session_name' ($commit_count commit(s), $files_changed file(s))"
+        success_count=$((success_count + 1))
+    done <<< "$projects"
+
+    echo ""
+    if [[ $success_count -gt 0 ]]; then
+        success "Created branch '$session_name' in $success_count repo(s)"
+        echo ""
+        echo "To see changes:  git log main..$session_name"
+        echo "Checkout:        git checkout $session_name"
+        echo "Merge:           git merge $session_name"
+    fi
+    if [[ $fail_count -gt 0 ]]; then
+        warn "$fail_count repo(s) skipped or failed"
+    fi
+}
+
+# Extract single-project session directly from volume (legacy fallback)
+_extract_single_project_direct() {
+    local session_name="$1"
+    local volume="$2"
+    local git_image="$3"
+    local force="$4"
+
+    # For single project without config, user must run from original repo
+    local target_repo
+    target_repo=$(pwd)
+
+    if ! is_git_repo "$target_repo"; then
+        error "Run this from your git repository directory"
+        return 1
+    fi
+
+    # Check if branch already exists
+    if git -C "$target_repo" show-ref --verify --quiet "refs/heads/$session_name" 2>/dev/null; then
+        if [[ "$force" != "true" ]]; then
+            error "Branch '$session_name' already exists. Use --force to overwrite."
+            return 1
+        fi
+        warn "Overwriting existing branch: $session_name"
+        git -C "$target_repo" branch -D "$session_name" 2>/dev/null || true
+    fi
+
+    # Create git bundle from volume
+    local bundle_file="$CACHE_DIR/extract-$$.bundle"
+    mkdir -p "$CACHE_DIR"
+    trap "rm -f '$bundle_file'" EXIT
+
+    if ! docker run --rm -v "$volume:/session:ro" "$git_image" \
+        sh -c "cd /session && git bundle create /dev/stdout HEAD 2>/dev/null" > "$bundle_file" 2>/dev/null; then
+        error "Failed to create git bundle from session"
+        return 1
+    fi
+
+    # Fetch from bundle
+    git -C "$target_repo" fetch "$bundle_file" HEAD 2>/dev/null
+
+    # Compare FETCH_HEAD to current HEAD
+    local current_head
+    current_head=$(git -C "$target_repo" rev-parse HEAD 2>/dev/null)
+    local fetched_head
+    fetched_head=$(git -C "$target_repo" rev-parse FETCH_HEAD 2>/dev/null)
+
+    if [[ "$current_head" == "$fetched_head" ]]; then
+        info "No changes in session (matches current HEAD)"
+        return 0
+    fi
+
+    # Create branch
+    git -C "$target_repo" branch "$session_name" FETCH_HEAD 2>/dev/null
+
+    local commit_count
+    commit_count=$(git -C "$target_repo" rev-list --count "$current_head".."$session_name" 2>/dev/null || echo "0")
+    local files_changed
+    files_changed=$(git -C "$target_repo" diff --stat --name-only "$current_head".."$session_name" 2>/dev/null | wc -l | tr -d ' ')
+
+    success "Created branch: $session_name ($commit_count commit(s), $files_changed file(s) changed)"
+    echo ""
+    echo "Commits:"
+    git -C "$target_repo" log --oneline "$current_head".."$session_name" 2>/dev/null | head -10 || true
+    echo ""
+    echo "Files changed:"
+    git -C "$target_repo" diff --stat "$current_head".."$session_name" 2>/dev/null | tail -20 || true
+
+    echo ""
+    echo "To see changes:  git log HEAD..$session_name"
+    echo "Checkout:        git checkout $session_name"
+    echo "Merge:           git merge $session_name"
+}
+
+# Legacy: Extract single-project session into original repo as branch (temp dir based)
 _extract_single_project() {
     local session_name="$1"
     local temp_dir="$2"
