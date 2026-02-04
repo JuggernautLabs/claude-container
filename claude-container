@@ -879,5 +879,5 @@ if $USE_GIT_SESSION; then
     info "Session complete: $SESSION_NAME"
     echo ""
     echo "To extract changes:"
-    echo "  claude-container --extract $SESSION_NAME"
+    echo "  claude-container -s $SESSION_NAME --extract"
 fi

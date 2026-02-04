@@ -682,9 +682,10 @@ _extract_multi_project_direct() {
         fi
 
         # Create git bundle in container (only transfers git objects, not working tree)
+        # Write to temp file then cat to stdout (git can't write directly to /dev/stdout due to lock files)
         local bundle_file="$bundle_dir/${proj_name//\//_}.bundle"
         if ! docker run --rm -v "$volume:/session:ro" "$git_image" \
-            sh -c "cd '/session/$proj_name' 2>/dev/null && git bundle create /dev/stdout HEAD 2>/dev/null" > "$bundle_file" 2>/dev/null; then
+            sh -c "git config --global --add safe.directory '*' && cd '/session/$proj_name' && git bundle create /tmp/out.bundle HEAD && cat /tmp/out.bundle" > "$bundle_file" 2>/dev/null; then
             warn "  $proj_name (no git data)"
             continue
         fi
@@ -774,8 +775,9 @@ _extract_single_project_direct() {
     mkdir -p "$CACHE_DIR"
     trap "rm -f '$bundle_file'" EXIT
 
+    # Write to temp file then cat to stdout (git can't write directly to /dev/stdout due to lock files)
     if ! docker run --rm -v "$volume:/session:ro" "$git_image" \
-        sh -c "cd /session && git bundle create /dev/stdout HEAD 2>/dev/null" > "$bundle_file" 2>/dev/null; then
+        sh -c "git config --global --add safe.directory '*' && cd /session && git bundle create /tmp/out.bundle HEAD && cat /tmp/out.bundle" > "$bundle_file" 2>/dev/null; then
         error "Failed to create git bundle from session"
         return 1
     fi
