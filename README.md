@@ -69,6 +69,7 @@ ln -s $(pwd)/claude-container /usr/local/bin/
 ┌─────────────────────────────────────────────────────────────────┐
 │  1. CREATE SESSION                                              │
 │     claude-container -s my-feature                              │
+│     claude-container -s post-feat --from feature-branch         │
 │     → Clones repo into Docker volume                            │
 │     → Strips git remotes (Claude can't push)                    │
 │     → Starts Claude Code in container                           │
@@ -100,6 +101,22 @@ ln -s $(pwd)/claude-container /usr/local/bin/
 │     git log main..my-feature                                    │
 │     git merge my-feature                                        │
 └─────────────────────────────────────────────────────────────────┘
+
+
+### Long-Running Sessions: Syncing with Upstream
+
+For long-lived sessions where the upstream branch has changed:
+
+┌─────────────────────────────────────────────────────────────────┐
+│  SYNC SESSION                                                   │
+│     claude-container -s my-feature --sync main                  │
+│     → Warns about uncommitted changes (commit/stash first)      │
+│     → Fetches latest changes from original repos                │
+│     → Rebases session work onto updated branch                  │
+│     → Claude resolves any conflicts interactively               │
+│     → Extract with --force to update branches                   │
+└─────────────────────────────────────────────────────────────────┘
+
 ```
 
 ## Commands
@@ -109,6 +126,9 @@ ln -s $(pwd)/claude-container /usr/local/bin/
 ```bash
 # Single project (clones current directory)
 claude-container -s my-feature
+
+# Start from a specific branch
+claude-container -s post-feature --from feature-branch
 
 # Resume and continue conversation
 claude-container -s my-feature --continue
@@ -131,6 +151,10 @@ claude-container --sessions
 # Extract session as branch
 claude-container -s my-feature --extract
 claude-container -s my-feature --extract --force  # Overwrite existing branch
+
+# Sync session with upstream changes (rebase)
+claude-container -s my-feature --sync main        # Rebase onto main
+claude-container -s my-feature --sync develop     # Rebase onto develop
 
 # Delete a session
 claude-container -s my-feature --delete
@@ -166,7 +190,9 @@ claude-container --cleanup-unused --yes
 | Flag | Description |
 |------|-------------|
 | `-s, --session <name>` | Session name (required) |
+| `--from <branch>` | Create session from specific branch |
 | `-c, --continue` | Continue the most recent conversation |
+| `--sync <branch>` | Rebase session onto upstream branch |
 | `--discover-repos <dir>` | Auto-discover git repos in directory |
 | `-C, --config <path>` | Path to `.claude-projects.yml` |
 | `-a, --add-repo <path>` | Add a repo to the session |
@@ -269,6 +295,54 @@ This means the session content matches the original repo HEAD. No branch is crea
 If you see paths like `/path/to/repo||true|`:
 ```bash
 claude-container -s my-feature --repair
+```
+
+## Development
+
+To contribute to claude-container using claude-container itself:
+
+```bash
+# Clone the repo
+git clone https://github.com/juggernautlabs/claude-container.git
+cd claude-container
+
+# Create a development session
+./claude-container -s dev-feature
+
+# Work with Claude in the container...
+# The container has access to the cloned claude-container repo
+
+# Exit and extract your changes
+./claude-container -s dev-feature --extract
+
+# Review and merge
+git checkout dev-feature
+git log main..dev-feature
+```
+
+### Running Tests
+
+```bash
+# Run all workflow tests
+./tests/test-workflows.sh
+
+# Run specific test
+./tests/test-workflows.sh sync_uncommitted
+
+# List available tests
+./tests/test-workflows.sh --help
+```
+
+### Syncing with Upstream
+
+For long-running development sessions:
+
+```bash
+# Sync with main branch
+./claude-container -s dev-feature --sync main
+
+# Extract updated work
+./claude-container -s dev-feature --extract --force
 ```
 
 ## Security
