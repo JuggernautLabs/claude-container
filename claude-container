@@ -54,6 +54,7 @@ ADD_REPOS=()  # Array for repos to add via --add-repo
 SESSIONS_CONFIG_DIR="$CONFIG_DIR/sessions"  # Where session configs are stored
 CLAUDE_ARGS=()  # Arguments to pass through to claude
 NO_INTERACTIVE=false  # Fail fast if no token found (don't start OAuth flow)
+NO_CONFIG=false       # Skip auto-discovery of .claude-projects.yml
 
 # Docker args accumulator
 declare -a DOCKER_ARGS
@@ -143,6 +144,10 @@ while [[ $# -gt 0 ]]; do
             NO_INTERACTIVE=true
             shift
             ;;
+        --no-config)
+            NO_CONFIG=true
+            shift
+            ;;
 
         # Session management actions (use with --session)
         --extract)
@@ -164,6 +169,15 @@ while [[ $# -gt 0 ]]; do
         --import)
             ACTION="import"
             IMPORT_SOURCE="$2"
+            shift 2
+            ;;
+        --sync)
+            ACTION="sync"
+            SYNC_BRANCH="${2:-main}"
+            shift 2
+            ;;
+        --from)
+            FROM_BRANCH="$2"
             shift 2
             ;;
 
@@ -222,6 +236,7 @@ Spawn into a Docker container with Claude Code ready.
 
 Options:
   --session, -s <name>     Session name (required for git sessions)
+  --from <branch>          Create session from specific branch
   --add-repo, -a <path>    Add a git repository to the session (can use multiple times)
   --discover-repos <dir>   Auto-discover all git repos in directory
   --config, -C <path>      Path to .claude-projects.yml config file
@@ -237,6 +252,7 @@ Options:
   --bash-exec <cmd>        Execute a bash command and exit
   --docker                 Mount Docker socket for host Docker access
   --no-interactive         Exit with error if no token found
+  --no-config              Skip auto-discovery of .claude-projects.yml
   --no-run                 Set up session but don't start container
   --verify, -v             Verify container setup works
   --version, -V            Show version
@@ -251,6 +267,7 @@ Session Management (use with -s <session>):
   --repair                 Fix corrupted session config
   --restart                Restart session (fixes permissions)
   --import <path>          Import claude session data from path
+  --sync <branch>          Rebase session onto upstream branch (default: main)
 
   Modifiers: --force/-f, --yes/-y, --regex/-r
 
@@ -349,6 +366,10 @@ if [[ -n "$ACTION" ]]; then
             $ACTION_FORCE && session_import "$IMPORT_SOURCE" "$SESSION_NAME" --force || session_import "$IMPORT_SOURCE" "$SESSION_NAME"
             exit 0
             ;;
+        sync)
+            session_sync "$SESSION_NAME" "$SYNC_BRANCH"
+            # Note: doesn't exit - continues to container startup
+            ;;
     esac
 fi
 
@@ -371,7 +392,7 @@ mkdir -p "$SESSIONS_CONFIG_DIR"
 ensure_token
 
 # Auto-discover config file if not explicitly set
-if [[ -z "$CONFIG_FILE" ]] && $USE_GIT_SESSION; then
+if [[ -z "$CONFIG_FILE" ]] && $USE_GIT_SESSION && ! $NO_CONFIG; then
     workspace="${WORKSPACE_DIR:-$(pwd)}"
     for candidate in \
         "$workspace/.claude-projects.yml" \
@@ -878,6 +899,37 @@ if $USE_GIT_SESSION; then
     echo ""
     info "Session complete: $SESSION_NAME"
     echo ""
-    echo "To extract changes:"
-    echo "  claude-container -s $SESSION_NAME --extract"
+
+    # Check if this was a sync session
+    SYNC_BRANCH_CHECK=$(docker run --rm -v "$GIT_SESSION_VOLUME:/session:ro" "$IMAGE_NAME" \
+        cat /session/.sync-branch 2>/dev/null || echo "")
+
+    if [[ -n "$SYNC_BRANCH_CHECK" ]]; then
+        # Clean up sync marker and remotes
+        info "Cleaning up sync remotes..."
+        SYNC_CONFIG_CONTENT=$(docker run --rm -v "$GIT_SESSION_VOLUME:/session:ro" "$IMAGE_NAME" \
+            cat /session/.claude-projects.yml 2>/dev/null || echo "")
+
+        if [[ -n "$SYNC_CONFIG_CONTENT" ]] && command -v yq &>/dev/null; then
+            SYNC_PROJECTS=$(echo "$SYNC_CONFIG_CONTENT" | yq eval '.projects | to_entries | .[] | .key' - 2>/dev/null)
+
+            while read -r proj_name; do
+                [[ -z "$proj_name" ]] && continue
+                docker run --rm -v "$GIT_SESSION_VOLUME:/session" "$IMAGE_NAME" \
+                    sh -c "cd '/session/$proj_name' && git remote remove upstream" 2>/dev/null || true
+            done <<< "$SYNC_PROJECTS"
+        fi
+
+        # Remove sync marker
+        docker run --rm -v "$GIT_SESSION_VOLUME:/session" "$IMAGE_NAME" \
+            rm -f /session/.sync-branch 2>/dev/null || true
+
+        success "Sync cleanup complete"
+        echo ""
+        echo "To update branches with rebased changes:"
+        echo "  claude-container -s $SESSION_NAME --extract --force"
+    else
+        echo "To extract changes:"
+        echo "  claude-container -s $SESSION_NAME --extract"
+    fi
 fi

@@ -140,11 +140,14 @@ create_multi_project_session() {
         project_track+=("${source_track:-true}")
 
         # Determine which branch to clone:
-        # 1. If source_branch specified in config, use that
-        # 2. Else if session name matches a branch in the repo, use that
-        # 3. Else use whatever is checked out (HEAD)
+        # 1. If --from flag specified, use that (highest priority)
+        # 2. If source_branch specified in config, use that
+        # 3. Else if session name matches a branch in the repo, use that
+        # 4. Else use whatever is checked out (HEAD)
         local clone_branch="$source_branch"
-        if [[ -z "$clone_branch" ]] && [[ -n "$name" ]]; then
+        if [[ -n "${FROM_BRANCH:-}" ]]; then
+            clone_branch="$FROM_BRANCH"
+        elif [[ -z "$clone_branch" ]] && [[ -n "$name" ]]; then
             # Check if a branch matching session name exists
             if git -C "$source_path" show-ref --verify --quiet "refs/heads/$name" 2>/dev/null; then
                 clone_branch="$name"
@@ -321,9 +324,15 @@ EOF
         "$git_image" \
         sh -c "echo '$project_name' > /session/.main-project" 2>/dev/null
 
-    # Check if a branch matching session name exists, use it if so
+    # Determine which branch to clone:
+    # 1. If --from flag specified, use that (highest priority)
+    # 2. Else if session name matches a branch in the repo, use that
+    # 3. Else use whatever is checked out (HEAD)
     local branch_flag=""
-    if git -C "$source_dir" show-ref --verify --quiet "refs/heads/$name" 2>/dev/null; then
+    if [[ -n "${FROM_BRANCH:-}" ]]; then
+        branch_flag="--branch $FROM_BRANCH"
+        info "Cloning repository (branch: $FROM_BRANCH)..."
+    elif git -C "$source_dir" show-ref --verify --quiet "refs/heads/$name" 2>/dev/null; then
         branch_flag="--branch $name"
         info "Cloning repository (branch: $name)..."
     else

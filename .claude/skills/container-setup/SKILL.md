@@ -36,6 +36,11 @@ Ask for a session name if not provided.
 - Examples: `my-feature`, `bugfix-123`, `refactor-auth`
 - **Branch matching**: If the session name matches an existing git branch, that branch will be cloned
 
+### Optional: Starting Branch
+Ask if they want to start from a specific branch (adds `--from <branch>` flag).
+- Use when the session name doesn't match the branch they want to clone
+- Example: `--from feature-xyz` creates session from `feature-xyz` branch
+
 ### Required: Repository Source
 Ask how they want to specify repositories:
 
@@ -67,6 +72,7 @@ claude-container -s <session-name> [options]
 ```
 
 Options:
+- `--from <branch>` - start from specific branch
 - `--discover-repos <path>` - repo discovery
 - `-a <path>` - add specific repos (repeatable)
 - `--config <path>` - config file
@@ -114,6 +120,9 @@ To start:
 ```bash
 # Basic (current directory)
 claude-container -s my-feature
+
+# Start from specific branch
+claude-container -s post-feature --from feature-branch
 
 # Multi-project with discovery
 claude-container -s my-feature --discover-repos ~/dev/myproject
@@ -163,6 +172,24 @@ Checkout:        git checkout my-feature
 Merge:           git merge my-feature
 ```
 
+## Syncing with Upstream
+
+For long-running sessions where upstream has changed:
+
+```bash
+# Sync session with main branch
+claude-container -s my-feature --sync main
+
+# Sync with develop
+claude-container -s my-feature --sync develop
+```
+
+This:
+- Fetches latest changes from original repos
+- Rebases session work onto updated branch
+- Claude resolves any conflicts interactively
+- After resolving, extract with `--force` to update branches
+
 ## Session Management
 
 ```bash
@@ -206,6 +233,12 @@ projects:
 3. Exit:    exit
 4. Extract: claude-container -s my-feature --extract
 5. Merge:   git checkout my-feature && git merge my-feature
+
+Long-running sessions:
+1. Sync:    claude-container -s my-feature --sync main
+2. Work:    (Claude resolves conflicts if any)
+3. Exit:    exit
+4. Extract: claude-container -s my-feature --extract --force
 ```
 
 ## Command Quick Reference
@@ -213,6 +246,8 @@ projects:
 | Task | Command |
 |------|---------|
 | Create session | `claude-container -s NAME` |
+| From specific branch | `claude-container -s NAME --from BRANCH` |
+| Sync with upstream | `claude-container -s NAME --sync main` |
 | Resume + continue | `claude-container -s NAME --continue` |
 | Discover repos | `claude-container -s NAME --discover-repos DIR` |
 | Prepare only | `claude-container -s NAME --no-run` |
