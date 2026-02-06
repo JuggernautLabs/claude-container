@@ -254,9 +254,9 @@ create_git_session() {
         return $?
     fi
 
-    # Check for multi-project config file
+    # Check for multi-project config file (skip if --no-config)
     local config_file
-    if config_file=$(find_config_file "$source_dir"); then
+    if ! ${NO_CONFIG:-false} && config_file=$(find_config_file "$source_dir"); then
         info "Multi-project config detected: $config_file"
         create_multi_project_session "$name" "$config_file"
         return $?
