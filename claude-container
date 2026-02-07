@@ -56,6 +56,13 @@ CLAUDE_ARGS=()  # Arguments to pass through to claude
 NO_INTERACTIVE=false  # Fail fast if no token found (don't start OAuth flow)
 NO_CONFIG=false       # Skip auto-discovery of .claude-projects.yml
 
+# Tracking booleans for CLI-set flags (for session metadata override logic)
+NO_CONFIG_SET=false
+RUN_AS_USER_SET=false
+RUN_AS_ROOTISH_SET=false
+ENABLE_DOCKER_SET=false
+DOCKERFILE_SET=false
+
 # Docker args accumulator
 declare -a DOCKER_ARGS
 
@@ -101,15 +108,19 @@ while [[ $# -gt 0 ]]; do
             ;;
         --as-user)
             RUN_AS_USER=true
+            RUN_AS_USER_SET=true
             shift
             ;;
         --as-rootish)
             RUN_AS_ROOTISH=true
+            RUN_AS_ROOTISH_SET=true
             shift
             ;;
         --as-root|--no-rootish)
             RUN_AS_ROOTISH=false
             RUN_AS_USER=false
+            RUN_AS_ROOTISH_SET=true
+            RUN_AS_USER_SET=true
             shift
             ;;
         --discover-repos)
@@ -138,6 +149,7 @@ while [[ $# -gt 0 ]]; do
             ;;
         --docker)
             ENABLE_DOCKER=true
+            ENABLE_DOCKER_SET=true
             shift
             ;;
         --no-interactive)
@@ -146,6 +158,7 @@ while [[ $# -gt 0 ]]; do
             ;;
         --no-config)
             NO_CONFIG=true
+            NO_CONFIG_SET=true
             shift
             ;;
 
@@ -211,6 +224,7 @@ while [[ $# -gt 0 ]]; do
 
         --dockerfile)
             # Specify explicit Dockerfile path (auto-detected if not provided)
+            DOCKERFILE_SET=true
             if [[ -n "${2:-}" ]] && [[ ! "$2" =~ ^- ]]; then
                 DOCKERFILE="$2"
                 shift 2
@@ -388,6 +402,20 @@ fi
 # Ensure session config directory exists
 mkdir -p "$SESSIONS_CONFIG_DIR"
 
+# Load persisted session metadata (CLI flags override saved values)
+if [[ -n "$SESSION_NAME" ]] && [[ -f "$SESSIONS_CONFIG_DIR/${SESSION_NAME}.env" ]]; then
+    while IFS='=' read -r _meta_key _meta_value; do
+        [[ -z "$_meta_key" || "$_meta_key" =~ ^# ]] && continue
+        case "$_meta_key" in
+            NO_CONFIG)      $NO_CONFIG_SET      || NO_CONFIG="$_meta_value" ;;
+            RUN_AS_USER)    $RUN_AS_USER_SET     || RUN_AS_USER="$_meta_value" ;;
+            RUN_AS_ROOTISH) $RUN_AS_ROOTISH_SET  || RUN_AS_ROOTISH="$_meta_value" ;;
+            ENABLE_DOCKER)  $ENABLE_DOCKER_SET   || ENABLE_DOCKER="$_meta_value" ;;
+            DOCKERFILE)     $DOCKERFILE_SET      || DOCKERFILE="$_meta_value" ;;
+        esac
+    done < "$SESSIONS_CONFIG_DIR/${SESSION_NAME}.env"
+fi
+
 # Ensure token is available (from config, keychain, or interactive auth)
 ensure_token
 
@@ -555,6 +583,16 @@ if $USE_GIT_SESSION; then
     fi
 
     create_git_session "$SESSION_NAME" "$WORKSPACE_DIR"
+
+    # Persist session metadata so resuming only needs: claude-container -s <name>
+    cat > "$SESSIONS_CONFIG_DIR/${SESSION_NAME}.env" << EOF
+# Session metadata for claude-container (auto-generated)
+NO_CONFIG=$NO_CONFIG
+RUN_AS_USER=$RUN_AS_USER
+RUN_AS_ROOTISH=$RUN_AS_ROOTISH
+ENABLE_DOCKER=$ENABLE_DOCKER
+DOCKERFILE=${DOCKERFILE:-}
+EOF
 
     # Handle --add-repo: add repos to session (works for both new and existing sessions)
     if [[ ${#ADD_REPOS[@]} -gt 0 ]]; then

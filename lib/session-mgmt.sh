@@ -324,6 +324,13 @@ session_delete() {
         docker volume rm "$vol"
         echo "Deleted: $vol"
     done
+
+    # Clean up session metadata files
+    for vol in "${volumes_to_delete[@]}"; do
+        local _sname="${vol#claude-session-}"
+        [[ "$_sname" != "$vol" ]] && rm -f "$SESSIONS_CONFIG_DIR/${_sname}.env" "$SESSIONS_CONFIG_DIR/${_sname}.yml"
+    done
+
     echo "Done"
 }
 
@@ -825,38 +832,54 @@ _extract_multi_project_direct() {
     mkdir -p "$bundle_dir"
     trap "rm -rf '$bundle_dir'" EXIT
 
+    # Phase 1: Validate projects and build list for batch bundle creation
+    local _valid_projects=()
     while IFS='|' read -r proj_name proj_path; do
         [[ -z "$proj_name" ]] && continue
-
-        # Check if original repo exists
         if [[ ! -d "$proj_path" ]]; then
             warn "Skipping $proj_name (original repo not found: $proj_path)"
             fail_count=$((fail_count + 1))
             continue
         fi
+        _valid_projects+=("$proj_name|$proj_path")
+        echo "$proj_name"
+    done <<< "$projects" > "$bundle_dir/.projects"
 
-        # Check if branch already exists
-        if git -C "$proj_path" show-ref --verify --quiet "refs/heads/$session_name" 2>/dev/null; then
-            if [[ "$force" != "true" ]]; then
-                warn "Skipping $proj_name (branch '$session_name' exists, use --force)"
-                fail_count=$((fail_count + 1))
-                continue
-            fi
-            git -C "$proj_path" branch -D "$session_name" 2>/dev/null || true
-        fi
+    if [[ ${#_valid_projects[@]} -eq 0 ]]; then
+        warn "No valid projects to extract"
+        return 0
+    fi
 
-        # Create git bundle in container (only transfers git objects, not working tree)
-        # Write to temp file then cat to stdout (git can't write directly to /dev/stdout due to lock files)
+    # Phase 2: Create all bundles in a single container run (parallel)
+    info "Bundling ${#_valid_projects[@]} project(s)..."
+    docker run --rm \
+        -v "$volume:/session:ro" \
+        -v "$bundle_dir:/bundles" \
+        "$git_image" \
+        sh -c '
+            git config --global --add safe.directory "*"
+            while IFS= read -r proj; do
+                [ -z "$proj" ] && continue
+                safe=$(echo "$proj" | tr "/" "_")
+                (
+                    if cd "/session/$proj" 2>/dev/null; then
+                        git bundle create "/tmp/${safe}.bundle" HEAD 2>/dev/null && \
+                            mv "/tmp/${safe}.bundle" "/bundles/${safe}.bundle" 2>/dev/null || true
+                    fi
+                ) &
+            done < /bundles/.projects
+            wait
+        ' 2>/dev/null || true
+
+    # Phase 3: Process each project on the host (fetch + branch — all local, fast)
+    for _entry in "${_valid_projects[@]}"; do
+        local proj_name="${_entry%%|*}"
+        local proj_path="${_entry#*|}"
         local bundle_file="$bundle_dir/${proj_name//\//_}.bundle"
-        if ! docker run --rm -v "$volume:/session:ro" "$git_image" \
-            sh -c "git config --global --add safe.directory '*' && cd '/session/$proj_name' && git bundle create /tmp/out.bundle HEAD && cat /tmp/out.bundle" > "$bundle_file" 2>/dev/null; then
-            warn "  $proj_name (no git data)"
-            continue
-        fi
 
-        # Check bundle is valid
+        # Check bundle was created
         if [[ ! -s "$bundle_file" ]]; then
-            warn "  $proj_name (empty bundle)"
+            warn "  $proj_name (no git data)"
             continue
         fi
 
@@ -867,33 +890,67 @@ _extract_multi_project_direct() {
             continue
         fi
 
-        # Compare FETCH_HEAD to current HEAD
-        local current_head
-        current_head=$(git -C "$proj_path" rev-parse HEAD 2>/dev/null)
         local fetched_head
         fetched_head=$(git -C "$proj_path" rev-parse FETCH_HEAD 2>/dev/null)
 
-        if [[ "$current_head" == "$fetched_head" ]]; then
+        # Check if branch already exists
+        local _branch_exists=false
+        local _branch_checked_out=false
+        local _compare_base
+        if git -C "$proj_path" show-ref --verify --quiet "refs/heads/$session_name" 2>/dev/null; then
+            _branch_exists=true
+            _compare_base=$(git -C "$proj_path" rev-parse "refs/heads/$session_name" 2>/dev/null)
+            local _current_branch
+            _current_branch=$(git -C "$proj_path" symbolic-ref --short HEAD 2>/dev/null || echo "")
+            [[ "$_current_branch" == "$session_name" ]] && _branch_checked_out=true
+        else
+            _compare_base=$(git -C "$proj_path" rev-parse HEAD 2>/dev/null)
+        fi
+
+        if [[ "$_compare_base" == "$fetched_head" ]]; then
             echo "  $proj_name (no changes)"
             continue
         fi
 
-        # Create branch
-        if ! git -C "$proj_path" branch "$session_name" FETCH_HEAD 2>/dev/null; then
-            error "  $proj_name branch creation failed"
-            fail_count=$((fail_count + 1))
-            continue
+        # If branch exists, allow fast-forward without --force; require --force for diverged
+        if $_branch_exists; then
+            if git -C "$proj_path" merge-base --is-ancestor "$_compare_base" "$fetched_head" 2>/dev/null; then
+                : # fast-forward — safe to update
+            elif [[ "$force" != "true" ]]; then
+                warn "Skipping $proj_name (branch '$session_name' has diverged, use --force)"
+                fail_count=$((fail_count + 1))
+                continue
+            fi
+        fi
+
+        # Create or update branch
+        if $_branch_checked_out; then
+            git -C "$proj_path" reset --hard FETCH_HEAD 2>/dev/null
+        elif $_branch_exists; then
+            git -C "$proj_path" branch -f "$session_name" FETCH_HEAD 2>/dev/null
+        else
+            if ! git -C "$proj_path" branch "$session_name" FETCH_HEAD 2>/dev/null; then
+                error "  $proj_name branch creation failed"
+                fail_count=$((fail_count + 1))
+                continue
+            fi
         fi
 
         # Count commits and files
         local commit_count
-        commit_count=$(git -C "$proj_path" rev-list --count "$current_head".."$session_name" 2>/dev/null || echo "0")
+        commit_count=$(git -C "$proj_path" rev-list --count "$_compare_base".."$session_name" 2>/dev/null || echo "0")
         local files_changed
-        files_changed=$(git -C "$proj_path" diff --stat --name-only "$current_head".."$session_name" 2>/dev/null | wc -l | tr -d ' ')
+        files_changed=$(git -C "$proj_path" diff --stat --name-only "$_compare_base".."$session_name" 2>/dev/null | wc -l | tr -d ' ')
 
-        success "  $proj_name → branch '$session_name' ($commit_count commit(s), $files_changed file(s))"
+        if $_branch_checked_out; then
+            success "  $proj_name → updated checked-out branch '$session_name' ($commit_count commit(s), $files_changed file(s))"
+        elif $_branch_exists; then
+            success "  $proj_name → updated branch '$session_name' ($commit_count commit(s), $files_changed file(s))"
+        else
+            success "  $proj_name → branch '$session_name' ($commit_count commit(s), $files_changed file(s))"
+        fi
         success_count=$((success_count + 1))
-    done <<< "$projects"
+    done
 
     echo ""
     if [[ $success_count -gt 0 ]]; then
@@ -924,16 +981,6 @@ _extract_single_project_direct() {
         return 1
     fi
 
-    # Check if branch already exists
-    if git -C "$target_repo" show-ref --verify --quiet "refs/heads/$session_name" 2>/dev/null; then
-        if [[ "$force" != "true" ]]; then
-            error "Branch '$session_name' already exists. Use --force to overwrite."
-            return 1
-        fi
-        warn "Overwriting existing branch: $session_name"
-        git -C "$target_repo" branch -D "$session_name" 2>/dev/null || true
-    fi
-
     # Create git bundle from volume
     local bundle_file="$CACHE_DIR/extract-$$.bundle"
     mkdir -p "$CACHE_DIR"
@@ -949,26 +996,59 @@ _extract_single_project_direct() {
     # Fetch from bundle
     git -C "$target_repo" fetch "$bundle_file" HEAD 2>/dev/null
 
-    # Compare FETCH_HEAD to current HEAD
-    local current_head
-    current_head=$(git -C "$target_repo" rev-parse HEAD 2>/dev/null)
     local fetched_head
     fetched_head=$(git -C "$target_repo" rev-parse FETCH_HEAD 2>/dev/null)
 
-    if [[ "$current_head" == "$fetched_head" ]]; then
+    # Check if branch already exists
+    local _branch_exists=false
+    local _branch_checked_out=false
+    local _compare_base
+    if git -C "$target_repo" show-ref --verify --quiet "refs/heads/$session_name" 2>/dev/null; then
+        _branch_exists=true
+        _compare_base=$(git -C "$target_repo" rev-parse "refs/heads/$session_name" 2>/dev/null)
+        local _current_branch
+        _current_branch=$(git -C "$target_repo" symbolic-ref --short HEAD 2>/dev/null || echo "")
+        [[ "$_current_branch" == "$session_name" ]] && _branch_checked_out=true
+    else
+        _compare_base=$(git -C "$target_repo" rev-parse HEAD 2>/dev/null)
+    fi
+
+    if [[ "$_compare_base" == "$fetched_head" ]]; then
         info "No changes in session (matches current HEAD)"
         return 0
     fi
 
-    # Create branch
-    git -C "$target_repo" branch "$session_name" FETCH_HEAD 2>/dev/null
+    # If branch exists, allow fast-forward without --force; require --force for diverged
+    if $_branch_exists; then
+        if git -C "$target_repo" merge-base --is-ancestor "$_compare_base" "$fetched_head" 2>/dev/null; then
+            : # fast-forward — safe to update
+        elif [[ "$force" != "true" ]]; then
+            error "Branch '$session_name' has diverged from session. Use --force to overwrite."
+            return 1
+        fi
+    fi
+
+    # Create or update branch
+    if $_branch_checked_out; then
+        git -C "$target_repo" reset --hard FETCH_HEAD 2>/dev/null
+    elif $_branch_exists; then
+        git -C "$target_repo" branch -f "$session_name" FETCH_HEAD 2>/dev/null
+    else
+        git -C "$target_repo" branch "$session_name" FETCH_HEAD 2>/dev/null
+    fi
 
     local commit_count
-    commit_count=$(git -C "$target_repo" rev-list --count "$current_head".."$session_name" 2>/dev/null || echo "0")
+    commit_count=$(git -C "$target_repo" rev-list --count "$_compare_base".."$session_name" 2>/dev/null || echo "0")
     local files_changed
-    files_changed=$(git -C "$target_repo" diff --stat --name-only "$current_head".."$session_name" 2>/dev/null | wc -l | tr -d ' ')
+    files_changed=$(git -C "$target_repo" diff --stat --name-only "$_compare_base".."$session_name" 2>/dev/null | wc -l | tr -d ' ')
 
-    success "Created branch: $session_name ($commit_count commit(s), $files_changed file(s) changed)"
+    if $_branch_checked_out; then
+        success "Updated checked-out branch: $session_name ($commit_count commit(s), $files_changed file(s) changed)"
+    elif $_branch_exists; then
+        success "Updated branch: $session_name ($commit_count commit(s), $files_changed file(s) changed)"
+    else
+        success "Created branch: $session_name ($commit_count commit(s), $files_changed file(s) changed)"
+    fi
     echo ""
     echo "Commits:"
     git -C "$target_repo" log --oneline "$current_head".."$session_name" 2>/dev/null | head -10 || true
