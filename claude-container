@@ -55,6 +55,8 @@ SESSIONS_CONFIG_DIR="$CONFIG_DIR/sessions"  # Where session configs are stored
 CLAUDE_ARGS=()  # Arguments to pass through to claude
 NO_INTERACTIVE=false  # Fail fast if no token found (don't start OAuth flow)
 NO_CONFIG=false       # Skip auto-discovery of .claude-projects.yml
+MERGE_INTO_BRANCH=""  # Branch to merge into session (--merge-into)
+AUTO_MERGE=false      # Auto-merge session back into target (--auto-merge)
 
 # Tracking booleans for CLI-set flags (for session metadata override logic)
 NO_CONFIG_SET=false
@@ -193,6 +195,15 @@ while [[ $# -gt 0 ]]; do
             FROM_BRANCH="$2"
             shift 2
             ;;
+        --merge-into)
+            ACTION="merge-into"
+            MERGE_INTO_BRANCH="$2"
+            shift 2
+            ;;
+        --auto-merge)
+            AUTO_MERGE=true
+            shift
+            ;;
 
         # Actions without session requirement
         --sessions|--list-sessions)
@@ -282,6 +293,8 @@ Session Management (use with -s <session>):
   --restart                Restart session (fixes permissions)
   --import <path>          Import claude session data from path
   --sync <branch>          Rebase session onto upstream branch (default: main)
+  --merge-into <branch>    Merge branch into session, resolve conflicts, extract
+  --auto-merge             Auto-merge session back into target (with --merge-into)
 
   Modifiers: --force/-f, --yes/-y, --regex/-r
 
@@ -382,6 +395,10 @@ if [[ -n "$ACTION" ]]; then
             ;;
         sync)
             session_sync "$SESSION_NAME" "$SYNC_BRANCH"
+            # Note: doesn't exit - continues to container startup
+            ;;
+        merge-into)
+            session_merge_into "$SESSION_NAME" "$MERGE_INTO_BRANCH"
             # Note: doesn't exit - continues to container startup
             ;;
     esac
@@ -942,6 +959,10 @@ if $USE_GIT_SESSION; then
     SYNC_BRANCH_CHECK=$(docker run --rm -v "$GIT_SESSION_VOLUME:/session:ro" "$IMAGE_NAME" \
         cat /session/.sync-branch 2>/dev/null || echo "")
 
+    # Check if this was a merge-into session
+    MERGE_INTO_BRANCH_CHECK=$(docker run --rm -v "$GIT_SESSION_VOLUME:/session:ro" "$IMAGE_NAME" \
+        cat /session/.merge-into-branch 2>/dev/null || echo "")
+
     if [[ -n "$SYNC_BRANCH_CHECK" ]]; then
         # Clean up sync marker and remotes
         info "Cleaning up sync remotes..."
@@ -966,6 +987,129 @@ if $USE_GIT_SESSION; then
         echo ""
         echo "To update branches with rebased changes:"
         echo "  claude-container -s $SESSION_NAME --extract --force"
+
+    elif [[ -n "$MERGE_INTO_BRANCH_CHECK" ]]; then
+        # Clean up merge-into marker and remotes
+        info "Cleaning up merge remotes..."
+        MERGE_CONFIG_CONTENT=$(docker run --rm -v "$GIT_SESSION_VOLUME:/session:ro" "$IMAGE_NAME" \
+            cat /session/.claude-projects.yml 2>/dev/null || echo "")
+
+        if [[ -n "$MERGE_CONFIG_CONTENT" ]] && command -v yq &>/dev/null; then
+            MERGE_PROJECTS=$(echo "$MERGE_CONFIG_CONTENT" | yq eval '.projects | to_entries | .[] | .key + "|" + .value.path' - 2>/dev/null)
+
+            while IFS='|' read -r proj_name proj_path; do
+                [[ -z "$proj_name" ]] && continue
+                docker run --rm -v "$GIT_SESSION_VOLUME:/session" "$IMAGE_NAME" \
+                    sh -c "cd '/session/$proj_name' && git remote remove upstream" 2>/dev/null || true
+            done <<< "$MERGE_PROJECTS"
+        fi
+
+        # Remove merge-into marker
+        docker run --rm -v "$GIT_SESSION_VOLUME:/session" "$IMAGE_NAME" \
+            rm -f /session/.merge-into-branch 2>/dev/null || true
+
+        success "Merge cleanup complete"
+        echo ""
+
+        # Auto-extract with --force
+        info "Extracting merged changes..."
+        session_extract "$SESSION_NAME" --force
+        echo ""
+
+        if $AUTO_MERGE; then
+            # Auto-merge session branch into target for each project
+            info "Auto-merging session into '$MERGE_INTO_BRANCH_CHECK'..."
+            echo ""
+
+            if [[ -n "$MERGE_CONFIG_CONTENT" ]] && command -v yq &>/dev/null; then
+                local merge_ok=0
+                local merge_skip=0
+
+                while IFS='|' read -r proj_name proj_path; do
+                    [[ -z "$proj_name" ]] && continue
+                    [[ ! -d "$proj_path" ]] && continue
+
+                    # Check if target branch is dirty in original repo
+                    local orig_dirty
+                    orig_dirty=$(git -C "$proj_path" status --porcelain 2>/dev/null)
+
+                    if [[ -n "$orig_dirty" ]]; then
+                        warn "  $proj_name: target repo has uncommitted changes, skipping auto-merge"
+                        echo "    Manual merge: cd $proj_path && git merge $SESSION_NAME"
+                        merge_skip=$((merge_skip + 1))
+                        continue
+                    fi
+
+                    # Check if session branch exists in original repo
+                    if ! git -C "$proj_path" show-ref --verify --quiet "refs/heads/$SESSION_NAME" 2>/dev/null; then
+                        warn "  $proj_name: session branch '$SESSION_NAME' not found in repo"
+                        merge_skip=$((merge_skip + 1))
+                        continue
+                    fi
+
+                    # Check if target branch exists
+                    if ! git -C "$proj_path" show-ref --verify --quiet "refs/heads/$MERGE_INTO_BRANCH_CHECK" 2>/dev/null; then
+                        warn "  $proj_name: target branch '$MERGE_INTO_BRANCH_CHECK' not found"
+                        merge_skip=$((merge_skip + 1))
+                        continue
+                    fi
+
+                    # Check what branch is currently checked out
+                    local current_branch
+                    current_branch=$(git -C "$proj_path" symbolic-ref --short HEAD 2>/dev/null || echo "")
+
+                    if [[ "$current_branch" == "$MERGE_INTO_BRANCH_CHECK" ]]; then
+                        # Target is checked out, merge directly
+                        if git -C "$proj_path" merge "$SESSION_NAME" --no-edit 2>/dev/null; then
+                            success "  $proj_name: merged $SESSION_NAME into $MERGE_INTO_BRANCH_CHECK"
+                            merge_ok=$((merge_ok + 1))
+                        else
+                            error "  $proj_name: merge failed (conflicts in original repo)"
+                            echo "    Resolve with: cd $proj_path && git merge --abort && git merge $SESSION_NAME"
+                            git -C "$proj_path" merge --abort 2>/dev/null || true
+                            merge_skip=$((merge_skip + 1))
+                        fi
+                    else
+                        # Target is not checked out, use checkout-merge-checkout
+                        if git -C "$proj_path" checkout "$MERGE_INTO_BRANCH_CHECK" 2>/dev/null; then
+                            if git -C "$proj_path" merge "$SESSION_NAME" --no-edit 2>/dev/null; then
+                                success "  $proj_name: merged $SESSION_NAME into $MERGE_INTO_BRANCH_CHECK"
+                                merge_ok=$((merge_ok + 1))
+                            else
+                                error "  $proj_name: merge failed (conflicts in original repo)"
+                                git -C "$proj_path" merge --abort 2>/dev/null || true
+                                merge_skip=$((merge_skip + 1))
+                            fi
+                            # Return to original branch
+                            git -C "$proj_path" checkout "$current_branch" 2>/dev/null || true
+                        else
+                            warn "  $proj_name: could not checkout $MERGE_INTO_BRANCH_CHECK"
+                            echo "    Manual merge: cd $proj_path && git checkout $MERGE_INTO_BRANCH_CHECK && git merge $SESSION_NAME"
+                            merge_skip=$((merge_skip + 1))
+                        fi
+                    fi
+                done <<< "$MERGE_PROJECTS"
+
+                echo ""
+                if [[ $merge_ok -gt 0 ]]; then
+                    success "$merge_ok project(s) merged into $MERGE_INTO_BRANCH_CHECK"
+                fi
+                if [[ $merge_skip -gt 0 ]]; then
+                    warn "$merge_skip project(s) need manual merge"
+                fi
+            fi
+        else
+            # Print manual merge commands
+            echo "To merge session changes into $MERGE_INTO_BRANCH_CHECK:"
+            if [[ -n "$MERGE_CONFIG_CONTENT" ]] && command -v yq &>/dev/null; then
+                MERGE_PROJ_NAMES=$(echo "$MERGE_CONFIG_CONTENT" | yq eval '.projects | to_entries | .[] | .key + "|" + .value.path' - 2>/dev/null)
+                while IFS='|' read -r proj_name proj_path; do
+                    [[ -z "$proj_name" ]] && continue
+                    [[ ! -d "$proj_path" ]] && continue
+                    echo "  cd $proj_path && git checkout $MERGE_INTO_BRANCH_CHECK && git merge $SESSION_NAME"
+                done <<< "$MERGE_PROJ_NAMES"
+            fi
+        fi
     else
         echo "To extract changes:"
         echo "  claude-container -s $SESSION_NAME --extract"

@@ -38,6 +38,10 @@ Available tests:
   sync_conflicts       - Sync detects and reports conflicts
   sync_multi           - Sync works with multiple projects
   sync_uncommitted     - Sync warns about uncommitted changes
+  merge_into_clean     - Merge-into merges cleanly without conflicts
+  merge_into_conflicts - Merge-into detects and reports conflicts
+  merge_into_uncommitted - Merge-into warns about uncommitted changes
+  merge_into_branch_not_found - Merge-into warns when branch doesn't exist
 
 Examples:
   ./test-workflows.sh                    # Run all tests
@@ -915,6 +919,298 @@ EOF
 }
 
 # ============================================================================
+# Merge-into tests
+# ============================================================================
+
+test_merge_into_clean() {
+    # Test that --merge-into merges cleanly when there are no conflicts
+    local base_dir="$HOME/.cache/claude-container-tests/merge-clean-$$"
+    mkdir -p "$base_dir"
+    TEST_REPOS+=("$base_dir")
+
+    # Create a repo with master branch
+    mkdir -p "$base_dir/myrepo"
+    cd "$base_dir/myrepo"
+    git init -q
+    git config user.email "test@test.com"
+    git config user.name "Test"
+    echo "# Original" > README.md
+    git add README.md
+    git commit -q -m "Initial commit"
+
+    local session="test-merge-clean-$$"
+    TEST_SESSIONS+=("$session")
+
+    # Create config file
+    cat > "$base_dir/.claude-projects.yml" << EOF
+version: "1"
+projects:
+  myrepo:
+    path: $base_dir/myrepo
+EOF
+
+    cd "$base_dir"
+
+    # Create session
+    $CC -s "$session" --no-run -C "$base_dir/.claude-projects.yml" >/dev/null 2>&1 || {
+        echo "Failed to create session"
+        return 1
+    }
+
+    # Add a commit in the session (to different file)
+    docker run --rm \
+        -v "claude-session-$session:/session" \
+        alpine sh -c "
+            apk add --quiet git
+            cd /session/myrepo
+            git config --global safe.directory '*'
+            git config user.email 'claude@container'
+            git config user.name 'Claude'
+            echo 'session work' > session-file.txt
+            git add session-file.txt
+            git commit -q -m 'Session commit'
+        " >/dev/null 2>&1 || {
+        echo "Failed to add session commit"
+        return 1
+    }
+
+    # Add a commit to the original repo (different file, no conflict)
+    cd "$base_dir/myrepo"
+    echo "upstream change" > upstream-file.txt
+    git add upstream-file.txt
+    git commit -q -m "Upstream commit"
+
+    # Run merge-into
+    cd "$base_dir"
+    local output
+    output=$($CC -s "$session" --merge-into master --no-run 2>&1) || true
+
+    # Check for success message
+    if ! echo "$output" | grep -qi "merged successfully\|up to date"; then
+        echo "Merge didn't report success"
+        echo "Output: $output"
+        return 1
+    fi
+
+    # Verify session now has both commits (merge preserves both)
+    local session_log
+    session_log=$(docker run --rm \
+        -v "claude-session-$session:/session:ro" \
+        alpine sh -c "
+            apk add --quiet git
+            cd /session/myrepo
+            git config --global safe.directory '*'
+            git log --oneline
+        " 2>/dev/null)
+
+    if ! echo "$session_log" | grep -q "Upstream commit"; then
+        echo "Upstream commit not in session"
+        echo "Log: $session_log"
+        return 1
+    fi
+
+    if ! echo "$session_log" | grep -q "Session commit"; then
+        echo "Session commit lost after merge"
+        echo "Log: $session_log"
+        return 1
+    fi
+
+    # Verify .merge-into-branch marker was written
+    local marker
+    marker=$(docker run --rm \
+        -v "claude-session-$session:/session:ro" \
+        alpine cat /session/.merge-into-branch 2>/dev/null || echo "")
+    if [[ "$marker" != "master" ]]; then
+        echo "Merge-into marker not written (got: '$marker')"
+        return 1
+    fi
+
+    return 0
+}
+
+test_merge_into_conflicts() {
+    # Test that --merge-into detects conflicts and reports them
+    local base_dir="$HOME/.cache/claude-container-tests/merge-conflict-$$"
+    mkdir -p "$base_dir"
+    TEST_REPOS+=("$base_dir")
+
+    # Create a repo
+    mkdir -p "$base_dir/conflictrepo"
+    cd "$base_dir/conflictrepo"
+    git init -q
+    git config user.email "test@test.com"
+    git config user.name "Test"
+    echo "original content" > conflict.txt
+    git add conflict.txt
+    git commit -q -m "Initial commit"
+
+    local session="test-merge-conflict-$$"
+    TEST_SESSIONS+=("$session")
+
+    # Create config
+    cat > "$base_dir/.claude-projects.yml" << EOF
+version: "1"
+projects:
+  conflictrepo:
+    path: $base_dir/conflictrepo
+EOF
+
+    cd "$base_dir"
+
+    # Create session
+    $CC -s "$session" --no-run -C "$base_dir/.claude-projects.yml" >/dev/null 2>&1
+
+    # Modify same file in session
+    docker run --rm \
+        -v "claude-session-$session:/session" \
+        alpine sh -c "
+            apk add --quiet git
+            cd /session/conflictrepo
+            git config --global safe.directory '*'
+            git config user.email 'claude@container'
+            git config user.name 'Claude'
+            echo 'session version' > conflict.txt
+            git add conflict.txt
+            git commit -q -m 'Session changes conflict.txt'
+        " >/dev/null 2>&1
+
+    # Modify same file in original (creates conflict)
+    cd "$base_dir/conflictrepo"
+    echo "upstream version" > conflict.txt
+    git add conflict.txt
+    git commit -q -m "Upstream changes conflict.txt"
+
+    # Run merge-into
+    cd "$base_dir"
+    local output
+    output=$($CC -s "$session" --merge-into master --no-run 2>&1) || true
+
+    # Should report conflicts
+    if ! echo "$output" | grep -qi "conflict"; then
+        echo "Merge didn't detect conflicts"
+        echo "Output: $output"
+        return 1
+    fi
+
+    # Should show merge resolution tips (git commit, not git rebase --continue)
+    if ! echo "$output" | grep -q "git commit"; then
+        echo "Should show merge resolution tips (git commit)"
+        echo "Output: $output"
+        return 1
+    fi
+
+    # Should NOT mention rebase
+    if echo "$output" | grep -q "rebase"; then
+        echo "Should not mention rebase in merge-into mode"
+        echo "Output: $output"
+        return 1
+    fi
+
+    return 0
+}
+
+test_merge_into_uncommitted() {
+    # Test that --merge-into warns about uncommitted changes
+    local base_dir="$HOME/.cache/claude-container-tests/merge-uncommitted-$$"
+    mkdir -p "$base_dir"
+    TEST_REPOS+=("$base_dir")
+
+    # Create a repo
+    mkdir -p "$base_dir/dirtyrepo"
+    cd "$base_dir/dirtyrepo"
+    git init -q
+    git config user.email "test@test.com"
+    git config user.name "Test"
+    echo "original" > file.txt
+    git add file.txt
+    git commit -q -m "Initial commit"
+
+    local session="test-merge-uncommitted-$$"
+    TEST_SESSIONS+=("$session")
+
+    # Create config
+    cat > "$base_dir/.claude-projects.yml" << EOF
+version: "1"
+projects:
+  dirtyrepo:
+    path: $base_dir/dirtyrepo
+EOF
+
+    cd "$base_dir"
+
+    # Create session
+    $CC -s "$session" --no-run -C "$base_dir/.claude-projects.yml" >/dev/null 2>&1
+
+    # Make UNCOMMITTED changes in the session (no commit!)
+    docker run --rm \
+        -v "claude-session-$session:/session" \
+        alpine sh -c "
+            echo 'uncommitted work' > /session/dirtyrepo/uncommitted.txt
+        " >/dev/null 2>&1
+
+    # Run merge-into - should warn about uncommitted changes
+    local output
+    output=$($CC -s "$session" --merge-into master --no-run 2>&1) || true
+
+    if ! echo "$output" | grep -qi "uncommitted"; then
+        echo "Should warn about uncommitted changes"
+        echo "Output: $output"
+        return 1
+    fi
+
+    # Should still proceed to start container
+    if ! echo "$output" | grep -qi "starting container\|review"; then
+        echo "Should still start container for review"
+        echo "Output: $output"
+        return 1
+    fi
+
+    return 0
+}
+
+test_merge_into_branch_not_found() {
+    # Test that --merge-into reports error when branch doesn't exist
+    local base_dir="$HOME/.cache/claude-container-tests/merge-nobranch-$$"
+    mkdir -p "$base_dir"
+    TEST_REPOS+=("$base_dir")
+
+    mkdir -p "$base_dir/myrepo"
+    cd "$base_dir/myrepo"
+    git init -q
+    git config user.email "test@test.com"
+    git config user.name "Test"
+    echo "content" > file.txt
+    git add file.txt
+    git commit -q -m "Initial"
+
+    local session="test-merge-nobranch-$$"
+    TEST_SESSIONS+=("$session")
+
+    cat > "$base_dir/.claude-projects.yml" << EOF
+version: "1"
+projects:
+  myrepo:
+    path: $base_dir/myrepo
+EOF
+
+    cd "$base_dir"
+    $CC -s "$session" --no-run -C "$base_dir/.claude-projects.yml" >/dev/null 2>&1
+
+    # Try to merge non-existent branch
+    local output
+    output=$($CC -s "$session" --merge-into nonexistent-branch --no-run 2>&1) || true
+
+    # Should skip or warn about missing branch
+    if ! echo "$output" | grep -qi "not found\|skipping"; then
+        echo "Should warn about missing branch"
+        echo "Output: $output"
+        return 1
+    fi
+
+    return 0
+}
+
+# ============================================================================
 # Run tests
 # ============================================================================
 
@@ -936,6 +1232,10 @@ declare -A ALL_TESTS=(
     ["from_branch"]="test_from_branch"
     ["sync_branch_not_found"]="test_sync_branch_not_found"
     ["sync_uncommitted"]="test_sync_uncommitted_changes"
+    ["merge_into_clean"]="test_merge_into_clean"
+    ["merge_into_conflicts"]="test_merge_into_conflicts"
+    ["merge_into_uncommitted"]="test_merge_into_uncommitted"
+    ["merge_into_branch_not_found"]="test_merge_into_branch_not_found"
 )
 
 echo "=== claude-container Workflow Tests ==="
@@ -981,4 +1281,10 @@ else
     run_test "From branch flag" test_from_branch
     run_test "Sync branch not found" test_sync_branch_not_found
     run_test "Sync uncommitted changes" test_sync_uncommitted_changes
+
+    # Merge-into tests
+    run_test "Merge-into clean" test_merge_into_clean
+    run_test "Merge-into with conflicts" test_merge_into_conflicts
+    run_test "Merge-into uncommitted changes" test_merge_into_uncommitted
+    run_test "Merge-into branch not found" test_merge_into_branch_not_found
 fi

@@ -757,6 +757,169 @@ session_sync() {
     # The sync marker will be detected on session exit
 }
 
+# Merge a branch into the session for conflict resolution
+# Similar to session_sync but uses git merge instead of rebase
+# Usage: session_merge_into <session_name> <target_branch>
+session_merge_into() {
+    local session_name="$1"
+    local target_branch="${2:-main}"
+    local volume="claude-session-${session_name}"
+    local git_image="${IMAGE_NAME:-$DEFAULT_IMAGE}"
+
+    # Verify session exists
+    if ! docker volume inspect "$volume" &>/dev/null; then
+        error "Session not found: $session_name"
+        exit 1
+    fi
+
+    # Get config content
+    local config_content
+    config_content=$(docker run --rm -v "$volume:/session:ro" "$git_image" \
+        cat /session/.claude-projects.yml 2>/dev/null)
+
+    if [[ -z "$config_content" ]]; then
+        error "No .claude-projects.yml found in session"
+        echo "Single-project sessions are not yet supported for --merge-into"
+        exit 1
+    fi
+
+    info "Merging branch '$target_branch' into session '$session_name'..."
+    echo ""
+
+    # Check for yq
+    if ! command -v yq &>/dev/null; then
+        error "yq required for multi-project merge"
+        exit 1
+    fi
+
+    # Parse projects
+    local projects
+    projects=$(echo "$config_content" | yq eval '.projects | to_entries | .[] | .key + "|" + .value.path' - 2>/dev/null)
+
+    local conflict_count=0
+    local success_count=0
+    local skip_count=0
+    local dirty_count=0
+
+    while IFS='|' read -r proj_name proj_path; do
+        [[ -z "$proj_name" ]] && continue
+
+        # Skip if original repo doesn't exist
+        if [[ ! -d "$proj_path" ]]; then
+            warn "  Skipping $proj_name (original not found: $proj_path)"
+            skip_count=$((skip_count + 1))
+            continue
+        fi
+
+        # Check if target branch exists in original repo
+        if ! git -C "$proj_path" show-ref --verify --quiet "refs/heads/$target_branch" 2>/dev/null; then
+            warn "  Skipping $proj_name (branch '$target_branch' not found)"
+            skip_count=$((skip_count + 1))
+            continue
+        fi
+
+        info "  Merging into $proj_name..."
+
+        # Check for merge in progress
+        local merge_in_progress
+        merge_in_progress=$(docker run --rm \
+            -v "$volume:/session:ro" \
+            "$git_image" \
+            sh -c "test -f '/session/$proj_name/.git/MERGE_HEAD' && echo 'yes' || echo 'no'" 2>/dev/null)
+
+        if [[ "$merge_in_progress" == "yes" ]]; then
+            warn "    $proj_name has merge in progress (use git commit or git merge --abort)"
+            conflict_count=$((conflict_count + 1))
+            continue
+        fi
+
+        # Check for uncommitted/unstaged changes BEFORE merging
+        local dirty_status
+        dirty_status=$(docker run --rm \
+            -v "$volume:/session:ro" \
+            "$git_image" \
+            sh -c "git config --global --add safe.directory '*' && cd '/session/$proj_name' && git status --porcelain" 2>/dev/null)
+
+        if [[ -n "$dirty_status" ]]; then
+            warn "    $proj_name has uncommitted changes (will need manual commit/stash)"
+            echo "$dirty_status" | head -3 | sed 's/^/      /'
+            local change_count
+            change_count=$(echo "$dirty_status" | wc -l | tr -d ' ')
+            if [[ $change_count -gt 3 ]]; then
+                echo "      ... and $((change_count - 3)) more"
+            fi
+            dirty_count=$((dirty_count + 1))
+            continue
+        fi
+
+        # Add remote, fetch, and merge in one docker run
+        local merge_output
+        local host_uid
+        host_uid=$(get_host_uid)
+
+        merge_output=$(docker run --rm \
+            --user "$host_uid:$host_uid" \
+            -v "$volume:/session" \
+            -v "$proj_path:/upstream:ro" \
+            "$git_image" \
+            sh -c "
+                cd '/session/$proj_name'
+                git -c safe.directory='*' remote remove upstream 2>/dev/null || true
+                git -c safe.directory='*' remote add upstream /upstream
+                git -c safe.directory='*' fetch upstream '$target_branch' 2>&1
+                git -c safe.directory='*' merge 'upstream/$target_branch' --no-edit 2>&1 || true
+            " 2>&1)
+
+        if echo "$merge_output" | grep -qE "CONFLICT|Merge conflict|Automatic merge failed"; then
+            warn "    $proj_name has conflicts (Claude will resolve)"
+            conflict_count=$((conflict_count + 1))
+        elif echo "$merge_output" | grep -qE "error:|fatal:"; then
+            error "    $proj_name merge failed:"
+            echo "$merge_output" | grep -E "error:|fatal:" | head -3 | sed 's/^/      /'
+            skip_count=$((skip_count + 1))
+        elif echo "$merge_output" | grep -q "Already up to date"; then
+            info "    $proj_name (already up to date)"
+            success_count=$((success_count + 1))
+        else
+            success "    $proj_name merged successfully"
+            success_count=$((success_count + 1))
+        fi
+    done <<< "$projects"
+
+    echo ""
+    if [[ $conflict_count -gt 0 ]]; then
+        info "$conflict_count project(s) have conflicts for Claude to resolve"
+        echo ""
+        echo "Conflict resolution tips for Claude:"
+        echo "  - Look for <<<<<<< HEAD markers in files"
+        echo "  - After resolving, run: git add <files> && git commit"
+        echo "  - To abort: git merge --abort"
+    fi
+    if [[ $success_count -gt 0 ]]; then
+        success "$success_count project(s) merged cleanly"
+    fi
+    if [[ $skip_count -gt 0 ]]; then
+        warn "$skip_count project(s) skipped"
+    fi
+    if [[ $dirty_count -gt 0 ]]; then
+        warn "$dirty_count project(s) have uncommitted changes (commit or stash in session)"
+    fi
+
+    # Store merge-into state for cleanup on exit
+    docker run --rm \
+        --user "$(get_host_uid):$(get_host_uid)" \
+        -v "$volume:/session" \
+        "$git_image" \
+        sh -c "echo '$target_branch' > /session/.merge-into-branch" 2>/dev/null || true
+
+    echo ""
+    info "Starting container for review..."
+    echo ""
+
+    # Return to main script to continue container startup
+    # The merge-into marker will be detected on session exit
+}
+
 # Extract session changes as branches in original repos
 # Uses git bundle to extract only git data (ignores build artifacts)
 # Usage: session_extract <session_name> [--force]
