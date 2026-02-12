@@ -19,6 +19,125 @@
 #   - DISCOVER_REPOS_DIRS: array of directories to scan for repos (set via --discover-repos flags)
 #   - CONFIG_FILE: path to config file (set via --config flag)
 
+# Write a repo manifest (root_commit|dirname) for all git repos in a session volume.
+# Used to detect renames/additions/deletions between creation and extraction.
+# Arguments:
+#   $1 - volume name
+write_repo_manifest() {
+    local volume="$1"
+    local git_image="${IMAGE_NAME:-$DEFAULT_IMAGE}"
+    local host_uid
+    host_uid=$(get_host_uid)
+
+    docker run --rm \
+        --user "$host_uid:$host_uid" \
+        -v "$volume:/session" \
+        "$git_image" \
+        sh -c '
+            git config --global --add safe.directory "*"
+            for d in /session/*/ /session/*/*/; do
+                [ -d "$d/.git" ] || continue
+                # Get path relative to /session (e.g. "org/repo" or "repo")
+                name="${d#/session/}"
+                name="${name%/}"
+                root=$(cd "$d" && git rev-list --max-parents=0 HEAD 2>/dev/null | head -1)
+                [ -n "$root" ] && echo "${root}|${name}"
+            done | sort > /session/.repo-manifest
+        ' 2>/dev/null || true
+}
+
+# Read current repo manifest from a session volume.
+# Returns: root_commit|dirname lines (or empty)
+# Arguments:
+#   $1 - volume name
+read_repo_manifest() {
+    local volume="$1"
+    local git_image="${IMAGE_NAME:-$DEFAULT_IMAGE}"
+
+    docker run --rm \
+        -v "$volume:/session:ro" \
+        "$git_image" \
+        cat /session/.repo-manifest 2>/dev/null || true
+}
+
+# Scan current repo state in a session volume (live, not from saved manifest).
+# Returns: root_commit|dirname lines
+# Arguments:
+#   $1 - volume name
+scan_repo_manifest() {
+    local volume="$1"
+    local git_image="${IMAGE_NAME:-$DEFAULT_IMAGE}"
+
+    docker run --rm \
+        -v "$volume:/session:ro" \
+        "$git_image" \
+        sh -c '
+            git config --global --add safe.directory "*"
+            for d in /session/*/ /session/*/*/; do
+                [ -d "$d/.git" ] || continue
+                name="${d#/session/}"
+                name="${name%/}"
+                root=$(cd "$d" && git rev-list --max-parents=0 HEAD 2>/dev/null | head -1)
+                [ -n "$root" ] && echo "${root}|${name}"
+            done | sort
+        ' 2>/dev/null || true
+}
+
+# Diff two repo manifests and report changes.
+# Arguments:
+#   $1 - old manifest (string, newline-separated)
+#   $2 - new manifest (string, newline-separated)
+# Prints changes to stdout. Returns 0 if changes found, 1 if identical.
+diff_repo_manifests() {
+    local old_manifest="$1"
+    local new_manifest="$2"
+    local has_changes=false
+
+    # Build associative arrays: hash→name
+    declare -A old_by_hash new_by_hash old_by_name new_by_name
+    while IFS='|' read -r hash name; do
+        [[ -z "$hash" ]] && continue
+        old_by_hash[$hash]="$name"
+        old_by_name[$name]="$hash"
+    done <<< "$old_manifest"
+
+    while IFS='|' read -r hash name; do
+        [[ -z "$hash" ]] && continue
+        new_by_hash[$hash]="$name"
+        new_by_name[$name]="$hash"
+    done <<< "$new_manifest"
+
+    # Detect renames: same hash, different name
+    for hash in "${!old_by_hash[@]}"; do
+        local old_name="${old_by_hash[$hash]}"
+        if [[ -n "${new_by_hash[$hash]:-}" ]]; then
+            local new_name="${new_by_hash[$hash]}"
+            if [[ "$old_name" != "$new_name" ]]; then
+                info "  Renamed: $old_name → $new_name"
+                has_changes=true
+            fi
+        fi
+    done
+
+    # Detect deletions: hash in old but not in new
+    for hash in "${!old_by_hash[@]}"; do
+        if [[ -z "${new_by_hash[$hash]:-}" ]]; then
+            warn "  Deleted: ${old_by_hash[$hash]}"
+            has_changes=true
+        fi
+    done
+
+    # Detect additions: hash in new but not in old
+    for hash in "${!new_by_hash[@]}"; do
+        if [[ -z "${old_by_hash[$hash]:-}" ]]; then
+            info "  Added: ${new_by_hash[$hash]}"
+            has_changes=true
+        fi
+    done
+
+    $has_changes && return 0 || return 1
+}
+
 # Check if a volume contains multi-project config
 # Arguments:
 #   $1 - volume name to check
@@ -224,6 +343,9 @@ create_multi_project_session() {
         exit 1
     fi
 
+    # Write repo manifest for rename/change detection on extract
+    write_repo_manifest "$volume"
+
     success "Multi-project session created: $name ($project_count projects)"
 }
 
@@ -371,6 +493,9 @@ EOF
         docker volume rm "$volume" >/dev/null 2>&1
         exit 1
     fi
+
+    # Write repo manifest for rename/change detection on extract
+    write_repo_manifest "$volume"
 
     success "Git session created: $name"
 }

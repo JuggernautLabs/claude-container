@@ -33,6 +33,7 @@ source "$SCRIPT_DIR/lib/auth.sh"
 source "$SCRIPT_DIR/lib/docker.sh"
 source "$SCRIPT_DIR/lib/git-session.sh"
 source "$SCRIPT_DIR/lib/session-mgmt.sh"
+source "$SCRIPT_DIR/lib/session-discovery.sh"
 
 # Global state variables
 DOCKERFILE=""
@@ -57,6 +58,8 @@ NO_INTERACTIVE=false  # Fail fast if no token found (don't start OAuth flow)
 NO_CONFIG=false       # Skip auto-discovery of .claude-projects.yml
 MERGE_INTO_BRANCH=""  # Branch to merge into session (--merge-into)
 AUTO_MERGE=false      # Auto-merge session back into target (--auto-merge)
+AUTO_MERGE_BRANCH=""  # Target branch for auto-merge (default: main)
+CLONE_FROM=""         # Clone volumes from existing session (--clone-from)
 
 # Tracking booleans for CLI-set flags (for session metadata override logic)
 NO_CONFIG_SET=false
@@ -65,8 +68,9 @@ RUN_AS_ROOTISH_SET=false
 ENABLE_DOCKER_SET=false
 DOCKERFILE_SET=false
 
-# Docker args accumulator
+# Docker args accumulators
 declare -a DOCKER_ARGS
+declare -a EXTRA_DOCKER_ARGS  # Populated by pre-startup actions (e.g. merge-into)
 
 # Action flags (only one action can be performed at a time)
 ACTION=""
@@ -74,6 +78,19 @@ ACTION_FORCE=false
 ACTION_YES=false
 ACTION_REGEX=false
 IMPORT_SOURCE=""
+REMOVE_UNDISCOVERED=false
+
+# Subcommand dispatch — if first arg is a known command, delegate to it
+if [[ $# -gt 0 ]] && [[ ! "$1" =~ ^- ]]; then
+    _subcmd="$1"
+    _subcmd_file="$SCRIPT_DIR/lib/commands/${_subcmd}.sh"
+    if [[ -f "$_subcmd_file" ]]; then
+        shift
+        source "$_subcmd_file"
+        "cmd_${_subcmd}" "$@"
+        exit $?
+    fi
+fi
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -191,6 +208,17 @@ while [[ $# -gt 0 ]]; do
             SYNC_BRANCH="${2:-main}"
             shift 2
             ;;
+        --refresh)
+            ACTION="refresh"
+            # Optional branch argument (default: session name)
+            if [[ -n "${2:-}" ]] && [[ ! "$2" =~ ^- ]]; then
+                REFRESH_BRANCH="$2"
+                shift 2
+            else
+                REFRESH_BRANCH=""
+                shift
+            fi
+            ;;
         --from)
             FROM_BRANCH="$2"
             shift 2
@@ -202,7 +230,17 @@ while [[ $# -gt 0 ]]; do
             ;;
         --auto-merge)
             AUTO_MERGE=true
-            shift
+            # Optional branch argument (default: main)
+            if [[ -n "${2:-}" ]] && [[ ! "$2" =~ ^- ]]; then
+                AUTO_MERGE_BRANCH="$2"
+                shift 2
+            else
+                shift
+            fi
+            ;;
+        --clone-from)
+            CLONE_FROM="$2"
+            shift 2
             ;;
 
         # Actions without session requirement
@@ -216,6 +254,11 @@ while [[ $# -gt 0 ]]; do
             ;;
         --cleanup-unused)
             ACTION="cleanup-unused"
+            shift
+            ;;
+
+        --remove-undiscovered)
+            REMOVE_UNDISCOVERED=true
             shift
             ;;
 
@@ -256,6 +299,7 @@ while [[ $# -gt 0 ]]; do
         --help|-h)
             cat <<EOF
 Usage: claude-container [options] [-- <claude-args>]
+       claude-container <subcommand> [options]
 
 Spawn into a Docker container with Claude Code ready.
 
@@ -293,8 +337,12 @@ Session Management (use with -s <session>):
   --restart                Restart session (fixes permissions)
   --import <path>          Import claude session data from path
   --sync <branch>          Rebase session onto upstream branch (default: main)
+  --refresh                Fetch latest from host repos into session (fast-forward)
+  --remove-undiscovered    With --refresh --discover-repos: remove stale repos
+  --clone-from <session>   Clone all volumes from existing session
   --merge-into <branch>    Merge branch into session, resolve conflicts, extract
-  --auto-merge             Auto-merge session back into target (with --merge-into)
+  --auto-merge [branch]    Merge session into host branch (default: main)
+                           Use with --extract or --merge-into
 
   Modifiers: --force/-f, --yes/-y, --regex/-r
 
@@ -322,8 +370,20 @@ Examples:
   # Delete a session
   claude-container -s myproj --delete --yes
 
+  # Extract and merge session into main
+  claude-container -s myproj --extract --auto-merge
+
+  # Extract and merge into a specific branch
+  claude-container -s myproj --extract --auto-merge develop
+
   # Run claude in print mode
   claude-container -s myproj -- -p "What is this?"
+
+Subcommands:
+  extract                Extract session branches to host repos
+                         Run 'claude-container extract --help' for details
+  merge                  Extract + merge session into host branches
+                         Run 'claude-container merge --help' for details
 
 Workflow:
   1. Start session:     claude-container -s myproj
@@ -368,6 +428,10 @@ if [[ -n "$ACTION" ]]; then
     case "$ACTION" in
         extract)
             $ACTION_FORCE && session_extract "$SESSION_NAME" --force || session_extract "$SESSION_NAME"
+            if $AUTO_MERGE; then
+                echo ""
+                session_auto_merge "$SESSION_NAME" "${AUTO_MERGE_BRANCH:-main}"
+            fi
             exit 0
             ;;
         delete)
@@ -397,11 +461,25 @@ if [[ -n "$ACTION" ]]; then
             session_sync "$SESSION_NAME" "$SYNC_BRANCH"
             # Note: doesn't exit - continues to container startup
             ;;
-        merge-into)
-            session_merge_into "$SESSION_NAME" "$MERGE_INTO_BRANCH"
+        refresh)
+            session_refresh "$SESSION_NAME" "${REFRESH_BRANCH:-$SESSION_NAME}"
             # Note: doesn't exit - continues to container startup
             ;;
+        merge-into)
+            if ! session_merge_into "$SESSION_NAME" "$MERGE_INTO_BRANCH"; then
+                # Nothing for Claude to resolve — extract and exit
+                session_extract "$SESSION_NAME" --force
+                exit 0
+            fi
+            # Has conflicts/dirty — continues to container startup
+            ;;
     esac
+fi
+
+# Validate --clone-from requires --session
+if [[ -n "$CLONE_FROM" ]] && [[ -z "$SESSION_NAME" ]]; then
+    error "--clone-from requires --session <name>"
+    exit 1
 fi
 
 # Validate session name is provided when required
@@ -599,7 +677,12 @@ if $USE_GIT_SESSION; then
         info "Session config: $session_config"
     fi
 
-    create_git_session "$SESSION_NAME" "$WORKSPACE_DIR"
+    # Handle --clone-from: clone volumes from existing session if target doesn't exist
+    if [[ -n "$CLONE_FROM" ]] && ! docker volume inspect "$GIT_SESSION_VOLUME" &>/dev/null; then
+        session_clone "$CLONE_FROM" "$SESSION_NAME"
+    else
+        create_git_session "$SESSION_NAME" "$WORKSPACE_DIR"
+    fi
 
     # Persist session metadata so resuming only needs: claude-container -s <name>
     cat > "$SESSIONS_CONFIG_DIR/${SESSION_NAME}.env" << EOF
@@ -665,6 +748,11 @@ SSH_SOCKET_ARGS=$(get_ssh_socket_args)
 if [[ -n "$SSH_SOCKET_ARGS" ]]; then
     # shellcheck disable=SC2086
     DOCKER_ARGS+=($SSH_SOCKET_ARGS)
+fi
+
+# Append extra docker args from pre-startup actions (e.g. merge-into host repo mounts)
+if [[ ${#EXTRA_DOCKER_ARGS[@]} -gt 0 ]]; then
+    DOCKER_ARGS+=("${EXTRA_DOCKER_ARGS[@]}")
 fi
 
 # Add environment variables
@@ -854,6 +942,21 @@ WRAPPER
         fi
     fi
 
+    # Install fin command for merge-into / reconcile session completion
+    cat > /usr/local/bin/fin << '\''FINSCRIPT'\''
+#!/bin/bash
+if [[ $# -eq 0 ]]; then
+    echo "Usage: fin <description>"
+    echo "Signals completion of conflict resolution and terminates the session."
+    exit 1
+fi
+echo "$*" > /workspace/.reconcile-complete
+echo ""
+echo "Session complete: $*"
+kill 1
+FINSCRIPT
+    chmod +x /usr/local/bin/fin
+
     # Verify mode
     if [[ "${VERIFY_MODE:-}" == "1" ]]; then
         echo "=== Verification ==="
@@ -941,8 +1044,23 @@ WRAPPER
         done <<< "$PASSTHROUGH_DECODED"
     fi
 
+    # Check for merge-into summary to use as initial prompt
+    CLAUDE_INITIAL_PROMPT=""
+    if [[ -f /workspace/.merge-into-summary ]]; then
+        CLAUDE_INITIAL_PROMPT=$(cat /workspace/.merge-into-summary)
+        rm -f /workspace/.merge-into-summary
+    fi
+
     cd $WORK_DIR
-    if [[ "${RUN_AS_USER:-}" == "1" ]] || [[ "${RUN_AS_ROOTISH:-}" == "1" ]]; then
+    if [[ -n "$CLAUDE_INITIAL_PROMPT" ]]; then
+        # Write prompt to temp file to avoid shell quoting issues
+        echo "$CLAUDE_INITIAL_PROMPT" > /tmp/.claude-initial-prompt
+        if [[ "${RUN_AS_USER:-}" == "1" ]] || [[ "${RUN_AS_ROOTISH:-}" == "1" ]]; then
+            exec gosu developer bash -c "claude $CLAUDE_CMD_ARGS \"\$(cat /tmp/.claude-initial-prompt)\""
+        else
+            exec bash -c "HOME=/home/developer claude $CLAUDE_CMD_ARGS \"\$(cat /tmp/.claude-initial-prompt)\""
+        fi
+    elif [[ "${RUN_AS_USER:-}" == "1" ]] || [[ "${RUN_AS_ROOTISH:-}" == "1" ]]; then
         exec gosu developer bash -c "claude $CLAUDE_CMD_ARGS"
     else
         exec bash -c "HOME=/home/developer claude $CLAUDE_CMD_ARGS"
@@ -966,13 +1084,12 @@ if $USE_GIT_SESSION; then
     if [[ -n "$SYNC_BRANCH_CHECK" ]]; then
         # Clean up sync marker and remotes
         info "Cleaning up sync remotes..."
-        SYNC_CONFIG_CONTENT=$(docker run --rm -v "$GIT_SESSION_VOLUME:/session:ro" "$IMAGE_NAME" \
-            cat /session/.claude-projects.yml 2>/dev/null || echo "")
+        SYNC_CONFIG_CONTENT=$(read_session_config "$GIT_SESSION_VOLUME")
 
         if [[ -n "$SYNC_CONFIG_CONTENT" ]] && command -v yq &>/dev/null; then
-            SYNC_PROJECTS=$(echo "$SYNC_CONFIG_CONTENT" | yq eval '.projects | to_entries | .[] | .key' - 2>/dev/null)
+            SYNC_PROJECTS=$(parse_session_projects "$SYNC_CONFIG_CONTENT")
 
-            while read -r proj_name; do
+            while IFS='|' read -r proj_name proj_path; do
                 [[ -z "$proj_name" ]] && continue
                 docker run --rm -v "$GIT_SESSION_VOLUME:/session" "$IMAGE_NAME" \
                     sh -c "cd '/session/$proj_name' && git remote remove upstream" 2>/dev/null || true
@@ -989,14 +1106,21 @@ if $USE_GIT_SESSION; then
         echo "  claude-container -s $SESSION_NAME --extract --force"
 
     elif [[ -n "$MERGE_INTO_BRANCH_CHECK" ]]; then
+        # Check if reconcile completed via 'fin' command
+        RECONCILE_RESULT=$(docker run --rm -v "$GIT_SESSION_VOLUME:/session:ro" "$IMAGE_NAME" \
+            cat /session/.reconcile-complete 2>/dev/null || echo "")
+        if [[ -n "$RECONCILE_RESULT" ]]; then
+            success "Reconcile complete: $RECONCILE_RESULT"
+            docker run --rm -v "$GIT_SESSION_VOLUME:/session" "$IMAGE_NAME" \
+                rm -f /session/.reconcile-complete 2>/dev/null || true
+        fi
+
         # Clean up merge-into marker and remotes
         info "Cleaning up merge remotes..."
-        MERGE_CONFIG_CONTENT=$(docker run --rm -v "$GIT_SESSION_VOLUME:/session:ro" "$IMAGE_NAME" \
-            cat /session/.claude-projects.yml 2>/dev/null || echo "")
+        MERGE_CONFIG_CONTENT=$(read_session_config "$GIT_SESSION_VOLUME")
+        MERGE_PROJECTS=$(parse_session_projects "$MERGE_CONFIG_CONTENT")
 
-        if [[ -n "$MERGE_CONFIG_CONTENT" ]] && command -v yq &>/dev/null; then
-            MERGE_PROJECTS=$(echo "$MERGE_CONFIG_CONTENT" | yq eval '.projects | to_entries | .[] | .key + "|" + .value.path' - 2>/dev/null)
-
+        if [[ -n "$MERGE_PROJECTS" ]]; then
             while IFS='|' read -r proj_name proj_path; do
                 [[ -z "$proj_name" ]] && continue
                 docker run --rm -v "$GIT_SESSION_VOLUME:/session" "$IMAGE_NAME" \
@@ -1004,9 +1128,9 @@ if $USE_GIT_SESSION; then
             done <<< "$MERGE_PROJECTS"
         fi
 
-        # Remove merge-into marker
+        # Remove merge-into marker and summary
         docker run --rm -v "$GIT_SESSION_VOLUME:/session" "$IMAGE_NAME" \
-            rm -f /session/.merge-into-branch 2>/dev/null || true
+            rm -f /session/.merge-into-branch /session/.merge-into-summary 2>/dev/null || true
 
         success "Merge cleanup complete"
         echo ""
@@ -1017,97 +1141,28 @@ if $USE_GIT_SESSION; then
         echo ""
 
         if $AUTO_MERGE; then
-            # Auto-merge session branch into target for each project
-            info "Auto-merging session into '$MERGE_INTO_BRANCH_CHECK'..."
-            echo ""
-
-            if [[ -n "$MERGE_CONFIG_CONTENT" ]] && command -v yq &>/dev/null; then
-                local merge_ok=0
-                local merge_skip=0
-
-                while IFS='|' read -r proj_name proj_path; do
-                    [[ -z "$proj_name" ]] && continue
-                    [[ ! -d "$proj_path" ]] && continue
-
-                    # Check if target branch is dirty in original repo
-                    local orig_dirty
-                    orig_dirty=$(git -C "$proj_path" status --porcelain 2>/dev/null)
-
-                    if [[ -n "$orig_dirty" ]]; then
-                        warn "  $proj_name: target repo has uncommitted changes, skipping auto-merge"
-                        echo "    Manual merge: cd $proj_path && git merge $SESSION_NAME"
-                        merge_skip=$((merge_skip + 1))
-                        continue
-                    fi
-
-                    # Check if session branch exists in original repo
-                    if ! git -C "$proj_path" show-ref --verify --quiet "refs/heads/$SESSION_NAME" 2>/dev/null; then
-                        warn "  $proj_name: session branch '$SESSION_NAME' not found in repo"
-                        merge_skip=$((merge_skip + 1))
-                        continue
-                    fi
-
-                    # Check if target branch exists
-                    if ! git -C "$proj_path" show-ref --verify --quiet "refs/heads/$MERGE_INTO_BRANCH_CHECK" 2>/dev/null; then
-                        warn "  $proj_name: target branch '$MERGE_INTO_BRANCH_CHECK' not found"
-                        merge_skip=$((merge_skip + 1))
-                        continue
-                    fi
-
-                    # Check what branch is currently checked out
-                    local current_branch
-                    current_branch=$(git -C "$proj_path" symbolic-ref --short HEAD 2>/dev/null || echo "")
-
-                    if [[ "$current_branch" == "$MERGE_INTO_BRANCH_CHECK" ]]; then
-                        # Target is checked out, merge directly
-                        if git -C "$proj_path" merge "$SESSION_NAME" --no-edit 2>/dev/null; then
-                            success "  $proj_name: merged $SESSION_NAME into $MERGE_INTO_BRANCH_CHECK"
-                            merge_ok=$((merge_ok + 1))
-                        else
-                            error "  $proj_name: merge failed (conflicts in original repo)"
-                            echo "    Resolve with: cd $proj_path && git merge --abort && git merge $SESSION_NAME"
-                            git -C "$proj_path" merge --abort 2>/dev/null || true
-                            merge_skip=$((merge_skip + 1))
-                        fi
-                    else
-                        # Target is not checked out, use checkout-merge-checkout
-                        if git -C "$proj_path" checkout "$MERGE_INTO_BRANCH_CHECK" 2>/dev/null; then
-                            if git -C "$proj_path" merge "$SESSION_NAME" --no-edit 2>/dev/null; then
-                                success "  $proj_name: merged $SESSION_NAME into $MERGE_INTO_BRANCH_CHECK"
-                                merge_ok=$((merge_ok + 1))
-                            else
-                                error "  $proj_name: merge failed (conflicts in original repo)"
-                                git -C "$proj_path" merge --abort 2>/dev/null || true
-                                merge_skip=$((merge_skip + 1))
-                            fi
-                            # Return to original branch
-                            git -C "$proj_path" checkout "$current_branch" 2>/dev/null || true
-                        else
-                            warn "  $proj_name: could not checkout $MERGE_INTO_BRANCH_CHECK"
-                            echo "    Manual merge: cd $proj_path && git checkout $MERGE_INTO_BRANCH_CHECK && git merge $SESSION_NAME"
-                            merge_skip=$((merge_skip + 1))
-                        fi
-                    fi
-                done <<< "$MERGE_PROJECTS"
-
-                echo ""
-                if [[ $merge_ok -gt 0 ]]; then
-                    success "$merge_ok project(s) merged into $MERGE_INTO_BRANCH_CHECK"
-                fi
-                if [[ $merge_skip -gt 0 ]]; then
-                    warn "$merge_skip project(s) need manual merge"
-                fi
-            fi
+            session_auto_merge "$SESSION_NAME" "$MERGE_INTO_BRANCH_CHECK"
         else
-            # Print manual merge commands
+            # Print manual merge commands as a single copy-pasteable script
             echo "To merge session changes into $MERGE_INTO_BRANCH_CHECK:"
-            if [[ -n "$MERGE_CONFIG_CONTENT" ]] && command -v yq &>/dev/null; then
-                MERGE_PROJ_NAMES=$(echo "$MERGE_CONFIG_CONTENT" | yq eval '.projects | to_entries | .[] | .key + "|" + .value.path' - 2>/dev/null)
+            echo ""
+            if [[ -n "$MERGE_PROJECTS" ]]; then
+                _merge_cmds=()
                 while IFS='|' read -r proj_name proj_path; do
                     [[ -z "$proj_name" ]] && continue
                     [[ ! -d "$proj_path" ]] && continue
-                    echo "  cd $proj_path && git checkout $MERGE_INTO_BRANCH_CHECK && git merge $SESSION_NAME"
-                done <<< "$MERGE_PROJ_NAMES"
+                    _merge_cmds+=("cd $proj_path && git checkout $MERGE_INTO_BRANCH_CHECK && git merge $SESSION_NAME")
+                done <<< "$MERGE_PROJECTS"
+                # Join with " && \" for a single copy-pasteable block
+                _i=0
+                for _cmd in "${_merge_cmds[@]}"; do
+                    _i=$((_i + 1))
+                    if [[ $_i -lt ${#_merge_cmds[@]} ]]; then
+                        echo "$_cmd && \\"
+                    else
+                        echo "$_cmd"
+                    fi
+                done
             fi
         fi
     else

@@ -352,6 +352,14 @@ main() {
 
     trap cleanup EXIT
 
+    # Pre-cleanup: remove stale test volumes from previous interrupted runs
+    _stale_vols=$(docker volume ls -q | grep -E '^claude-(session|state|cargo|npm|pip)-test-multi-' 2>/dev/null || true)
+    if [[ -n "$_stale_vols" ]]; then
+        echo "Cleaning $(echo "$_stale_vols" | wc -l | tr -d ' ') stale test volume(s)..."
+        echo "$_stale_vols" | xargs docker volume rm 2>/dev/null || true
+    fi
+    rm -rf "$HOME/.cache/claude-container-test-"* 2>/dev/null || true
+
     check_prerequisites
     echo ""
 

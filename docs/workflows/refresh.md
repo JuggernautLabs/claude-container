@@ -1,0 +1,63 @@
+# Refresh Workflow
+
+Pull changes from host repos into an active session without restarting.
+
+## When to use
+
+You have a running session and need to bring in changes made on the host:
+- You edited files outside the container and want Claude to see them
+- Another tool or CI pushed updates to a branch
+- You extracted, made fixes on the host, and want to push them back in
+
+## Basic usage
+
+```bash
+# Refresh from the session-named branch (default)
+claude-container -s my-feature --refresh
+```
+
+This fetches the `my-feature` branch from each host repo and fast-forwards the session copy.
+
+## Specify a branch
+
+```bash
+# Refresh from main instead
+claude-container -s my-feature --refresh main
+```
+
+## Refresh and continue working
+
+```bash
+# Refresh then launch Claude with conversation history
+claude-container -s my-feature --continue --refresh
+```
+
+## What happens
+
+For each repo in the session config:
+
+1. Mounts the host repo read-only into the container
+2. Fetches the specified branch (default: session name)
+3. Fast-forwards the session copy if possible
+
+### Possible outcomes per repo
+
+| Status | Meaning |
+|--------|---------|
+| `up to date` | Session and host are at the same commit |
+| `N new commit(s)` | Fast-forwarded N commits from host |
+| `diverged` | Both sides have unique commits — use `--sync` to rebase |
+| `no branch 'X' on host` | The requested branch doesn't exist on the host repo |
+
+## Repos created in-session
+
+If Claude created new repos inside the container (e.g., `git init`), refresh automatically registers them in the session config on first run. Their host paths are inferred from sibling repos with the same org prefix.
+
+## Refresh vs. Sync
+
+| | `--refresh` | `--sync <branch>` |
+|-|-------------|-------------------|
+| **Strategy** | Fast-forward only | Rebase |
+| **Conflicts** | Skips diverged repos | Claude resolves interactively |
+| **Use case** | Quick update, no divergence | Long-running session, upstream moved |
+| **Continues to container** | Yes | Yes |
