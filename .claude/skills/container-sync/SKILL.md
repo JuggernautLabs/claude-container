@@ -1,6 +1,6 @@
 ---
 name: container-sync
-description: Sync a claude-container session with upstream changes. Use when the user wants to rebase their session work onto an updated branch, pull in upstream changes, or resolve merge conflicts. Handles long-running sessions where main/develop has been updated.
+description: Sync a claude-container session with upstream changes. Use when the user wants to rebase their session work onto an updated branch, pull in upstream changes, push a specific repo/branch, force-reset a repo, reconcile multiple sessions, or resolve merge conflicts. Handles long-running sessions where main/develop has been updated.
 argument-hint: <session-name> [branch]
 allowed-tools:
   - AskUserQuestion
@@ -127,6 +127,12 @@ The `--force` flag is needed because the branch already exists from previous ext
 # Fast-forward from host (session branch)
 claude-container push -s my-feature
 
+# Fast-forward a single repo from a specific branch
+claude-container push -s my-feature --repo synapse,main
+
+# Force-reset a single repo to match host branch
+claude-container push -s my-feature --repo synapse,main --force
+
 # Rebase onto main
 claude-container push -s my-feature main --rebase
 
@@ -136,6 +142,14 @@ claude-container push -s my-feature develop --rebase
 # Merge main into session
 claude-container push -s my-feature main --merge
 ```
+
+### --repo flag
+
+`--repo <name>[,<branch>]` targets a single repo:
+- Name can be partial: `synapse` matches `org/synapse`
+- Optional `,branch` overrides which host branch to push from
+- Ambiguous partial matches are rejected with a list of candidates
+- Works with `--force` to reset diverged or ahead repos to host HEAD
 
 ## After Sync Workflow
 
@@ -228,6 +242,46 @@ cd /workspace/<project>
 git rebase --abort
 ```
 Then try push --rebase again.
+
+## Reconcile: Multi-Session Merge
+
+Merge multiple sessions into a single target branch, sequentially. Each session is extracted and auto-merged; if conflicts arise, a container launches for Claude to resolve them, then reconcile continues automatically.
+
+```bash
+# Merge named sessions into main
+claude-container reconcile main s1 s2 s3
+
+# Auto-discover all sessions with unmerged work
+claude-container reconcile main
+
+# Preview what would happen (non-destructive)
+claude-container reconcile main --dry-run
+
+# Filter sessions by regex
+claude-container reconcile main --include 'feature-.*' --exclude 'wip'
+
+# Resume after interruption or container exit
+claude-container reconcile --continue
+
+# Skip confirmation
+claude-container reconcile main --yes
+```
+
+### How it works
+1. For each session: extract → auto-merge into target
+2. If conflicts: merge target INTO session, launch container, Claude resolves with `fin`
+3. Exit handler detects plan file → `reconcile --continue` → next session
+4. State persisted in `~/.config/claude-container/.reconcile-plan`
+
+### Flags
+| Flag | Description |
+|------|-------------|
+| `--include <regex>` | Only process matching sessions (repeatable) |
+| `--exclude <regex>` | Skip matching sessions (repeatable, wins over include) |
+| `--dry-run` | Preview without merging |
+| `--yes, -y` | Skip confirmation |
+| `--force, -f` | Force extraction even if diverged |
+| `--continue` | Resume interrupted reconcile |
 
 ## Legacy Command Mapping
 

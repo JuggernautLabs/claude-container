@@ -763,6 +763,8 @@ session_sync() {
 session_refresh() {
     local session_name="$1"
     local refresh_branch="${2:-$session_name}"
+    local repo_filter="${3:-}"
+    local force_reset="${4:-false}"
     local volume="claude-session-${session_name}"
     local git_image="${IMAGE_NAME:-$DEFAULT_IMAGE}"
 
@@ -894,6 +896,35 @@ session_refresh() {
     local projects
     projects=$(parse_session_projects "$config_content")
 
+    # Resolve repo filter before processing
+    if [[ -n "$repo_filter" ]]; then
+        local _matches=()
+        while IFS='|' read -r _rn _rp; do
+            [[ -z "$_rn" ]] && continue
+            if [[ "$_rn" == "$repo_filter" ]]; then
+                # Exact match — use it directly, skip ambiguity check
+                _matches=("$_rn")
+                break
+            elif [[ "$_rn" == */"$repo_filter" ]]; then
+                _matches+=("$_rn")
+            fi
+        done <<< "$projects"
+
+        if [[ ${#_matches[@]} -eq 0 ]]; then
+            error "No repo matching '$repo_filter' in session"
+            return 1
+        elif [[ ${#_matches[@]} -gt 1 ]]; then
+            error "'$repo_filter' is ambiguous — matches ${#_matches[@]} repos:"
+            for _m in "${_matches[@]}"; do
+                echo "  $_m"
+            done
+            echo "Use the full name with --repo to be specific"
+            return 1
+        fi
+
+        repo_filter="${_matches[0]}"
+    fi
+
     info "Refreshing session '$session_name' from host branch '$refresh_branch'..."
     echo ""
 
@@ -908,6 +939,11 @@ session_refresh() {
 
     while IFS='|' read -r proj_name proj_path; do
         [[ -z "$proj_name" ]] && continue
+
+        # Apply resolved repo filter
+        if [[ -n "$repo_filter" && "$proj_name" != "$repo_filter" ]]; then
+            continue
+        fi
 
         if [[ ! -d "$proj_path" ]]; then
             warn "  Skipping $proj_name (not found: $proj_path)"
@@ -939,9 +975,17 @@ session_refresh() {
                 count=\$(git rev-list --count \"\$local_head\"..HEAD)
                 echo 'OK|$proj_name|'\$count' new commit(s)'
             elif git merge-base --is-ancestor FETCH_HEAD \"\$local_head\"; then
-                echo 'SAME|$proj_name|up to date'
+                if [ '$force_reset' = 'true' ]; then
+                    git reset --hard FETCH_HEAD 2>/dev/null
+                    echo 'OK|$proj_name|force-reset to host HEAD'
+                else
+                    echo 'SAME|$proj_name|up to date'
+                fi
+            elif [ '$force_reset' = 'true' ]; then
+                git reset --hard FETCH_HEAD 2>/dev/null
+                echo 'OK|$proj_name|force-reset to host HEAD'
             else
-                echo 'DIVERGE|$proj_name|session and host have diverged (use --sync to rebase)'
+                echo 'DIVERGE|$proj_name|session and host have diverged (use --force or --sync to rebase)'
             fi
             git remote remove _host 2>/dev/null || true
         ) &"
@@ -2159,6 +2203,7 @@ session_auto_merge() {
         echo "  Resolve conflicts in-container first, then pull again:"
         echo "    claude-container push -s $session_name $target_branch --merge"
         echo "    claude-container pull -s $session_name $target_branch"
+        return 2
     fi
 }
 

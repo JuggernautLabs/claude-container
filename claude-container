@@ -1175,6 +1175,13 @@ if $USE_GIT_SESSION; then
             echo "To merge into $MERGE_INTO_BRANCH_CHECK:"
             echo "  claude-container pull -s $SESSION_NAME $MERGE_INTO_BRANCH_CHECK"
         fi
+
+        # Check for reconcile continuation
+        if [[ -f "$CONFIG_DIR/.reconcile-plan" ]]; then
+            echo ""
+            info "Continuing reconcile..."
+            exec "$0" reconcile --continue
+        fi
     else
         echo "To pull changes to host:"
         echo "  claude-container pull -s $SESSION_NAME"

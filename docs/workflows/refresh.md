@@ -25,6 +25,25 @@ This fetches the `my-feature` branch from each host repo and fast-forwards the s
 claude-container push -s my-feature main
 ```
 
+## Push a single repo
+
+```bash
+# Push only the synapse repo (partial name matching works)
+claude-container push -s my-feature --repo synapse
+
+# Push a specific branch into a specific repo
+claude-container push -s my-feature --repo synapse,main
+
+# Force-reset a repo to match the host branch
+claude-container push -s my-feature --repo synapse,main --force
+```
+
+The `--repo` flag accepts `name[,branch]`:
+- **`name`** — matches exactly, or by suffix (e.g. `synapse` matches `org/synapse`)
+- **`,branch`** — overrides the branch to push from (otherwise uses session name or positional arg)
+
+If the name is ambiguous (matches multiple repos), you'll be told which ones matched and asked to use the full name.
+
 ## Push and continue working
 
 ```bash
@@ -47,7 +66,8 @@ For each repo in the session config:
 |--------|---------|
 | `up to date` | Session and host are at the same commit |
 | `N new commit(s)` | Fast-forwarded N commits from host |
-| `diverged` | Both sides have unique commits — use `push --rebase` to rebase |
+| `force-reset to host HEAD` | Session was reset to match host (with `--force`) |
+| `diverged` | Both sides have unique commits — use `--force` to reset or `--rebase` to rebase |
 | `no branch 'X' on host` | The requested branch doesn't exist on the host repo |
 
 ## Repos created in-session
@@ -56,12 +76,12 @@ If Claude created new repos inside the container (e.g., `git init`), push automa
 
 ## Push strategies
 
-| | `push` (--ff) | `push --rebase` | `push --merge` |
-|-|---------------|-----------------|----------------|
-| **Strategy** | Fast-forward only | Rebase | Merge |
-| **Conflicts** | Skips diverged repos | Claude resolves interactively | Claude resolves interactively |
-| **Use case** | Quick update, no divergence | Long-running session, upstream moved | Need to incorporate upstream changes |
-| **Container** | No | Yes, if conflicts | Yes, if conflicts |
+| | `push` (--ff) | `push --ff --force` | `push --rebase` | `push --merge` |
+|-|---------------|---------------------|-----------------|----------------|
+| **Strategy** | Fast-forward only | Reset to host HEAD | Rebase | Merge |
+| **Conflicts** | Skips diverged repos | Overwrites session state | Claude resolves interactively | Claude resolves interactively |
+| **Use case** | Quick update, no divergence | Reload a repo from a different branch | Long-running session, upstream moved | Need to incorporate upstream changes |
+| **Container** | No | No | Yes, if conflicts | Yes, if conflicts |
 
 ## Legacy command mapping
 

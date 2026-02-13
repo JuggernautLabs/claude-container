@@ -14,11 +14,23 @@ cmd_push() {
     local branch=""
     local strategy="ff"  # ff, rebase, merge
     local force=false
+    local repo_filter=""
+    local repo_branch=""
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --session|-s)
                 session_name="$2"
+                shift 2
+                ;;
+            --repo)
+                # Parse --repo name[,branch]
+                if [[ "$2" == *,* ]]; then
+                    repo_filter="${2%%,*}"
+                    repo_branch="${2#*,}"
+                else
+                    repo_filter="$2"
+                fi
                 shift 2
                 ;;
             --ff)
@@ -69,8 +81,9 @@ cmd_push() {
     case "$strategy" in
         ff)
             # Fast-forward: fetch + ff from host branch
-            local refresh_branch="${branch:-$session_name}"
-            session_refresh "$session_name" "$refresh_branch"
+            # repo_branch (from --repo name,branch) overrides positional branch
+            local refresh_branch="${repo_branch:-${branch:-$session_name}}"
+            session_refresh "$session_name" "$refresh_branch" "$repo_filter" "$force"
             return $?
             ;;
         rebase)
@@ -106,6 +119,8 @@ Arguments:
 
 Options:
   --session, -s <name>     Session name (required)
+  --repo <name>[,<branch>] Only push this repo, optionally from a specific branch.
+                           Name can be partial (e.g. 'synapse' matches 'org/synapse').
   --ff                     Fast-forward from host branch (default)
   --rebase                 Rebase session onto host branch
   --merge                  Merge host branch into session
@@ -129,6 +144,12 @@ Examples:
 
   # Merge main into session (for conflict resolution)
   claude-container push -s myproj main --merge
+
+  # Push a single repo's main branch into session
+  claude-container push -s myproj --repo synapse,main
+
+  # Force-reset a single diverged repo
+  claude-container push -s myproj --repo synapse,main --force
 
 Migration from old flags:
   --refresh [branch]    →  push [branch]

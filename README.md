@@ -246,10 +246,13 @@ claude-container push -s <session> [branch] [options]
 
 | Flag | Description |
 |------|-------------|
+| `--repo <name>[,<branch>]` | Only push this repo, optionally from a specific branch |
 | `--ff` | Fast-forward from host branch (default) |
 | `--rebase` | Rebase session onto host branch |
 | `--merge` | Merge host branch into session |
-| `--force, -f` | Force operation |
+| `--force, -f` | Force operation (reset diverged repos to host HEAD) |
+
+Repo names support partial matching (`synapse` matches `org/synapse`). Ambiguous matches are rejected with a list of candidates.
 
 ### pull
 
@@ -280,6 +283,25 @@ claude-container status -s <session> [branch] [options]
 
 No branch = sync classification. With branch = hash comparison.
 
+### reconcile
+
+Merge multiple sessions into a unified branch, sequentially.
+
+```bash
+claude-container reconcile <branch> [session...] [options]
+```
+
+| Flag | Description |
+|------|-------------|
+| `--include <regex>` | Only process matching sessions (repeatable) |
+| `--exclude <regex>` | Skip matching sessions (repeatable, wins over include) |
+| `--dry-run` | Preview what would happen without merging |
+| `--yes, -y` | Skip confirmation prompt |
+| `--continue` | Resume an interrupted reconcile |
+| `--force, -f` | Force extraction even if branches diverged |
+
+Omit session names to auto-discover all sessions with unmerged work.
+
 ### Legacy subcommands
 
 `merge` and `extract` subcommands still work but print deprecation warnings. Use `push`/`pull`/`status` instead.
@@ -292,6 +314,7 @@ Detailed guides for common workflows:
 - **[Basic Session](docs/workflows/basic-session.md)** -- Create, work, extract, merge
 - **[Multi-Project](docs/workflows/multi-project.md)** -- Discover repos, work across multiple repos, handle new repos
 - **[Reconcile](docs/workflows/reconcile.md)** -- Merge with dirty worktrees and conflicts, AI-assisted resolution
+- **[Multi-Session Reconcile](docs/workflows/multi-session-reconcile.md)** -- Merge multiple sessions into one branch
 - **[Refresh](docs/workflows/refresh.md)** -- Pull host changes into an active session
 - **[Verification](docs/workflows/verification.md)** -- Hash checks, sync status, scripting with exit codes
 
@@ -335,6 +358,14 @@ claude-container pull -s my-feature main
 claude-container push -s my-feature main              # Fast-forward
 claude-container push -s my-feature main --rebase     # Rebase onto main
 claude-container push -s my-feature develop --rebase  # Rebase onto develop
+claude-container push -s my-feature --repo api,main   # Push main into one repo
+claude-container push -s my-feature --repo api --force # Force-reset one repo
+
+# Reconcile multiple sessions into main
+claude-container reconcile main s1 s2 s3              # Named sessions
+claude-container reconcile main                       # Auto-discover
+claude-container reconcile main --dry-run             # Preview
+claude-container reconcile --continue                 # Resume
 
 # Check sync state
 claude-container status -s my-feature main
