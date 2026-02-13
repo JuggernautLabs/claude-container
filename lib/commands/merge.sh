@@ -9,6 +9,13 @@
 #   claude-container merge -s myproj --verify       # check sync status (read-only)
 
 cmd_merge() {
+    warn "Deprecated: use 'pull', 'push', or 'status' subcommands instead"
+    echo "  merge --branch <b>       → pull -s <session> <b>"
+    echo "  merge --reconcile <b>    → pull -s <session> <b> --reconcile"
+    echo "  merge --check <b>        → status -s <session> <b>"
+    echo "  merge --verify           → status -s <session>"
+    echo ""
+
     local session_name=""
     local target_branch=""
     local verify=false

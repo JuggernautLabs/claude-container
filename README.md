@@ -22,12 +22,11 @@ claude-container -s my-feature
 
 # 3. Work with Claude in the container...
 
-# 4. Exit and extract changes as a branch
-claude-container -s my-feature --extract
+# 4. Pull changes to host and merge into main
+claude-container pull -s my-feature main
 
-# 5. Use git normally
-git checkout my-feature
-git merge my-feature
+# 5. Or just extract as a branch
+claude-container pull -s my-feature
 ```
 
 ## Installation
@@ -78,9 +77,9 @@ ln -s $(pwd)/claude-container /usr/local/bin/
  └──────────────────┘             └──────────────────┘
                                             │
                                             ▼
- EXTRACT & MERGE                  VERIFY
- claude-container merge           claude-container merge
- -s my-feature --branch main      -s my-feature --check main
+ PULL & MERGE                     VERIFY
+ claude-container pull            claude-container status
+ -s my-feature main               -s my-feature main
          │                                  │
          ▼                                  ▼
  ┌──────────────────┐             ┌──────────────────┐
@@ -89,7 +88,7 @@ ln -s $(pwd)/claude-container /usr/local/bin/
  └──────────────────┘             └──────────────────┘
 
  If dirty or conflicts:
- claude-container merge -s my-feature --reconcile main
+ claude-container pull -s my-feature main --reconcile
  → stash dirty work → merge → launch Claude for conflicts → fin
 ```
 
@@ -99,11 +98,11 @@ For long-lived sessions where the upstream branch has changed:
 
 ```bash
 # Rebase session onto updated main
-claude-container -s my-feature --sync main
+claude-container push -s my-feature main --rebase
 
 # Claude resolves any rebase conflicts interactively
-# Then extract the rebased work
-claude-container -s my-feature --extract --force
+# Then pull the rebased work
+claude-container pull -s my-feature --force
 ```
 
 ## Full Workflow: Session to Merged Code
@@ -135,7 +134,7 @@ Claude works, makes commits, creates files. When done, exit the container (`Ctrl
 
 ```bash
 # Compare session commit hashes against host main branch
-claude-container merge -s my-feature --check main
+claude-container status -s my-feature main
 
 # Example output:
 #   repo-a
@@ -151,29 +150,39 @@ claude-container merge -s my-feature --check main
 #     result:  NO BRANCH
 
 # Check a single repo
-claude-container merge -s my-feature --check main --repo repo-a
+claude-container status -s my-feature main --repo repo-a
 ```
 
-### 4a. Clean path — extract and merge
+### 4a. Clean path — pull and merge
 
-If your host repos are clean (no uncommitted changes) and you don't expect conflicts:
+If your host repos are clean and the session already incorporates `main`:
 
 ```bash
-claude-container merge -s my-feature --branch main
+claude-container pull -s my-feature main
 ```
 
 This extracts session branches to each host repo, then merges them into `main`. For each repo:
 - Creates/updates a `my-feature` branch matching the session HEAD
 - Merges `my-feature` into `main` via `git merge --no-edit`
 - Skips repos where nothing changed
-- **Aborts** if the worktree is dirty or there are merge conflicts
+- **Skips** repos where the merge would conflict — tells you to resolve in-container first
+
+If any repos are skipped due to conflicts:
+
+```bash
+# Merge main INTO the session (Claude resolves conflicts in-container)
+claude-container push -s my-feature main --merge
+
+# Then pull again (now guaranteed clean)
+claude-container pull -s my-feature main
+```
 
 ### 4b. Messy path — reconcile
 
 If your host repos have uncommitted changes or you expect conflicts, use `--reconcile`:
 
 ```bash
-claude-container merge -s my-feature --reconcile main
+claude-container pull -s my-feature main --reconcile
 ```
 
 **Phase 1 — Extract**: Creates `my-feature` branches on the host from session data.
@@ -198,10 +207,10 @@ fin "resolved config merge conflict in repo-a"
 
 ```bash
 # Hash comparison — every repo should show MATCH
-claude-container merge -s my-feature --check main
+claude-container status -s my-feature main
 
 # Classification view — synced, unchanged, extracted-only, pending, missing
-claude-container merge -s my-feature --verify
+claude-container status -s my-feature
 ```
 
 ### Summary
@@ -212,42 +221,68 @@ claude-container -s my-feature --discover-repos ~/dev/myorg --dir ~/dev/myorg/re
 
 # work, exit
 
-# clean path (no dirty repos, no conflicts)
-claude-container merge -s my-feature --branch main
+# pull session branches to host
+claude-container pull -s my-feature
 
-# messy path (dirty repos and/or conflicts)
-claude-container merge -s my-feature --reconcile main
+# merge main into session first (Claude resolves conflicts)
+claude-container push -s my-feature main --merge
+
+# now merge into main on host (guaranteed clean)
+claude-container pull -s my-feature main
 
 # verify
-claude-container merge -s my-feature --check main
+claude-container status -s my-feature main
 ```
 
 ## Subcommands
 
-### merge
+### push
 
-Extract session work and merge into host branches.
+Push host changes into a container session (host → container).
 
 ```bash
-claude-container merge -s <session> [options]
+claude-container push -s <session> [branch] [options]
 ```
 
 | Flag | Description |
 |------|-------------|
-| `--branch, -b <branch>` | Target branch to merge into (default: session name) |
-| `--check, -c <branch>` | Compare session hashes against host branch |
-| `--repo <name>` | Filter `--check` to a single repo |
-| `--reconcile, -R <branch>` | Stash dirty work, merge, resolve conflicts, merge back |
-| `--verify` | Show sync status for all repos |
-| `--force, -f` | Force extraction even if branches diverged |
+| `--ff` | Fast-forward from host branch (default) |
+| `--rebase` | Rebase session onto host branch |
+| `--merge` | Merge host branch into session |
+| `--force, -f` | Force operation |
 
-### extract
+### pull
 
-Extract session branches without merging.
+Pull session changes to host (container → host).
 
 ```bash
-claude-container extract -s <session> [--force] [--auto-merge [branch]]
+claude-container pull -s <session> [branch] [options]
 ```
+
+| Flag | Description |
+|------|-------------|
+| `--reconcile, -R` | Stash dirty work, merge, resolve conflicts, merge back |
+| `--force, -f` | Force extraction even if branches diverged |
+
+No branch = extract only. With branch = extract + auto-merge.
+
+### status
+
+Check sync state (read-only, no changes).
+
+```bash
+claude-container status -s <session> [branch] [options]
+```
+
+| Flag | Description |
+|------|-------------|
+| `--repo <name>` | Filter to a single repo |
+
+No branch = sync classification. With branch = hash comparison.
+
+### Legacy subcommands
+
+`merge` and `extract` subcommands still work but print deprecation warnings. Use `push`/`pull`/`status` instead.
 
 ## Workflow Guides
 
@@ -289,13 +324,20 @@ All session commands use the `--session/-s` flag:
 # List all sessions with disk usage
 claude-container --sessions
 
-# Extract session as branch
-claude-container -s my-feature --extract
-claude-container -s my-feature --extract --force  # Overwrite existing branch
+# Pull session to host (extract branches)
+claude-container pull -s my-feature
+claude-container pull -s my-feature --force  # Overwrite existing branches
 
-# Sync session with upstream changes (rebase)
-claude-container -s my-feature --sync main        # Rebase onto main
-claude-container -s my-feature --sync develop     # Rebase onto develop
+# Pull and merge into main
+claude-container pull -s my-feature main
+
+# Push host changes into session
+claude-container push -s my-feature main              # Fast-forward
+claude-container push -s my-feature main --rebase     # Rebase onto main
+claude-container push -s my-feature develop --rebase  # Rebase onto develop
+
+# Check sync state
+claude-container status -s my-feature main
 
 # Delete a session
 claude-container -s my-feature --delete
@@ -333,7 +375,6 @@ claude-container --cleanup-unused --yes
 | `-s, --session <name>` | Session name (required) |
 | `--from <branch>` | Create session from specific branch |
 | `-c, --continue` | Continue the most recent conversation |
-| `--sync <branch>` | Rebase session onto upstream branch |
 | `--discover-repos <dir>` | Auto-discover git repos in directory |
 | `-C, --config <path>` | Path to `.claude-projects.yml` |
 | `-a, --add-repo <path>` | Add a repo to the session |
@@ -453,12 +494,8 @@ cd claude-container
 # Work with Claude in the container...
 # The container has access to the cloned claude-container repo
 
-# Exit and extract your changes
-./claude-container -s dev-feature --extract
-
-# Review and merge
-git checkout dev-feature
-git log main..dev-feature
+# Exit and pull your changes
+./claude-container pull -s dev-feature main
 ```
 
 ### Running Tests
@@ -479,11 +516,11 @@ git log main..dev-feature
 For long-running development sessions:
 
 ```bash
-# Sync with main branch
-./claude-container -s dev-feature --sync main
+# Push main into session (rebase)
+./claude-container push -s dev-feature main --rebase
 
-# Extract updated work
-./claude-container -s dev-feature --extract --force
+# Pull updated work
+./claude-container pull -s dev-feature --force
 ```
 
 ## Security

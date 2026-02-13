@@ -1086,6 +1086,7 @@ session_merge_into() {
     local skip_count=0
     local dirty_count=0
     local summary_lines=()  # Collect summary for Claude's initial prompt
+    local dirty_mounts=()   # Collect proj_name|proj_path for .merge-into-mounts marker
 
     while IFS='|' read -r proj_name proj_path; do
         [[ -z "$proj_name" ]] && continue
@@ -1139,6 +1140,7 @@ session_merge_into() {
             fi
             # Mount the host repo into the container so Claude can handle the merge
             EXTRA_DOCKER_ARGS+=("-v" "$proj_path:/host/$proj_name:ro")
+            dirty_mounts+=("$proj_name|$proj_path")
             summary_lines+=("DIRTY: $proj_name ($change_count uncommitted changes) — host repo mounted at /host/$proj_name")
             dirty_count=$((dirty_count + 1))
             continue
@@ -1266,6 +1268,15 @@ session_merge_into() {
         -v "$volume:/session" \
         "$git_image" \
         sh -c 'cat > /session/.merge-into-summary' 2>/dev/null || true
+
+    # Write dirty mount info so exec-back can reconstruct EXTRA_DOCKER_ARGS
+    if [[ ${#dirty_mounts[@]} -gt 0 ]]; then
+        printf '%s\n' "${dirty_mounts[@]}" | docker run --rm -i \
+            --user "$host_uid:$host_uid" \
+            -v "$volume:/session" \
+            "$git_image" \
+            sh -c 'cat > /session/.merge-into-mounts' 2>/dev/null || true
+    fi
 
     echo ""
     info "Starting container for review..."
@@ -1950,7 +1961,8 @@ session_clone() {
 # Merge session branches into a target branch on the host
 # Extracts should have already created the branches; this merges them.
 # If the target branch doesn't exist, creates it from the session branch.
-# Skips projects with dirty worktrees or merge conflicts.
+# Only performs clean merges — skips repos where conflicts would occur.
+# For conflicts, directs user to resolve in-container via push --merge.
 # All independent repos are merged in parallel.
 # Usage: session_auto_merge <session_name> [target_branch]
 session_auto_merge() {
@@ -2018,7 +2030,7 @@ session_auto_merge() {
             local orig_dirty
             orig_dirty=$(git -C "$proj_path" status --porcelain 2>/dev/null)
             if [[ -n "$orig_dirty" ]]; then
-                echo "SKIP|$proj_name|uncommitted changes|cd $proj_path && git merge $session_name" > "$_result_file"
+                echo "SKIP|$proj_name|host has uncommitted changes" > "$_result_file"
                 exit 0
             fi
 
@@ -2035,27 +2047,61 @@ session_auto_merge() {
                 exit 0
             fi
 
+            # Check if this would be a fast-forward (target is ancestor of session)
+            local is_ff=false
+            if git -C "$proj_path" merge-base --is-ancestor "$target_branch" "$session_name" 2>/dev/null; then
+                is_ff=true
+            fi
+
+            # If not a fast-forward, dry-run the merge to check for conflicts
+            if ! $is_ff; then
+                local current_branch
+                current_branch=$(git -C "$proj_path" symbolic-ref --short HEAD 2>/dev/null || echo "")
+
+                # Checkout target, try merge --no-commit, check result, abort
+                local _checkout_ok=false
+                if [[ "$current_branch" == "$target_branch" ]]; then
+                    _checkout_ok=true
+                elif git -C "$proj_path" checkout "$target_branch" 2>/dev/null; then
+                    _checkout_ok=true
+                fi
+
+                if ! $_checkout_ok; then
+                    echo "SKIP|$proj_name|could not checkout $target_branch" > "$_result_file"
+                    exit 0
+                fi
+
+                if ! git -C "$proj_path" merge --no-commit --no-ff "$session_name" 2>/dev/null; then
+                    # Conflicts detected — abort and skip
+                    git -C "$proj_path" merge --abort 2>/dev/null || true
+                    if [[ "$current_branch" != "$target_branch" ]]; then
+                        git -C "$proj_path" checkout "$current_branch" 2>/dev/null || true
+                    fi
+                    echo "CONFLICT|$proj_name|would conflict" > "$_result_file"
+                    exit 0
+                fi
+
+                # Clean merge — abort the dry-run, we'll do it for real
+                git -C "$proj_path" merge --abort 2>/dev/null || true
+                if [[ "$current_branch" != "$target_branch" ]]; then
+                    git -C "$proj_path" checkout "$current_branch" 2>/dev/null || true
+                fi
+            fi
+
+            # Safe to merge — either fast-forward or verified clean
             local current_branch
             current_branch=$(git -C "$proj_path" symbolic-ref --short HEAD 2>/dev/null || echo "")
 
             if [[ "$current_branch" == "$target_branch" ]]; then
-                if git -C "$proj_path" merge "$session_name" --no-edit 2>/dev/null; then
-                    echo "OK|$proj_name|merged $session_name into $target_branch" > "$_result_file"
-                else
-                    git -C "$proj_path" merge --abort 2>/dev/null || true
-                    echo "FAIL|$proj_name|merge conflicts|cd $proj_path && git merge $session_name" > "$_result_file"
-                fi
+                git -C "$proj_path" merge "$session_name" --no-edit 2>/dev/null
+                echo "OK|$proj_name|merged $session_name into $target_branch" > "$_result_file"
             else
                 if git -C "$proj_path" checkout "$target_branch" 2>/dev/null; then
-                    if git -C "$proj_path" merge "$session_name" --no-edit 2>/dev/null; then
-                        echo "OK|$proj_name|merged $session_name into $target_branch" > "$_result_file"
-                    else
-                        git -C "$proj_path" merge --abort 2>/dev/null || true
-                        echo "FAIL|$proj_name|merge conflicts|cd $proj_path && git merge $session_name" > "$_result_file"
-                    fi
+                    git -C "$proj_path" merge "$session_name" --no-edit 2>/dev/null
+                    echo "OK|$proj_name|merged $session_name into $target_branch" > "$_result_file"
                     git -C "$proj_path" checkout "$current_branch" 2>/dev/null || true
                 else
-                    echo "SKIP|$proj_name|could not checkout $target_branch|cd $proj_path && git checkout $target_branch && git merge $session_name" > "$_result_file"
+                    echo "SKIP|$proj_name|could not checkout $target_branch" > "$_result_file"
                 fi
             fi
         ) &
@@ -2070,6 +2116,7 @@ session_auto_merge() {
     # Collect and display results
     local merge_ok=0
     local merge_skip=0
+    local merge_conflict=0
 
     for proj_name in "${_proj_names[@]}"; do
         local _result_file="$_result_dir/${proj_name//\//_}"
@@ -2082,8 +2129,6 @@ session_auto_merge() {
         local _name="${_rest%%|*}"
         _rest="${_rest#*|}"
         local _msg="${_rest%%|*}"
-        local _hint="${_rest#*|}"
-        [[ "$_hint" == "$_msg" ]] && _hint=""
 
         case "$_status" in
             OK)
@@ -2091,14 +2136,12 @@ session_auto_merge() {
                 merge_ok=$((merge_ok + 1))
                 ;;
             SKIP)
-                warn "  $_name: $_msg"
-                [[ -n "$_hint" ]] && echo "    Manual merge: $_hint"
+                warn "  $_name: $_msg (skipped)"
                 merge_skip=$((merge_skip + 1))
                 ;;
-            FAIL)
-                error "  $_name: $_msg"
-                [[ -n "$_hint" ]] && echo "    Resolve with: $_hint"
-                merge_skip=$((merge_skip + 1))
+            CONFLICT)
+                warn "  $_name: $_msg (skipped)"
+                merge_conflict=$((merge_conflict + 1))
                 ;;
         esac
     done
@@ -2108,7 +2151,14 @@ session_auto_merge() {
         success "$merge_ok project(s) merged into $target_branch"
     fi
     if [[ $merge_skip -gt 0 ]]; then
-        warn "$merge_skip project(s) need manual merge"
+        warn "$merge_skip project(s) skipped"
+    fi
+    if [[ $merge_conflict -gt 0 ]]; then
+        warn "$merge_conflict project(s) would conflict — skipped"
+        echo ""
+        echo "  Resolve conflicts in-container first, then pull again:"
+        echo "    claude-container push -s $session_name $target_branch --merge"
+        echo "    claude-container pull -s $session_name $target_branch"
     fi
 }
 

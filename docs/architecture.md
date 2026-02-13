@@ -144,7 +144,7 @@ The developer can:
 ### 3. Extract
 
 ```bash
-claude-container -s myfeature --extract
+claude-container pull -s myfeature
 ```
 
 The host program:

@@ -58,7 +58,7 @@ Works the same as single-repo, but operates on all repos:
 
 ```bash
 # Extract + merge all repos into main
-claude-container merge -s my-feature --branch main
+claude-container pull -s my-feature main
 ```
 
 Each repo gets a `my-feature` branch. Repos with no changes are skipped.
@@ -67,10 +67,10 @@ Each repo gets a `my-feature` branch. Repos with no changes are skipped.
 
 ```bash
 # Hash comparison across all repos
-claude-container merge -s my-feature --check main
+claude-container status -s my-feature main
 
 # Check a single repo
-claude-container merge -s my-feature --check main --repo synapse
+claude-container status -s my-feature main --repo synapse
 ```
 
 ## New repos created in-session

@@ -9,6 +9,11 @@
 #   claude-container extract -s myproj --auto-merge develop  # extract + merge into develop
 
 cmd_extract() {
+    warn "Deprecated: use 'pull' subcommand instead"
+    echo "  extract -s <session>                → pull -s <session>"
+    echo "  extract -s <session> --auto-merge   → pull -s <session> main"
+    echo ""
+
     local session_name=""
     local force=false
     local auto_merge=false

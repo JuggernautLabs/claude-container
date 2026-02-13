@@ -13,9 +13,9 @@ allowed-tools:
 
 You are helping the user sync their claude-container session with upstream changes. This is useful for long-running sessions where the original branch (main, develop, etc.) has been updated.
 
-## What --sync Does
+## What `push --rebase` Does
 
-The `--sync <branch>` command:
+The `push <branch> --rebase` command:
 
 1. **Mounts original repos** read-only as `upstream` remote
 2. **Checks for uncommitted changes** (skips rebase if dirty, warns user)
@@ -24,7 +24,7 @@ The `--sync <branch>` command:
 5. **Reports** conflicts (if any) for Claude to resolve
 6. **Starts** the container for interactive conflict resolution
 
-After resolving conflicts and exiting, the user should extract with `--force`.
+After resolving conflicts and exiting, the user should pull with `--force`.
 
 ## Step 1: Identify Session and Branch
 
@@ -50,12 +50,12 @@ docker volume inspect claude-session-<name> >/dev/null 2>&1
 command -v yq >/dev/null 2>&1
 ```
 
-## Step 3: Run Sync
+## Step 3: Run Push with Rebase
 
-Execute the sync command:
+Execute the push command:
 
 ```bash
-claude-container -s <session-name> --sync <branch>
+claude-container push -s <session-name> <branch> --rebase
 ```
 
 This will output something like:
@@ -108,11 +108,11 @@ git log --oneline -5
 
 ## Step 5: Post-Sync Instructions
 
-After the user exits the container, remind them to extract with `--force`:
+After the user exits the container, remind them to pull with `--force`:
 
 ```
 To update branches with rebased changes:
-  claude-container -s <session-name> --extract --force
+  claude-container pull -s <session-name> --force
 ```
 
 The `--force` flag is needed because the branch already exists from previous extraction.
@@ -121,24 +121,27 @@ The `--force` flag is needed because the branch already exists from previous ext
 
 # Quick Reference
 
-## Sync Commands
+## Push Commands
 
 ```bash
-# Sync with main (default)
-claude-container -s my-feature --sync main
+# Fast-forward from host (session branch)
+claude-container push -s my-feature
 
-# Sync with develop
-claude-container -s my-feature --sync develop
+# Rebase onto main
+claude-container push -s my-feature main --rebase
 
-# Sync with specific feature branch
-claude-container -s my-feature --sync feature-upstream
+# Rebase onto develop
+claude-container push -s my-feature develop --rebase
+
+# Merge main into session
+claude-container push -s my-feature main --merge
 ```
 
 ## After Sync Workflow
 
 ```bash
-# 1. Sync session
-claude-container -s my-feature --sync main
+# 1. Push with rebase
+claude-container push -s my-feature main --rebase
 
 # 2. (In container) Resolve any conflicts
 #    Claude will help with this
@@ -146,8 +149,8 @@ claude-container -s my-feature --sync main
 # 3. Exit container
 exit
 
-# 4. Extract updated work
-claude-container -s my-feature --extract --force
+# 4. Pull updated work
+claude-container pull -s my-feature --force
 ```
 
 ## Conflict Resolution Inside Container
@@ -224,4 +227,13 @@ If a previous sync was interrupted:
 cd /workspace/<project>
 git rebase --abort
 ```
-Then try sync again.
+Then try push --rebase again.
+
+## Legacy Command Mapping
+
+| Old | New |
+|-----|-----|
+| `--sync <branch>` | `push <branch> --rebase` |
+| `--refresh [branch]` | `push [branch]` |
+| `--merge-into <branch>` | `push <branch> --merge` |
+| `--extract --force` | `pull --force` |

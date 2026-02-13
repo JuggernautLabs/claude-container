@@ -182,7 +182,9 @@ while [[ $# -gt 0 ]]; do
             ;;
 
         # Session management actions (use with --session)
+        # Note: --extract, --sync, --refresh, --merge-into are deprecated in favor of push/pull/status subcommands
         --extract)
+            warn "Deprecated: use 'pull' subcommand instead (e.g., 'claude-container pull -s <session>')"
             ACTION="extract"
             shift
             ;;
@@ -204,11 +206,13 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
         --sync)
+            warn "Deprecated: use 'push --rebase' instead (e.g., 'claude-container push -s <session> ${2:-main} --rebase')"
             ACTION="sync"
             SYNC_BRANCH="${2:-main}"
             shift 2
             ;;
         --refresh)
+            warn "Deprecated: use 'push' subcommand instead (e.g., 'claude-container push -s <session> [branch]')"
             ACTION="refresh"
             # Optional branch argument (default: session name)
             if [[ -n "${2:-}" ]] && [[ ! "$2" =~ ^- ]]; then
@@ -224,6 +228,7 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
         --merge-into)
+            warn "Deprecated: use 'push --merge' instead (e.g., 'claude-container push -s <session> $2 --merge')"
             ACTION="merge-into"
             MERGE_INTO_BRANCH="$2"
             shift 2
@@ -303,6 +308,18 @@ Usage: claude-container [options] [-- <claude-args>]
 
 Spawn into a Docker container with Claude Code ready.
 
+Subcommands (data transfer):
+  push -s <session> [branch]    Push host changes into session (host → container)
+                                Run 'claude-container push --help' for details
+  pull -s <session> [branch]    Pull session changes to host (container → host)
+                                Run 'claude-container pull --help' for details
+  status -s <session> [branch]  Check sync state (read-only)
+                                Run 'claude-container status --help' for details
+
+Subcommands (legacy, use push/pull/status instead):
+  extract                       Extract session branches to host repos
+  merge                         Extract + merge session into host branches
+
 Options:
   --session, -s <name>     Session name (required for git sessions)
   --from <branch>          Create session from specific branch
@@ -331,18 +348,19 @@ Arguments:
   -- <claude-args>         Pass remaining arguments to claude (e.g., -p, --print)
 
 Session Management (use with -s <session>):
-  --extract                Extract session as branch
   --delete                 Delete session volumes
   --repair                 Fix corrupted session config
   --restart                Restart session (fixes permissions)
   --import <path>          Import claude session data from path
-  --sync <branch>          Rebase session onto upstream branch (default: main)
-  --refresh                Fetch latest from host repos into session (fast-forward)
-  --remove-undiscovered    With --refresh --discover-repos: remove stale repos
   --clone-from <session>   Clone all volumes from existing session
-  --merge-into <branch>    Merge branch into session, resolve conflicts, extract
-  --auto-merge [branch]    Merge session into host branch (default: main)
-                           Use with --extract or --merge-into
+  --remove-undiscovered    With push --discover-repos: remove stale repos
+
+  Deprecated (use push/pull/status subcommands instead):
+  --extract                → pull
+  --sync <branch>          → push <branch> --rebase
+  --refresh [branch]       → push [branch]
+  --merge-into <branch>    → push <branch> --merge
+  --auto-merge [branch]    Use with pull <branch> instead
 
   Modifiers: --force/-f, --yes/-y, --regex/-r
 
@@ -364,33 +382,31 @@ Examples:
   # Resume session and continue conversation
   claude-container -s myproj --continue
 
-  # Extract changes as a branch
-  claude-container -s myproj --extract
+  # Pull session changes to host
+  claude-container pull -s myproj
+
+  # Pull and merge into main
+  claude-container pull -s myproj main
+
+  # Push host changes into session (fast-forward)
+  claude-container push -s myproj main
+
+  # Check sync state
+  claude-container status -s myproj
 
   # Delete a session
   claude-container -s myproj --delete --yes
 
-  # Extract and merge session into main
-  claude-container -s myproj --extract --auto-merge
-
-  # Extract and merge into a specific branch
-  claude-container -s myproj --extract --auto-merge develop
-
   # Run claude in print mode
   claude-container -s myproj -- -p "What is this?"
 
-Subcommands:
-  extract                Extract session branches to host repos
-                         Run 'claude-container extract --help' for details
-  merge                  Extract + merge session into host branches
-                         Run 'claude-container merge --help' for details
-
 Workflow:
-  1. Start session:     claude-container -s myproj
+  1. Start session:      claude-container -s myproj
   2. Do work in container...
-  3. Exit container:    exit
-  4. Extract as branch: claude-container -s myproj --extract
-  5. Use git normally:  git checkout myproj  OR  git merge myproj
+  3. Exit container:     exit
+  4. Pull to host:       claude-container pull -s myproj main
+  5. Push updates back:  claude-container push -s myproj main
+  6. Check sync state:   claude-container status -s myproj main
 EOF
             exit 0
             ;;
@@ -750,6 +766,19 @@ if [[ -n "$SSH_SOCKET_ARGS" ]]; then
     DOCKER_ARGS+=($SSH_SOCKET_ARGS)
 fi
 
+# Read .merge-into-mounts marker from volume (written by session_merge_into for exec-back)
+if $USE_GIT_SESSION && [[ ${#EXTRA_DOCKER_ARGS[@]} -eq 0 ]]; then
+    _mounts_content=$(docker run --rm -v "$GIT_SESSION_VOLUME:/session:ro" "$IMAGE_NAME" \
+        cat /session/.merge-into-mounts 2>/dev/null || echo "")
+    if [[ -n "$_mounts_content" ]]; then
+        while IFS='|' read -r _mount_name _mount_path; do
+            [[ -z "$_mount_name" ]] && continue
+            [[ -z "$_mount_path" ]] && continue
+            EXTRA_DOCKER_ARGS+=("-v" "$_mount_path:/host/$_mount_name:ro")
+        done <<< "$_mounts_content"
+    fi
+fi
+
 # Append extra docker args from pre-startup actions (e.g. merge-into host repo mounts)
 if [[ ${#EXTRA_DOCKER_ARGS[@]} -gt 0 ]]; then
     DOCKER_ARGS+=("${EXTRA_DOCKER_ARGS[@]}")
@@ -1102,8 +1131,8 @@ if $USE_GIT_SESSION; then
 
         success "Sync cleanup complete"
         echo ""
-        echo "To update branches with rebased changes:"
-        echo "  claude-container -s $SESSION_NAME --extract --force"
+        echo "To pull rebased changes to host:"
+        echo "  claude-container pull -s $SESSION_NAME --force"
 
     elif [[ -n "$MERGE_INTO_BRANCH_CHECK" ]]; then
         # Check if reconcile completed via 'fin' command
@@ -1128,9 +1157,9 @@ if $USE_GIT_SESSION; then
             done <<< "$MERGE_PROJECTS"
         fi
 
-        # Remove merge-into marker and summary
+        # Remove merge-into markers (branch, summary, mounts)
         docker run --rm -v "$GIT_SESSION_VOLUME:/session" "$IMAGE_NAME" \
-            rm -f /session/.merge-into-branch /session/.merge-into-summary 2>/dev/null || true
+            rm -f /session/.merge-into-branch /session/.merge-into-summary /session/.merge-into-mounts 2>/dev/null || true
 
         success "Merge cleanup complete"
         echo ""
@@ -1143,30 +1172,11 @@ if $USE_GIT_SESSION; then
         if $AUTO_MERGE; then
             session_auto_merge "$SESSION_NAME" "$MERGE_INTO_BRANCH_CHECK"
         else
-            # Print manual merge commands as a single copy-pasteable script
-            echo "To merge session changes into $MERGE_INTO_BRANCH_CHECK:"
-            echo ""
-            if [[ -n "$MERGE_PROJECTS" ]]; then
-                _merge_cmds=()
-                while IFS='|' read -r proj_name proj_path; do
-                    [[ -z "$proj_name" ]] && continue
-                    [[ ! -d "$proj_path" ]] && continue
-                    _merge_cmds+=("cd $proj_path && git checkout $MERGE_INTO_BRANCH_CHECK && git merge $SESSION_NAME")
-                done <<< "$MERGE_PROJECTS"
-                # Join with " && \" for a single copy-pasteable block
-                _i=0
-                for _cmd in "${_merge_cmds[@]}"; do
-                    _i=$((_i + 1))
-                    if [[ $_i -lt ${#_merge_cmds[@]} ]]; then
-                        echo "$_cmd && \\"
-                    else
-                        echo "$_cmd"
-                    fi
-                done
-            fi
+            echo "To merge into $MERGE_INTO_BRANCH_CHECK:"
+            echo "  claude-container pull -s $SESSION_NAME $MERGE_INTO_BRANCH_CHECK"
         fi
     else
-        echo "To extract changes:"
-        echo "  claude-container -s $SESSION_NAME --extract"
+        echo "To pull changes to host:"
+        echo "  claude-container pull -s $SESSION_NAME"
     fi
 fi

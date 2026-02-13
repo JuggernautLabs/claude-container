@@ -153,14 +153,17 @@ claude-container -s my-feature --docker
 claude-container -s my-feature --dockerfile
 ```
 
-## Extracting Changes
+## Pulling Changes to Host
 
 ```bash
-# Extract as branch
-claude-container -s my-feature --extract
+# Pull (extract) as branch
+claude-container pull -s my-feature
 
 # Force overwrite existing branch
-claude-container -s my-feature --extract --force
+claude-container pull -s my-feature --force
+
+# Pull and merge into main
+claude-container pull -s my-feature main
 ```
 
 Output:
@@ -172,23 +175,26 @@ Checkout:        git checkout my-feature
 Merge:           git merge my-feature
 ```
 
-## Syncing with Upstream
+## Pushing Host Changes into Session
 
 For long-running sessions where upstream has changed:
 
 ```bash
-# Sync session with main branch
-claude-container -s my-feature --sync main
+# Fast-forward from host
+claude-container push -s my-feature
 
-# Sync with develop
-claude-container -s my-feature --sync develop
+# Rebase session onto main
+claude-container push -s my-feature main --rebase
+
+# Rebase onto develop
+claude-container push -s my-feature develop --rebase
 ```
 
-This:
+Rebase:
 - Fetches latest changes from original repos
 - Rebases session work onto updated branch
 - Claude resolves any conflicts interactively
-- After resolving, extract with `--force` to update branches
+- After resolving, pull with `--force` to update branches
 
 ## Session Management
 
@@ -231,14 +237,13 @@ projects:
 1. Create:  claude-container -s my-feature
 2. Work:    (inside container with Claude)
 3. Exit:    exit
-4. Extract: claude-container -s my-feature --extract
-5. Merge:   git checkout my-feature && git merge my-feature
+4. Pull:    claude-container pull -s my-feature main
 
 Long-running sessions:
-1. Sync:    claude-container -s my-feature --sync main
+1. Push:    claude-container push -s my-feature main --rebase
 2. Work:    (Claude resolves conflicts if any)
 3. Exit:    exit
-4. Extract: claude-container -s my-feature --extract --force
+4. Pull:    claude-container pull -s my-feature --force
 ```
 
 ## Command Quick Reference
@@ -247,12 +252,15 @@ Long-running sessions:
 |------|---------|
 | Create session | `claude-container -s NAME` |
 | From specific branch | `claude-container -s NAME --from BRANCH` |
-| Sync with upstream | `claude-container -s NAME --sync main` |
 | Resume + continue | `claude-container -s NAME --continue` |
 | Discover repos | `claude-container -s NAME --discover-repos DIR` |
 | Prepare only | `claude-container -s NAME --no-run` |
-| Extract as branch | `claude-container -s NAME --extract` |
-| Extract (overwrite) | `claude-container -s NAME --extract -f` |
+| Pull to host | `claude-container pull -s NAME` |
+| Pull + merge into main | `claude-container pull -s NAME main` |
+| Pull (overwrite) | `claude-container pull -s NAME --force` |
+| Push from host (ff) | `claude-container push -s NAME` |
+| Push + rebase | `claude-container push -s NAME main --rebase` |
+| Check sync state | `claude-container status -s NAME main` |
 | Delete session | `claude-container -s NAME --delete -y` |
 | Repair session | `claude-container -s NAME --repair` |
 | List sessions | `claude-container --sessions` |

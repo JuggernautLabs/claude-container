@@ -7,45 +7,45 @@ How data moves between your host repos and the container session volume.
                  (your repos)                   (docker volume)
                      |                               |
                      |                               |
-  ---------------- HOST -> CONTAINER ---------------------------------
+  ---------------- HOST -> CONTAINER (push) ----------------------------
                      |                               |
   session create     | --- bundle repos ---------->  |  initial clone
   --discover-repos   |                               |
                      |                               |
-  --refresh [branch] | --- fetch + fast-forward -->  |  pull latest from
+  push [branch]      | --- fetch + fast-forward -->  |  pull latest from
                      |     (default: session branch) |  host into session
                      |                               |
-  --sync <branch>    | --- fetch + rebase -------->  |  rebase session onto
+  push <br> --rebase | --- fetch + rebase -------->  |  rebase session onto
                      |     (Claude resolves)         |  updated upstream
                      |                               |
-  --merge-into <br>  | --- fetch + merge --------->  |  merge target branch
+  push <br> --merge  | --- fetch + merge --------->  |  merge target branch
                      |     (Claude resolves)         |  into session
                      |                               |
   --add-repo <path>  | --- clone single repo ----->  |  add repo to session
                      |                               |
                      |                               |
-  ---------------- CONTAINER -> HOST ---------------------------------
+  ---------------- CONTAINER -> HOST (pull) ----------------------------
                      |                               |
-  --extract          | <-- git bundle -------------- |  create session-named
-  extract -s X       |     (branch per repo)         |  branches on host
+  pull               | <-- git bundle -------------- |  create session-named
+                     |     (branch per repo)         |  branches on host
                      |                               |
-  merge --branch <b> | <-- bundle + merge ---------- |  extract then merge
+  pull <branch>      | <-- bundle + merge ---------- |  extract then merge
                      |     (into target branch)      |  into target branch
                      |                               |
                      |                               |
-  ---------------- BIDIRECTIONAL -------------------------------------
+  ---------------- BIDIRECTIONAL -------------------------------------------
                      |                               |
-  merge --reconcile  | <-- extract ----------------  |
-    <branch>         | --- stash dirty work          |
+  pull <branch>      | <-- extract ----------------  |
+    --reconcile      | --- stash dirty work          |
                      | --- merge target into ------>  |  merge + resolve
                      | <-- extract resolved --------  |  then merge back
                      | --- auto-merge into target    |
                      |                               |
                      |                               |
-  ---------------- READ-ONLY ----------------------------------------
+  ---------------- READ-ONLY (status) ------------------------------------
                      |                               |
-  merge --check <b>  |    compare hashes             |  no data transferred
-  merge --verify     |    classify sync state        |
+  status <branch>    |    compare hashes             |  no data transferred
+  status             |    classify sync state        |
 ```
 
 ## Command Reference
@@ -54,27 +54,46 @@ How data moves between your host repos and the container session volume.
 |---------|-----------|----------|---------|
 | session create | host -> container | bundle clone | no |
 | `--add-repo` | host -> container | clone | no |
-| `--refresh [branch]` | host -> container | fetch + fast-forward | no |
-| `--sync <branch>` | host -> container | fetch + rebase | yes, if conflicts |
-| `--merge-into <branch>` | host -> container | fetch + merge | yes, if conflicts |
-| `--extract` | container -> host | git bundle | no |
-| `merge --branch <b>` | container -> host | bundle + merge | no |
-| `merge --reconcile <b>` | both | extract, merge, resolve, merge back | yes, if conflicts |
-| `merge --check` | read-only | hash comparison | no |
-| `merge --verify` | read-only | sync classification | no |
+| `push [branch]` | host -> container | fetch + fast-forward | no |
+| `push <branch> --rebase` | host -> container | fetch + rebase | yes, if conflicts |
+| `push <branch> --merge` | host -> container | fetch + merge | yes, if conflicts |
+| `pull` | container -> host | git bundle | no |
+| `pull <branch>` | container -> host | bundle + merge (skips conflicts) | no |
+| `pull <branch> --reconcile` | both | extract, merge, resolve, merge back | yes, if conflicts |
+| `status <branch>` | read-only | hash comparison | no |
+| `status` | read-only | sync classification | no |
 
 ## Choosing the Right Tool
 
 **"I need to get host changes into the container"**
-- Small update, no conflicts: `--refresh`
-- Upstream moved significantly: `--sync main`
-- Need to merge a specific branch in: `--merge-into main`
+- Small update, no conflicts: `push`
+- Upstream moved significantly: `push main --rebase`
+- Need to merge a specific branch in: `push main --merge`
 
 **"I need to get container work onto the host"**
-- Just want branches: `--extract`
-- Want branches merged into a target: `merge --branch main`
-- Host is dirty or conflicts expected: `merge --reconcile main`
+- Just want branches: `pull`
+- Want branches merged into a target: `pull main` (skips repos that would conflict)
+- Host is dirty or conflicts expected: `pull main --reconcile`
+
+**Recommended merge-into-main workflow:**
+1. `push main --merge` — merge main INTO session (Claude resolves conflicts)
+2. `pull` — extract session branches to host
+3. `pull main` — merge into main (guaranteed clean, session already has main)
 
 **"I need to check if things are in sync"**
-- Hash-level comparison: `merge --check main`
-- Sync state classification: `merge --verify`
+- Hash-level comparison: `status main`
+- Sync state classification: `status`
+
+## Legacy Command Mapping
+
+| Old | New |
+|-----|-----|
+| `--refresh [branch]` | `push [branch]` |
+| `--sync <branch>` | `push <branch> --rebase` |
+| `--merge-into <branch>` | `push <branch> --merge` |
+| `--extract` | `pull` |
+| `--extract --auto-merge main` | `pull main` |
+| `merge --branch main` | `pull main` |
+| `merge --reconcile main` | `pull main --reconcile` |
+| `merge --check main` | `status main` |
+| `merge --verify` | `status` |

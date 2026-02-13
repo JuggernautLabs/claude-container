@@ -11,8 +11,9 @@ Each session lives in a Docker volume named `claude-session-{name}`:
   .claude-projects.yml          # Config: project name → host path mappings
   .repo-manifest                # Root-commit|name pairs (written at session creation)
   .sync-branch                  # Marker: set during --sync, cleaned on exit
-  .merge-into-branch            # Marker: set during --merge-into, cleaned on exit
+  .merge-into-branch            # Marker: set during push --merge, cleaned on exit
   .merge-into-summary           # Claude prompt for conflict resolution
+  .merge-into-mounts            # Dirty project mounts for exec-back (proj_name|proj_path)
   .main-project                 # Which project to cd into on container start
   alpha/                        # Git repo (1-level nesting)
   org/beta/                     # Git repo (2-level org/repo nesting)
@@ -97,7 +98,7 @@ Uses the repo manifest system (`lib/git-session.sh`):
 
 ## Sync Status Classification
 
-Used by `merge --verify` and the post-exit status display:
+Used by `status` and the post-exit status display:
 
 ```
 Session HEAD == Host HEAD?          → unchanged
@@ -113,10 +114,20 @@ Host path doesn't exist?            → missing
 
 | Command | What it does |
 |---------|-------------|
-| `claude-container -s X --extract` | Extract session branches (flag-based) |
-| `claude-container extract -s X` | Extract session branches (subcommand) |
-| `claude-container extract -s X --auto-merge` | Extract + merge into main |
-| `claude-container merge -s X` | Extract + merge into session-named branch |
-| `claude-container merge -s X --branch main` | Extract + merge into main |
-| `claude-container merge -s X --verify` | Check sync status (read-only) |
-| `claude-container -s X --extract --auto-merge develop` | Extract + merge into develop (flag-based) |
+| `claude-container pull -s X` | Extract session branches to host |
+| `claude-container pull -s X main` | Extract + merge into main |
+| `claude-container pull -s X main --reconcile` | Extract, stash dirty, merge, resolve, merge back |
+| `claude-container push -s X` | Fast-forward session from host (session branch) |
+| `claude-container push -s X main --rebase` | Rebase session onto main |
+| `claude-container push -s X main --merge` | Merge main into session |
+| `claude-container status -s X` | Sync state classification (read-only) |
+| `claude-container status -s X main` | Hash comparison against main (read-only) |
+
+Legacy (deprecated, still functional):
+
+| Command | Equivalent |
+|---------|-----------|
+| `claude-container -s X --extract` | `pull -s X` |
+| `claude-container extract -s X --auto-merge` | `pull -s X main` |
+| `claude-container merge -s X --branch main` | `pull -s X main` |
+| `claude-container merge -s X --verify` | `status -s X` |

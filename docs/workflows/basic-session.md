@@ -35,7 +35,7 @@ claude-container -s my-feature --continue
 
 ```bash
 # Extract session work as a branch, then merge into main
-claude-container merge -s my-feature --branch main
+claude-container pull -s my-feature main
 ```
 
 This does two things:
@@ -45,16 +45,14 @@ This does two things:
 If you just want the branch without merging:
 
 ```bash
-claude-container extract -s my-feature
-# or
-claude-container -s my-feature --extract
+claude-container pull -s my-feature
 ```
 
 ## Verify
 
 ```bash
 # Are session and host in sync?
-claude-container merge -s my-feature --check main
+claude-container status -s my-feature main
 ```
 
 ## Clean up

@@ -4,14 +4,14 @@ Merge session work into a target branch when your host repos are dirty or there 
 
 ## The problem
 
-`claude-container merge -s my-feature --branch main` fails in two cases:
+`claude-container pull -s my-feature main` fails in two cases:
 1. **Dirty worktrees** on the host (uncommitted changes)
 2. **Merge conflicts** between session work and the target branch
 
 ## The solution
 
 ```bash
-claude-container merge -s my-feature --reconcile main
+claude-container pull -s my-feature main --reconcile
 ```
 
 ## What happens
@@ -77,11 +77,16 @@ fin "description of what was resolved"
 - Terminates the container
 - The description appears in the exit handler output
 
-## When to use reconcile vs. plain merge
+## When to use what
 
 | Situation | Use |
 |-----------|-----|
-| Clean host repos, no conflicts expected | `merge -s X --branch main` |
-| Dirty host repos | `merge -s X --reconcile main` |
-| Conflicts likely (diverged branches) | `merge -s X --reconcile main` |
-| Want Claude to handle everything | `merge -s X --reconcile main` |
+| Session already incorporates main | `pull -s X main` |
+| Need to incorporate main first | `push -s X main --merge` then `pull -s X main` |
+| Dirty host repos | `pull -s X main --reconcile` |
+| Conflicts likely (diverged branches) | `push -s X main --merge` (Claude resolves in container) |
+| Want Claude to handle everything | `pull -s X main --reconcile` |
+
+`pull main` will **skip** any repo where the merge would conflict and tell you
+to run `push main --merge` first. Conflicts are always resolved in the container
+where Claude can help — never on the host.

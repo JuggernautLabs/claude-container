@@ -100,4 +100,4 @@ docker run --rm -v claude-state-my-session:/check alpine cat /check/history.json
 
 - `claude-container --sessions` - List sessions
 - `claude-container -s NAME --delete` - Delete session
-- `claude-container -s NAME --extract` - Extract changes as branch
+- `claude-container pull -s NAME` - Pull changes to host as branch

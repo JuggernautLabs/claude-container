@@ -2,12 +2,12 @@
 
 Check whether session work has been properly extracted and merged without making any changes.
 
-## Hash check (`--check`)
+## Hash check (`status <branch>`)
 
 Compare session commit hashes directly against a host branch:
 
 ```bash
-claude-container merge -s my-feature --check main
+claude-container status -s my-feature main
 ```
 
 Output for each repo:
@@ -42,7 +42,7 @@ Output for each repo:
 ### Filter to one repo
 
 ```bash
-claude-container merge -s my-feature --check main --repo synapse
+claude-container status -s my-feature main --repo synapse
 ```
 
 Matches on full name (`org/synapse`) or basename (`synapse`).
@@ -55,26 +55,26 @@ Matches on full name (`org/synapse`) or basename (`synapse`).
 Useful in scripts:
 
 ```bash
-if claude-container merge -s my-feature --check main; then
+if claude-container status -s my-feature main; then
   echo "All synced"
 else
   echo "Needs attention"
 fi
 ```
 
-## Status verify (`--verify`)
+## Sync verify (`status`)
 
 Classifies each repo into a sync state:
 
 ```bash
-claude-container merge -s my-feature --verify
+claude-container status -s my-feature
 ```
 
 Output:
 
 ```
   org/repo-a: synced
-  org/repo-b: extracted but not merged into main
+  org/repo-b: extracted but not merged
   org/repo-c: unchanged
   org/repo-d: not extracted
 
@@ -95,7 +95,7 @@ Output:
 
 | Question | Tool |
 |----------|------|
-| "Does this specific branch match the session?" | `--check <branch>` |
-| "Has everything been extracted and merged?" | `--verify` |
-| "Is this one repo in sync?" | `--check <branch> --repo <name>` |
-| "Quick sanity check in a script" | `--check` (exit code) |
+| "Does this specific branch match the session?" | `status -s X main` |
+| "Has everything been extracted and merged?" | `status -s X` |
+| "Is this one repo in sync?" | `status -s X main --repo <name>` |
+| "Quick sanity check in a script" | `status -s X main` (exit code) |
