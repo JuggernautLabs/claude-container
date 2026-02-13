@@ -76,9 +76,9 @@ How data moves between your host repos and the container session volume.
 - Host is dirty or conflicts expected: `pull main --reconcile`
 
 **Recommended merge-into-main workflow:**
-1. `push main --merge` — merge main INTO session (Claude resolves conflicts)
-2. `pull` — extract session branches to host
-3. `pull main` — merge into main (guaranteed clean, session already has main)
+1. `push -s X main --merge` — merge main INTO session (Claude resolves conflicts)
+2. `pull -s X` — extract session branches to host
+3. `pull -s X main` — merge into main (guaranteed clean, session already has main)
 
 **"I need to check if things are in sync"**
 - Hash-level comparison: `status main`

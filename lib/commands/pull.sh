@@ -239,9 +239,9 @@ Examples:
   claude-container pull -s myproj --force
 
 Recommended workflow:
-  1. push main --merge     # merge main INTO session (Claude resolves conflicts)
-  2. pull                  # extract session branches to host
-  3. pull main             # merge into main (guaranteed clean, session has main)
+  1. push -s X main --merge   # merge main INTO session (Claude resolves conflicts)
+  2. pull -s X                # extract session branches to host
+  3. pull -s X main           # merge into main (guaranteed clean, session has main)
 
 Migration from old commands:
   --extract                    →  pull
