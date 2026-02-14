@@ -12,6 +12,7 @@ cmd_status() {
     local session_name=""
     local branch=""
     local filter_repo=""
+    local check_dirty=false
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -22,6 +23,10 @@ cmd_status() {
             --repo)
                 filter_repo="$2"
                 shift 2
+                ;;
+            --dirty)
+                check_dirty=true
+                shift
                 ;;
             --help|-h)
                 _status_help
@@ -52,7 +57,9 @@ cmd_status() {
         return 1
     fi
 
-    if [[ -n "$branch" ]]; then
+    if $check_dirty; then
+        _status_dirty "$session_name" "$filter_repo"
+    elif [[ -n "$branch" ]]; then
         _status_check "$session_name" "$branch" "$filter_repo"
     else
         _status_verify "$session_name"
@@ -266,6 +273,87 @@ _status_verify() {
     return 0
 }
 
+_status_dirty() {
+    local session_name="$1"
+    local filter_repo="$2"
+    local volume="claude-session-${session_name}"
+
+    if ! docker volume inspect "$volume" &>/dev/null; then
+        error "Session not found: $session_name"
+        return 1
+    fi
+
+    if ! command -v yq &>/dev/null; then
+        error "yq required for status check"
+        return 1
+    fi
+
+    local config=$(read_session_config "$volume")
+    local projects=$(parse_session_projects "$config")
+
+    if [[ -z "$projects" ]]; then
+        warn "No projects found in session config"
+        return 1
+    fi
+
+    info "Checking host repos for uncommitted changes..."
+    echo ""
+
+    local dirty_count=0
+    local clean_count=0
+    local total=0
+
+    while IFS='|' read -r proj_name proj_path; do
+        [[ -z "$proj_name" ]] && continue
+
+        # Apply repo filter (exact or suffix match)
+        if [[ -n "$filter_repo" ]]; then
+            local _basename="${proj_name##*/}"
+            if [[ "$proj_name" != "$filter_repo" && "$_basename" != "$filter_repo" ]]; then
+                continue
+            fi
+        fi
+
+        total=$((total + 1))
+
+        if [[ ! -d "$proj_path" ]]; then
+            warn "  $proj_name: not found ($proj_path)"
+            continue
+        fi
+
+        local porcelain
+        porcelain=$(git -C "$proj_path" status --porcelain 2>/dev/null)
+
+        if [[ -z "$porcelain" ]]; then
+            clean_count=$((clean_count + 1))
+            continue
+        fi
+
+        local file_count
+        file_count=$(echo "$porcelain" | wc -l | tr -d ' ')
+        dirty_count=$((dirty_count + 1))
+
+        warn "  $proj_name ($file_count files)"
+        # Show first few files indented
+        echo "$porcelain" | head -5 | while IFS= read -r line; do
+            echo "    $line"
+        done
+        local remaining=$((file_count - 5))
+        if [[ $remaining -gt 0 ]]; then
+            echo "    ... and $remaining more"
+        fi
+    done <<< "$projects"
+
+    echo ""
+    if [[ $dirty_count -gt 0 ]]; then
+        warn "$dirty_count/$total repo(s) have uncommitted changes"
+        return 1
+    else
+        success "All $total repo(s) clean"
+        return 0
+    fi
+}
+
 _status_help() {
     cat <<EOF
 Usage: claude-container status -s <session> [branch] [options]
@@ -278,6 +366,7 @@ Arguments:
 Options:
   --session, -s <name>     Session name (required)
   --repo <name>            Filter to a single repo (name or basename)
+  --dirty                  Check which host repos have uncommitted changes
   --help, -h               Show this help
 
 Modes:
@@ -285,6 +374,8 @@ Modes:
                    synced/unchanged/extracted-only/not-extracted/missing.
   With branch      Hash comparison: compares session HEAD against host branch
                    with ancestry info (host ahead, session ahead, diverged).
+  --dirty          Show repos with uncommitted changes on the host.
+                   These block pull/auto-merge operations.
 
 Exit code: 0 = all match/synced, 1 = at least one mismatch or pending.
 
@@ -297,6 +388,12 @@ Examples:
 
   # Check a single repo against main
   claude-container status -s myproj main --repo synapse
+
+  # Check which repos have uncommitted changes
+  claude-container status -s myproj --dirty
+
+  # Check a specific repo for dirty state
+  claude-container status -s myproj --dirty --repo synapse
 
 Migration from old commands:
   merge -s X --check main            →  status -s X main

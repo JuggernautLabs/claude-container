@@ -2012,6 +2012,7 @@ session_clone() {
 session_auto_merge() {
     local session_name="$1"
     local target_branch="${2:-main}"
+    local dry_run="${3:-false}"
     local volume="claude-session-${session_name}"
     local git_image="${IMAGE_NAME:-$DEFAULT_IMAGE}"
 
@@ -2029,7 +2030,11 @@ session_auto_merge() {
         return 1
     fi
 
-    info "Merging session '$session_name' into '$target_branch'..."
+    if [[ "$dry_run" == "true" ]]; then
+        info "Dry run: checking merge of '$session_name' into '$target_branch'..."
+    else
+        info "Merging session '$session_name' into '$target_branch'..."
+    fi
     echo ""
 
     local projects
@@ -2080,8 +2085,10 @@ session_auto_merge() {
 
             # If target branch doesn't exist, create it from session branch
             if ! git -C "$proj_path" show-ref --verify --quiet "refs/heads/$target_branch" 2>/dev/null; then
-                git -C "$proj_path" branch "$target_branch" "$session_name" 2>/dev/null
-                echo "OK|$proj_name|created '$target_branch' from $session_name" > "$_result_file"
+                if [ '$dry_run' != 'true' ]; then
+                    git -C "$proj_path" branch "$target_branch" "$session_name" 2>/dev/null
+                fi
+                echo "OK|$proj_name|would create '$target_branch' from $session_name" > "$_result_file"
                 exit 0
             fi
 
@@ -2133,19 +2140,27 @@ session_auto_merge() {
             fi
 
             # Safe to merge — either fast-forward or verified clean
-            local current_branch
-            current_branch=$(git -C "$proj_path" symbolic-ref --short HEAD 2>/dev/null || echo "")
-
-            if [[ "$current_branch" == "$target_branch" ]]; then
-                git -C "$proj_path" merge "$session_name" --no-edit 2>/dev/null
-                echo "OK|$proj_name|merged $session_name into $target_branch" > "$_result_file"
+            if [ '$dry_run' = 'true' ]; then
+                if $is_ff; then
+                    echo "OK|$proj_name|would fast-forward into $target_branch" > "$_result_file"
+                else
+                    echo "OK|$proj_name|would merge cleanly into $target_branch" > "$_result_file"
+                fi
             else
-                if git -C "$proj_path" checkout "$target_branch" 2>/dev/null; then
+                local current_branch
+                current_branch=$(git -C "$proj_path" symbolic-ref --short HEAD 2>/dev/null || echo "")
+
+                if [[ "$current_branch" == "$target_branch" ]]; then
                     git -C "$proj_path" merge "$session_name" --no-edit 2>/dev/null
                     echo "OK|$proj_name|merged $session_name into $target_branch" > "$_result_file"
-                    git -C "$proj_path" checkout "$current_branch" 2>/dev/null || true
                 else
-                    echo "SKIP|$proj_name|could not checkout $target_branch" > "$_result_file"
+                    if git -C "$proj_path" checkout "$target_branch" 2>/dev/null; then
+                        git -C "$proj_path" merge "$session_name" --no-edit 2>/dev/null
+                        echo "OK|$proj_name|merged $session_name into $target_branch" > "$_result_file"
+                        git -C "$proj_path" checkout "$current_branch" 2>/dev/null || true
+                    else
+                        echo "SKIP|$proj_name|could not checkout $target_branch" > "$_result_file"
+                    fi
                 fi
             fi
         ) &

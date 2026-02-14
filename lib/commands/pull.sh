@@ -13,6 +13,7 @@ cmd_pull() {
     local branch=""
     local reconcile=false
     local force=false
+    local dry_run=false
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -26,6 +27,10 @@ cmd_pull() {
                 ;;
             --force|-f)
                 force=true
+                shift
+                ;;
+            --dry-run)
+                dry_run=true
                 shift
                 ;;
             --help|-h)
@@ -57,6 +62,13 @@ cmd_pull() {
         return 1
     fi
 
+    # Dry-run requires a branch
+    if $dry_run && [[ -z "$branch" ]]; then
+        error "--dry-run requires a target branch"
+        echo "Usage: claude-container pull -s <session> <branch> --dry-run"
+        return 1
+    fi
+
     # Extract session branches to host repos
     local extract_args=("$session_name")
     if $force; then
@@ -71,6 +83,12 @@ cmd_pull() {
             return 1
         fi
         _pull_reconcile "$session_name" "$branch" "$force"
+        return $?
+    fi
+
+    if $dry_run; then
+        # Dry-run: check what would happen without extracting or merging
+        session_auto_merge "$session_name" "$branch" true
         return $?
     fi
 
@@ -200,6 +218,7 @@ Options:
   --session, -s <name>     Session name (required)
   --reconcile, -R          Full reconcile: stash dirty, merge target into session,
                            launch Claude for conflicts, then merge back
+  --dry-run                Show what would happen without extracting or merging
   --force, -f              Force extraction even if branches diverged
   --help, -h               Show this help
 
@@ -234,6 +253,9 @@ Examples:
 
   # Full reconcile cycle against main
   claude-container pull -s myproj main --reconcile
+
+  # Preview what would happen (no changes made)
+  claude-container pull -s myproj main --dry-run
 
   # Force extraction (overwrite diverged branches)
   claude-container pull -s myproj --force
