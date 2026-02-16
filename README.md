@@ -302,16 +302,12 @@ claude-container reconcile <branch> [session...] [options]
 
 Omit session names to auto-discover all sessions with unmerged work.
 
-### Legacy subcommands
-
-`merge` and `extract` subcommands still work but print deprecation warnings. Use `push`/`pull`/`status` instead.
-
 ## Workflow Guides
 
 Detailed guides for common workflows:
 
 - **[Data Transfer Overview](docs/workflows/data-transfer.md)** -- How data moves between host and container, choosing the right tool
-- **[Basic Session](docs/workflows/basic-session.md)** -- Create, work, extract, merge
+- **[Basic Session](docs/workflows/basic-session.md)** -- Create, work, pull, merge
 - **[Multi-Project](docs/workflows/multi-project.md)** -- Discover repos, work across multiple repos, handle new repos
 - **[Reconcile](docs/workflows/reconcile.md)** -- Merge with dirty worktrees and conflicts, AI-assisted resolution
 - **[Multi-Session Reconcile](docs/workflows/multi-session-reconcile.md)** -- Merge multiple sessions into one branch

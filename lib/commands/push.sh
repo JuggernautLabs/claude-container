@@ -150,10 +150,5 @@ Examples:
 
   # Force-reset a single diverged repo
   claude-container push -s myproj --repo synapse,main --force
-
-Migration from old flags:
-  --refresh [branch]    →  push [branch]
-  --sync <branch>       →  push <branch> --rebase
-  --merge-into <branch> →  push <branch> --merge
 EOF
 }

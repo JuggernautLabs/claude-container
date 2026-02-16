@@ -100,16 +100,3 @@ How data moves between your host repos and the container session volume.
 - Hash-level comparison: `status main`
 - Sync state classification: `status`
 
-## Legacy Command Mapping
-
-| Old | New |
-|-----|-----|
-| `--refresh [branch]` | `push [branch]` |
-| `--sync <branch>` | `push <branch> --rebase` |
-| `--merge-into <branch>` | `push <branch> --merge` |
-| `--extract` | `pull` |
-| `--extract --auto-merge main` | `pull main` |
-| `merge --branch main` | `pull main` |
-| `merge --reconcile main` | `pull main --reconcile` |
-| `merge --check main` | `status main` |
-| `merge --verify` | `status` |

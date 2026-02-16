@@ -246,7 +246,7 @@ session_list() {
     echo ""
     echo "Commands:"
     echo "  Delete session:  claude-container --delete <name>"
-    echo "  Extract session: claude-container --extract <name>"
+    echo "  Pull session:    claude-container pull -s <name>"
 }
 
 # Delete a specific session and all its volumes

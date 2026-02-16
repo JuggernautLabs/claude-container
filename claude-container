@@ -316,10 +316,6 @@ Subcommands (data transfer):
   status -s <session> [branch]  Check sync state (read-only)
                                 Run 'claude-container status --help' for details
 
-Subcommands (legacy, use push/pull/status instead):
-  extract                       Extract session branches to host repos
-  merge                         Extract + merge session into host branches
-
 Options:
   --session, -s <name>     Session name (required for git sessions)
   --from <branch>          Create session from specific branch

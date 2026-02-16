@@ -83,10 +83,3 @@ If Claude created new repos inside the container (e.g., `git init`), push automa
 | **Use case** | Quick update, no divergence | Reload a repo from a different branch | Long-running session, upstream moved | Need to incorporate upstream changes |
 | **Container** | No | No | Yes, if conflicts | Yes, if conflicts |
 
-## Legacy command mapping
-
-| Old | New |
-|-----|-----|
-| `--refresh [branch]` | `push [branch]` |
-| `--sync <branch>` | `push <branch> --rebase` |
-| `--merge-into <branch>` | `push <branch> --merge` |

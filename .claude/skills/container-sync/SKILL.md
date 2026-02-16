@@ -283,11 +283,3 @@ claude-container reconcile main --yes
 | `--force, -f` | Force extraction even if diverged |
 | `--continue` | Resume interrupted reconcile |
 
-## Legacy Command Mapping
-
-| Old | New |
-|-----|-----|
-| `--sync <branch>` | `push <branch> --rebase` |
-| `--refresh [branch]` | `push [branch]` |
-| `--merge-into <branch>` | `push <branch> --merge` |
-| `--extract --force` | `pull --force` |

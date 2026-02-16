@@ -10,7 +10,7 @@ Each session lives in a Docker volume named `claude-session-{name}`:
 /session/
   .claude-projects.yml          # Config: project name → host path mappings
   .repo-manifest                # Root-commit|name pairs (written at session creation)
-  .sync-branch                  # Marker: set during --sync, cleaned on exit
+  .sync-branch                  # Marker: set during push --rebase, cleaned on exit
   .merge-into-branch            # Marker: set during push --merge, cleaned on exit
   .merge-into-summary           # Claude prompt for conflict resolution
   .merge-into-mounts            # Dirty project mounts for exec-back (proj_name|proj_path)
@@ -123,11 +123,3 @@ Host path doesn't exist?            → missing
 | `claude-container status -s X` | Sync state classification (read-only) |
 | `claude-container status -s X main` | Hash comparison against main (read-only) |
 
-Legacy (deprecated, still functional):
-
-| Command | Equivalent |
-|---------|-----------|
-| `claude-container -s X --extract` | `pull -s X` |
-| `claude-container extract -s X --auto-merge` | `pull -s X main` |
-| `claude-container merge -s X --branch main` | `pull -s X main` |
-| `claude-container merge -s X --verify` | `status -s X` |

@@ -264,12 +264,5 @@ Recommended workflow:
   1. push -s X main --merge   # merge main INTO session (Claude resolves conflicts)
   2. pull -s X                # extract session branches to host
   3. pull -s X main           # merge into main (guaranteed clean, session has main)
-
-Migration from old commands:
-  --extract                    →  pull
-  --extract --auto-merge main  →  pull main
-  extract -s X --auto-merge    →  pull -s X main
-  merge -s X --branch main     →  pull -s X main
-  merge -s X --reconcile main  →  pull -s X main --reconcile
 EOF
 }

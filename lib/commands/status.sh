@@ -394,10 +394,5 @@ Examples:
 
   # Check a specific repo for dirty state
   claude-container status -s myproj --dirty --repo synapse
-
-Migration from old commands:
-  merge -s X --check main            →  status -s X main
-  merge -s X --check main --repo Y   →  status -s X main --repo Y
-  merge -s X --verify                →  status -s X
 EOF
 }
