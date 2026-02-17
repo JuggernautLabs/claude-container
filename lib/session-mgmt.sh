@@ -191,6 +191,8 @@ session_cleanup_unused() {
 # List all sessions with disk usage
 # Usage: session_list
 session_list() {
+    local name_only="${1:-false}"
+
     # Get all claude volumes
     local all_volumes
     all_volumes=$(docker volume ls -q | grep -E "^(claude-session-|claude-state-|claude-cargo-|claude-npm-|claude-pip-)" || true)
@@ -208,17 +210,30 @@ session_list() {
         [[ -n "$session_name" ]] && sessions[$session_name]=1
     done <<< "$all_volumes"
 
-    # Get all sizes in one container run
+    # Name-only mode: just print names and exit
+    if [[ "$name_only" == "true" ]]; then
+        for session in $(echo "${!sessions[@]}" | tr ' ' '\n' | sort); do
+            echo "$session"
+        done
+        return 0
+    fi
+
+    # Get all sizes in one container run (with total)
     echo "Scanning $(echo "$all_volumes" | wc -l | tr -d ' ') volumes..."
-    local sizes
-    sizes=$(get_volume_sizes_batch "$all_volumes")
+    local sizes_with_total
+    sizes_with_total=$(get_volume_sizes_batch_with_total "$all_volumes")
 
     # Parse sizes into associative array
     declare -A vol_sizes
+    local total_human="?"
     while IFS='|' read -r vol size; do
         [[ -z "$vol" ]] && continue
-        vol_sizes[$vol]="$size"
-    done <<< "$sizes"
+        if [[ "$vol" == "TOTAL" ]]; then
+            total_human="$size"
+        else
+            vol_sizes[$vol]="$size"
+        fi
+    done <<< "$sizes_with_total"
 
     # Display table
     echo ""
@@ -233,13 +248,6 @@ session_list() {
         local pi="${vol_sizes[claude-pip-$session]:-"-"}"
         printf "%-30s %10s %10s %10s %10s %10s\n" "$session" "$ws" "$st" "$ca" "$np" "$pi"
     done
-
-    # Calculate total size
-    local total_human="?"
-    local sizes_with_total
-    sizes_with_total=$(get_volume_sizes_batch_with_total "$all_volumes")
-    total_human=$(echo "$sizes_with_total" | grep "^TOTAL|" | cut -d'|' -f2)
-    [[ -z "$total_human" ]] && total_human="?"
 
     echo ""
     echo "Total disk usage: $total_human"

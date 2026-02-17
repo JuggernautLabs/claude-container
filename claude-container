@@ -1130,7 +1130,7 @@ if $USE_GIT_SESSION; then
         echo "To pull rebased changes to host:"
         echo "  claude-container pull -s $SESSION_NAME --force"
 
-    elif [[ -n "$MERGE_INTO_BRANCH_CHECK" ]]; then
+    elif [[ -n "$MERGE_INTO_BRANCH_CHECK" ]] && { [[ -n "$MERGE_INTO_BRANCH" ]] || $AUTO_MERGE; }; then
         # Check if reconcile completed via 'fin' command
         RECONCILE_RESULT=$(docker run --rm -v "$GIT_SESSION_VOLUME:/session:ro" "$IMAGE_NAME" \
             cat /session/.reconcile-complete 2>/dev/null || echo "")
