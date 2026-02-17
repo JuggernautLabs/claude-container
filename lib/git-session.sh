@@ -154,6 +154,74 @@ has_multi_project_config() {
         sh -c 'test -f /session/.claude-projects.yml' 2>/dev/null
 }
 
+# Apply host working tree state (uncommitted changes) into a session volume as a WIP commit.
+# Copies modified/untracked files, removes deleted tracked files, then commits.
+# Arguments:
+#   $1 - source_path: absolute path to host git repo
+#   $2 - volume: Docker volume name
+#   $3 - project_name: directory name inside the volume (e.g. "myrepo")
+# Returns:
+#   0 on success or clean tree, 1 on failure (non-fatal, warns only)
+_apply_dirty_overlay() {
+    local source_path="$1"
+    local volume="$2"
+    local project_name="$3"
+    local git_image="${IMAGE_NAME:-$DEFAULT_IMAGE}"
+    local host_uid
+    host_uid=$(get_host_uid)
+
+    # Host-side check: skip if working tree is clean
+    if [[ -z "$(git -C "$source_path" status --porcelain 2>/dev/null)" ]]; then
+        return 0
+    fi
+
+    info "Applying uncommitted changes to '$project_name'..."
+
+    # Single docker run: copy changed/untracked files, remove deleted, commit
+    if ! docker run --rm \
+        --user "$host_uid:$host_uid" \
+        -v "$source_path:/source:ro" \
+        -v "$volume:/session" \
+        "$git_image" \
+        sh -c '
+            set -e
+            cd "/session/'"$project_name"'"
+            git config --local safe.directory "*"
+
+            # Copy modified/added tracked files (exclude deleted)
+            git -C /source diff --name-only --diff-filter=d HEAD 2>/dev/null | while IFS= read -r f; do
+                [ -z "$f" ] && continue
+                mkdir -p "$(dirname "$f")"
+                cp "/source/$f" "$f"
+            done
+
+            # Remove deleted tracked files
+            git -C /source diff --name-only --diff-filter=D HEAD 2>/dev/null | while IFS= read -r f; do
+                [ -z "$f" ] && continue
+                rm -f "$f"
+            done
+
+            # Copy untracked files (respects .gitignore)
+            git -C /source ls-files --others --exclude-standard 2>/dev/null | while IFS= read -r f; do
+                [ -z "$f" ] && continue
+                mkdir -p "$(dirname "$f")"
+                cp "/source/$f" "$f"
+            done
+
+            # Stage and commit (skip if nothing changed)
+            git add -A
+            if ! git diff --cached --quiet; then
+                git commit -m "WIP: uncommitted changes from host" --no-verify
+            fi
+        ' 2>&1; then
+        warn "Failed to apply dirty overlay to '$project_name' (non-fatal)"
+        return 1
+    fi
+
+    success "  Applied uncommitted changes to '$project_name'"
+    return 0
+}
+
 # Create multi-project git session from config file
 # Clones multiple repositories into a single session volume based on YAML config
 # Arguments:
@@ -346,6 +414,17 @@ create_multi_project_session() {
     # Write repo manifest for rename/change detection on extract
     write_repo_manifest "$volume"
 
+    # Apply uncommitted host changes if --dirty was specified
+    if ${DIRTY_SESSION:-false}; then
+        while IFS='|' read -r proj_name proj_path proj_branch proj_track proj_source; do
+            [[ -z "$proj_name" ]] && continue
+            # Skip projects that failed to clone (no .git dir)
+            docker run --rm -v "$volume:/session:ro" "$git_image" \
+                sh -c "test -d '/session/$proj_name/.git'" 2>/dev/null || continue
+            _apply_dirty_overlay "$proj_path" "$volume" "$proj_name"
+        done <<< "$projects"
+    fi
+
     success "Multi-project session created: $name ($project_count projects)"
 }
 
@@ -496,6 +575,11 @@ EOF
 
     # Write repo manifest for rename/change detection on extract
     write_repo_manifest "$volume"
+
+    # Apply uncommitted host changes if --dirty was specified
+    if ${DIRTY_SESSION:-false}; then
+        _apply_dirty_overlay "$abs_source_dir" "$volume" "$project_name"
+    fi
 
     success "Git session created: $name"
 }

@@ -60,6 +60,7 @@ MERGE_INTO_BRANCH=""  # Branch to merge into session (--merge-into)
 AUTO_MERGE=false      # Auto-merge session back into target (--auto-merge)
 AUTO_MERGE_BRANCH=""  # Target branch for auto-merge (default: main)
 CLONE_FROM=""         # Clone volumes from existing session (--clone-from)
+DIRTY_SESSION=false   # Capture host uncommitted changes into session (--dirty)
 
 # Tracking booleans for CLI-set flags (for session metadata override logic)
 NO_CONFIG_SET=false
@@ -247,6 +248,10 @@ while [[ $# -gt 0 ]]; do
             CLONE_FROM="$2"
             shift 2
             ;;
+        --dirty)
+            DIRTY_SESSION=true
+            shift
+            ;;
 
         # Actions without session requirement
         --sessions|--list-sessions)
@@ -335,6 +340,7 @@ Options:
   --docker                 Mount Docker socket for host Docker access
   --no-interactive         Exit with error if no token found
   --no-config              Skip auto-discovery of .claude-projects.yml
+  --dirty                  Capture uncommitted host changes into session as WIP commit
   --no-run                 Set up session but don't start container
   --verify, -v             Verify container setup works
   --version, -V            Show version
@@ -389,6 +395,9 @@ Examples:
 
   # Check sync state
   claude-container status -s myproj
+
+  # Start session with uncommitted changes from host
+  claude-container -s myproj --dirty
 
   # Delete a session
   claude-container -s myproj --delete --yes
