@@ -320,6 +320,8 @@ Subcommands (data transfer):
                                 Run 'claude-container pull --help' for details
   status -s <session> [branch]  Check sync state (read-only)
                                 Run 'claude-container status --help' for details
+  image [-s <session>]          Show Docker image for a session
+                                Run 'claude-container image --help' for details
 
 Options:
   --session, -s <name>     Session name (required for git sessions)
@@ -592,6 +594,8 @@ if [[ -n "$DOCKERFILE" ]]; then
         error "Dockerfile not found: $DOCKERFILE"
         exit 1
     fi
+    # Resolve to absolute path so session metadata is meaningful
+    DOCKERFILE="$(cd "$(dirname "$DOCKERFILE")" && pwd)/$(basename "$DOCKERFILE")"
     USE_DEFAULT_IMAGE=false
 else
     # No local Dockerfile found, use default image
@@ -624,10 +628,17 @@ else
     if [[ -z "$IMAGE_EXISTS" ]]; then
         NEEDS_BUILD=true
     else
-        # Check if Dockerfile is newer than image
-        IMAGE_CREATED=$(docker inspect -f '{{.Created}}' "$IMAGE_NAME" 2>/dev/null | cut -d'T' -f1 | tr -d '-')
-        DOCKERFILE_MODIFIED=$(stat -f %Sm -t %Y%m%d "$DOCKERFILE" 2>/dev/null || stat -c %Y "$DOCKERFILE" 2>/dev/null | xargs -I{} date -d @{} +%Y%m%d 2>/dev/null || echo "0")
-        if [[ "$DOCKERFILE_MODIFIED" > "$IMAGE_CREATED" ]]; then
+        # Compare epoch seconds: image creation vs Dockerfile modification
+        IMAGE_EPOCH=$(date -j -f "%Y-%m-%dT%H:%M:%S" \
+            "$(docker inspect -f '{{.Created}}' "$IMAGE_NAME" 2>/dev/null | cut -d'.' -f1)" \
+            +%s 2>/dev/null \
+            || docker inspect -f '{{.Created}}' "$IMAGE_NAME" 2>/dev/null \
+            | xargs -I{} date -d {} +%s 2>/dev/null \
+            || echo "0")
+        DOCKERFILE_EPOCH=$(stat -f %m "$DOCKERFILE" 2>/dev/null \
+            || stat -c %Y "$DOCKERFILE" 2>/dev/null \
+            || echo "0")
+        if [[ "$DOCKERFILE_EPOCH" -gt "$IMAGE_EPOCH" ]]; then
             NEEDS_BUILD=true
         fi
     fi
@@ -1078,11 +1089,14 @@ FINSCRIPT
         done <<< "$PASSTHROUGH_DECODED"
     fi
 
-    # Check for merge-into summary to use as initial prompt
+    # Check for merge-into or sync summary to use as initial prompt
     CLAUDE_INITIAL_PROMPT=""
     if [[ -f /workspace/.merge-into-summary ]]; then
         CLAUDE_INITIAL_PROMPT=$(cat /workspace/.merge-into-summary)
         rm -f /workspace/.merge-into-summary
+    elif [[ -f /workspace/.sync-summary ]]; then
+        CLAUDE_INITIAL_PROMPT=$(cat /workspace/.sync-summary)
+        rm -f /workspace/.sync-summary
     fi
 
     cd $WORK_DIR
@@ -1130,9 +1144,9 @@ if $USE_GIT_SESSION; then
             done <<< "$SYNC_PROJECTS"
         fi
 
-        # Remove sync marker
+        # Remove sync markers
         docker run --rm -v "$GIT_SESSION_VOLUME:/session" "$IMAGE_NAME" \
-            rm -f /session/.sync-branch 2>/dev/null || true
+            rm -f /session/.sync-branch /session/.sync-summary 2>/dev/null || true
 
         success "Sync cleanup complete"
         echo ""

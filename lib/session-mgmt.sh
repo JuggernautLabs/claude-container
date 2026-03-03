@@ -422,9 +422,106 @@ session_add_repo() {
         info "Detected worktree, using main repo: $source_repo_path (branch: $branch_to_checkout)"
     fi
 
-    # Default workspace path to repo basename
+    # Default workspace path: infer placement from existing session repos
+    # Match the deepest common ancestor between the new repo's host path and
+    # any existing project's host path, then mirror the relative path under
+    # that project's workspace prefix.
+    #
+    # Example: existing project "juggernautlabs/substrate" at /a/b/juggernautlabs/substrate
+    #   add-repo /a/b/juggernautlabs/nested/cage
+    #   → common ancestor with /a/b/juggernautlabs/substrate is /a/b/juggernautlabs
+    #   → relative suffix: nested/cage
+    #   → workspace prefix dirname: juggernautlabs
+    #   → result: juggernautlabs/nested/cage
     if [[ -z "$workspace_path" ]]; then
-        workspace_path=$(basename "$abs_repo_path")
+        local repo_basename
+        repo_basename=$(basename "$abs_repo_path")
+
+        local _config_content
+        _config_content=$(read_session_config "$volume" 2>/dev/null || true)
+        local _best_workspace=""
+        local _best_depth=0
+
+        if [[ -n "$_config_content" ]]; then
+            local _projects
+            _projects=$(parse_session_projects "$_config_content")
+            while IFS='|' read -r _pname _ppath; do
+                [[ -z "$_pname" || -z "$_ppath" ]] && continue
+                # Only consider namespaced entries (prefix/name)
+                [[ "$_pname" != */* ]] && continue
+
+                # Find longest common path prefix between existing project's
+                # host path and the new repo's host path (component-wise)
+                local _existing_parent
+                _existing_parent=$(dirname "$_ppath")
+                local _new_parent
+                _new_parent=$(dirname "$abs_repo_path")
+
+                # Split into components and walk
+                local _common=""
+                local _ep="$_existing_parent"
+                local _np="$_new_parent"
+
+                # Build arrays of path components
+                local -a _ec=() _nc=()
+                while [[ "$_ep" != "/" && -n "$_ep" ]]; do
+                    _ec=("$(basename "$_ep")" "${_ec[@]}")
+                    _ep=$(dirname "$_ep")
+                done
+                while [[ "$_np" != "/" && -n "$_np" ]]; do
+                    _nc=("$(basename "$_np")" "${_nc[@]}")
+                    _np=$(dirname "$_np")
+                done
+
+                # Walk from root, counting matching components
+                local _depth=0
+                local _i=0
+                while [[ $_i -lt ${#_ec[@]} && $_i -lt ${#_nc[@]} ]]; do
+                    if [[ "${_ec[$_i]}" == "${_nc[$_i]}" ]]; then
+                        _depth=$((_depth + 1))
+                    else
+                        break
+                    fi
+                    _i=$((_i + 1))
+                done
+
+                # The common prefix must cover at least the existing project's parent
+                # (i.e., depth >= number of components in existing parent)
+                if [[ $_depth -gt $_best_depth && $_depth -ge ${#_ec[@]} ]]; then
+                    # New repo is under (or at) the same ancestor as this project
+                    # Compute relative path from that ancestor to the new repo
+                    # The ancestor has _depth components; the new repo has all of _nc + basename
+                    local _rel=""
+                    local _j=$_depth
+                    while [[ $_j -lt ${#_nc[@]} ]]; do
+                        if [[ -n "$_rel" ]]; then
+                            _rel="$_rel/${_nc[$_j]}"
+                        else
+                            _rel="${_nc[$_j]}"
+                        fi
+                        _j=$((_j + 1))
+                    done
+
+                    # Workspace prefix = dirname of existing workspace name (the org part)
+                    local _ws_prefix
+                    _ws_prefix=$(dirname "$_pname")
+
+                    if [[ -n "$_rel" ]]; then
+                        _best_workspace="$_ws_prefix/$_rel/$repo_basename"
+                    else
+                        _best_workspace="$_ws_prefix/$repo_basename"
+                    fi
+                    _best_depth=$_depth
+                fi
+            done <<< "$_projects"
+        fi
+
+        if [[ -n "$_best_workspace" ]]; then
+            workspace_path="$_best_workspace"
+            info "Inferred workspace path '$workspace_path' from sibling repos"
+        else
+            workspace_path="$repo_basename"
+        fi
     fi
 
     local git_image="${IMAGE_NAME:-$DEFAULT_IMAGE}"
@@ -642,6 +739,9 @@ session_sync() {
     local success_count=0
     local skip_count=0
     local dirty_count=0
+    local -a conflict_projects=()
+    local -a dirty_projects=()
+    local -a summary_lines=()
 
     while IFS='|' read -r proj_name proj_path; do
         [[ -z "$proj_name" ]] && continue
@@ -650,6 +750,7 @@ session_sync() {
         if [[ ! -d "$proj_path" ]]; then
             warn "  Skipping $proj_name (original not found: $proj_path)"
             skip_count=$((skip_count + 1))
+            summary_lines+=("- $proj_name: SKIPPED (original not found)")
             continue
         fi
 
@@ -657,12 +758,13 @@ session_sync() {
         if ! git -C "$proj_path" show-ref --verify --quiet "refs/heads/$target_branch" 2>/dev/null; then
             warn "  Skipping $proj_name (branch '$target_branch' not found)"
             skip_count=$((skip_count + 1))
+            summary_lines+=("- $proj_name: SKIPPED (branch '$target_branch' not found)")
             continue
         fi
 
         info "  Syncing $proj_name..."
 
-        # Check for rebase in progress
+        # Check for stale rebase in progress — abort it so we can start fresh
         local rebase_in_progress
         rebase_in_progress=$(docker run --rm \
             -v "$volume:/session:ro" \
@@ -670,9 +772,14 @@ session_sync() {
             sh -c "test -d '/session/$proj_name/.git/rebase-merge' -o -d '/session/$proj_name/.git/rebase-apply' && echo 'yes' || echo 'no'" 2>/dev/null)
 
         if [[ "$rebase_in_progress" == "yes" ]]; then
-            warn "    $proj_name has rebase in progress (use git rebase --continue or --abort)"
-            conflict_count=$((conflict_count + 1))
-            continue
+            warn "    $proj_name has stale rebase in progress, aborting to start fresh..."
+            local host_uid_abort
+            host_uid_abort=$(get_host_uid)
+            docker run --rm \
+                --user "$host_uid_abort:$host_uid_abort" \
+                -v "$volume:/session" \
+                "$git_image" \
+                sh -c "cd '/session/$proj_name' && git -c safe.directory='*' rebase --abort" 2>/dev/null || true
         fi
 
         # Check for uncommitted/unstaged changes BEFORE rebasing
@@ -692,6 +799,8 @@ session_sync() {
                 echo "      ... and $((change_count - 3)) more"
             fi
             dirty_count=$((dirty_count + 1))
+            dirty_projects+=("$proj_name")
+            summary_lines+=("- $proj_name: DIRTY (uncommitted changes)")
             continue
         fi
 
@@ -701,6 +810,8 @@ session_sync() {
         local host_uid
         host_uid=$(get_host_uid)
 
+        # Note: git rebase exits non-zero on conflicts, so || true prevents
+        # set -e from killing the script before we can check the output
         rebase_output=$(docker run --rm \
             --user "$host_uid:$host_uid" \
             -v "$volume:/session" \
@@ -712,32 +823,32 @@ session_sync() {
                 git -c safe.directory='*' remote add upstream /upstream
                 git -c safe.directory='*' fetch upstream '$target_branch' 2>&1
                 git -c safe.directory='*' rebase 'upstream/$target_branch' 2>&1
-            " 2>&1)
+            " 2>&1) || true
 
         if echo "$rebase_output" | grep -qE "CONFLICT|Merge conflict|could not apply"; then
             warn "    $proj_name has conflicts (Claude will resolve)"
             conflict_count=$((conflict_count + 1))
+            conflict_projects+=("$proj_name")
+            summary_lines+=("- $proj_name: CONFLICTS (needs resolution)")
         elif echo "$rebase_output" | grep -qE "error:|fatal:"; then
             error "    $proj_name rebase failed:"
             echo "$rebase_output" | grep -E "error:|fatal:" | head -3 | sed 's/^/      /'
             skip_count=$((skip_count + 1))
+            summary_lines+=("- $proj_name: FAILED")
         elif echo "$rebase_output" | grep -q "is up to date"; then
             info "    $proj_name (already up to date)"
             success_count=$((success_count + 1))
+            summary_lines+=("- $proj_name: up to date")
         else
             success "    $proj_name rebased successfully"
             success_count=$((success_count + 1))
+            summary_lines+=("- $proj_name: rebased cleanly")
         fi
     done <<< "$projects"
 
     echo ""
     if [[ $conflict_count -gt 0 ]]; then
         info "$conflict_count project(s) have conflicts for Claude to resolve"
-        echo ""
-        echo "Conflict resolution tips for Claude:"
-        echo "  - Look for <<<<<<< HEAD markers in files"
-        echo "  - After resolving, run: git add <files> && git rebase --continue"
-        echo "  - To abort: git rebase --abort"
     fi
     if [[ $success_count -gt 0 ]]; then
         success "$success_count project(s) rebased cleanly"
@@ -750,11 +861,55 @@ session_sync() {
     fi
 
     # Store sync state for cleanup message on exit
+    local host_uid_sync
+    host_uid_sync=$(get_host_uid)
     docker run --rm \
-        --user "$(get_host_uid):$(get_host_uid)" \
+        --user "$host_uid_sync:$host_uid_sync" \
         -v "$volume:/session" \
         "$git_image" \
         sh -c "echo '$target_branch' > /session/.sync-branch" 2>/dev/null || true
+
+    # Build sync summary as initial prompt for Claude (mirrors merge-into-summary)
+    if [[ $conflict_count -gt 0 || $dirty_count -gt 0 ]]; then
+        local sync_summary
+        sync_summary="Session was rebased onto '$target_branch'. Here is what happened:"
+        sync_summary+=$'\n'
+        for line in "${summary_lines[@]}"; do
+            sync_summary+=$'\n'"  $line"
+        done
+        if [[ $conflict_count -gt 0 ]]; then
+            sync_summary+=$'\n\n'"$conflict_count project(s) have rebase conflicts that need resolution."
+            sync_summary+=$'\n\n'"Resolve all rebase conflicts autonomously. The session branch contains the work we want to keep — when conflicts arise, prefer the session (HEAD/ours) side. The '$target_branch' branch changes should be incorporated where they don't conflict, but session work takes priority."
+            sync_summary+=$'\n\n'"For each conflicted project:"
+            sync_summary+=$'\n'"1. cd /workspace/{project_name}"
+            sync_summary+=$'\n'"2. Find all files with <<<<<<< markers: grep -r '<<<<<<< HEAD' ."
+            sync_summary+=$'\n'"3. Edit each file to resolve conflicts, keeping our (HEAD) changes"
+            sync_summary+=$'\n'"4. git add the resolved files"
+            sync_summary+=$'\n'"5. git rebase --continue"
+            sync_summary+=$'\n'"6. Repeat steps 2-5 if the rebase surfaces more conflicts"
+            sync_summary+=$'\n\n'"Conflicted projects: ${conflict_projects[*]}"
+            sync_summary+=$'\n\n'"Do not ask for clarification unless a conflict is genuinely ambiguous (e.g. both sides made substantive changes to the same logic). Just resolve and continue the rebase."
+        fi
+        if [[ $dirty_count -gt 0 ]]; then
+            sync_summary+=$'\n\n'"$dirty_count project(s) had uncommitted changes and were skipped."
+            sync_summary+=$'\n'"For each dirty project, commit or stash the changes first, then rebase manually:"
+            sync_summary+=$'\n'"1. cd /workspace/{project_name}"
+            sync_summary+=$'\n'"2. git stash (or git add -A && git commit -m 'WIP')"
+            sync_summary+=$'\n'"3. git rebase upstream/$target_branch"
+            sync_summary+=$'\n'"4. git stash pop (if stashed)"
+            sync_summary+=$'\n\n'"Dirty projects: ${dirty_projects[*]}"
+        fi
+        sync_summary+=$'\n\n'"After resolving all conflicts, review the result and run:"
+        sync_summary+=$'\n'"  fin \"<brief description of what was resolved>\""
+        sync_summary+=$'\n'"This will signal completion and terminate the session."
+
+        # Write sync summary to volume for container startup
+        printf '%s' "$sync_summary" | docker run --rm -i \
+            --user "$host_uid_sync:$host_uid_sync" \
+            -v "$volume:/session" \
+            "$git_image" \
+            sh -c 'cat > /session/.sync-summary' 2>/dev/null || true
+    fi
 
     echo ""
     info "Starting container for review..."
@@ -976,22 +1131,45 @@ session_refresh() {
             fi
             local_head=\$(git rev-parse HEAD)
             remote_head=\$(git rev-parse FETCH_HEAD)
-            if [ \"\$local_head\" = \"\$remote_head\" ]; then
+            dirty=\$(git status --porcelain 2>/dev/null)
+            if [ -n \"\$dirty\" ]; then
+                dirty_count=\$(echo \"\$dirty\" | wc -l | tr -d ' ')
+                if [ '$force_reset' != 'true' ]; then
+                    echo 'DIRTY|$proj_name|'\$dirty_count' dirty file(s) — use --force to override'
+                    git remote remove _host 2>/dev/null || true
+                    exit 0
+                else
+                    echo 'WARN|$proj_name|'\$dirty_count' dirty file(s) will be discarded'
+                fi
+            fi
+            if [ '$force_reset' = 'true' ]; then
+                # Force: unconditionally reset to host HEAD (nuke and replace)
+                if [ \"\$local_head\" = \"\$remote_head\" ]; then
+                    echo 'SAME|$proj_name|up to date'
+                else
+                    git checkout . 2>/dev/null
+                    git clean -fd 2>/dev/null
+                    git reset --hard FETCH_HEAD 2>/dev/null
+                    new_head=\$(git rev-parse --short HEAD)
+                    if [ \"\$(git rev-parse HEAD)\" = \"\$remote_head\" ]; then
+                        echo 'OK|$proj_name|force-reset to host HEAD ('\$new_head')'
+                    else
+                        echo 'FAIL|$proj_name|force-reset failed (HEAD is '\$new_head', expected '\$(git rev-parse --short FETCH_HEAD)')'
+                    fi
+                fi
+            elif [ \"\$local_head\" = \"\$remote_head\" ]; then
                 echo 'SAME|$proj_name|up to date'
             elif git merge-base --is-ancestor \"\$local_head\" FETCH_HEAD; then
                 git merge --ff-only FETCH_HEAD 2>/dev/null
-                count=\$(git rev-list --count \"\$local_head\"..HEAD)
-                echo 'OK|$proj_name|'\$count' new commit(s)'
-            elif git merge-base --is-ancestor FETCH_HEAD \"\$local_head\"; then
-                if [ '$force_reset' = 'true' ]; then
-                    git reset --hard FETCH_HEAD 2>/dev/null
-                    echo 'OK|$proj_name|force-reset to host HEAD'
+                new_head=\$(git rev-parse HEAD)
+                if [ \"\$new_head\" = \"\$remote_head\" ]; then
+                    count=\$(git rev-list --count \"\$local_head\"..HEAD)
+                    echo 'OK|$proj_name|'\$count' new commit(s) ('\$(git rev-parse --short HEAD)')'
                 else
-                    echo 'SAME|$proj_name|up to date'
+                    echo 'FAIL|$proj_name|fast-forward failed (HEAD unchanged, dirty working tree?)'
                 fi
-            elif [ '$force_reset' = 'true' ]; then
-                git reset --hard FETCH_HEAD 2>/dev/null
-                echo 'OK|$proj_name|force-reset to host HEAD'
+            elif git merge-base --is-ancestor FETCH_HEAD \"\$local_head\"; then
+                echo 'SAME|$proj_name|up to date'
             else
                 echo 'DIVERGE|$proj_name|session and host have diverged (use --force or --sync to rebase)'
             fi
@@ -1034,6 +1212,17 @@ session_refresh() {
             DIVERGE)
                 warn "  $proj_name ($msg)"
                 fail_count=$((fail_count + 1))
+                ;;
+            FAIL)
+                error "  $proj_name ($msg)"
+                fail_count=$((fail_count + 1))
+                ;;
+            DIRTY)
+                warn "  $proj_name ($msg)"
+                fail_count=$((fail_count + 1))
+                ;;
+            WARN)
+                warn "  $proj_name ($msg)"
                 ;;
         esac
     done <<< "$refresh_output"
@@ -1423,11 +1612,12 @@ _extract_multi_project_direct() {
 
     # Phase 1: Validate projects and build list for batch bundle creation
     local _valid_projects=()
+    local _missing_host_repos=()
     while IFS='|' read -r proj_name proj_path; do
         [[ -z "$proj_name" ]] && continue
         if [[ ! -d "$proj_path" ]]; then
-            warn "Skipping $proj_name (original repo not found: $proj_path)"
-            fail_count=$((fail_count + 1))
+            info "  $proj_name: host path missing ($proj_path) — will extract from session"
+            _missing_host_repos+=("$proj_name|$proj_path")
             continue
         fi
         _valid_projects+=("$proj_name|$proj_path")
@@ -1541,10 +1731,15 @@ _extract_multi_project_direct() {
         success_count=$((success_count + 1))
     done
 
-    # Phase 4: Extract new repos (created inside session, not in original config)
-    # Scan live state and compare against either saved manifest or config project names
+    # Phase 4: Extract new repos (created in session) + missing-host repos (in config but host path gone)
     local _new_manifest
     _new_manifest=$(scan_repo_manifest "$volume")
+
+    # Start with missing-host repos from Phase 1
+    local _new_repos=()
+    for _mhr in "${_missing_host_repos[@]}"; do
+        _new_repos+=("${_mhr%%|*}")
+    done
 
     if [[ -n "$_new_manifest" ]]; then
         local _old_manifest
@@ -1565,108 +1760,112 @@ _extract_multi_project_direct() {
             done <<< "$projects"
         fi
 
+        # Also mark missing-host repos as known so they aren't double-counted
+        for _mhr in "${_missing_host_repos[@]}"; do
+            _known_names[${_mhr%%|*}]=1
+        done
+
         # Find repos in live scan that aren't known
-        local _new_repos=()
         while IFS='|' read -r _hash _name; do
             [[ -z "$_name" ]] && continue
             if [[ -z "${_known_names[$_name]:-}" ]]; then
                 _new_repos+=("$_name")
             fi
         done <<< "$_new_manifest"
+    fi
 
-        if [[ ${#_new_repos[@]} -gt 0 ]]; then
-            info "Found ${#_new_repos[@]} new repo(s) created in session"
+    if [[ ${#_new_repos[@]} -gt 0 ]]; then
+        info "Found ${#_new_repos[@]} repo(s) to extract (new or missing host path)"
 
-            # Bundle new repos
-            for _new_name in "${_new_repos[@]}"; do
-                echo "$_new_name"
-            done >> "$bundle_dir/.projects"
+        # Bundle new repos
+        for _new_name in "${_new_repos[@]}"; do
+            echo "$_new_name"
+        done >> "$bundle_dir/.projects"
 
-            # Write just the new repo names to a separate file for bundling
-            printf '%s\n' "${_new_repos[@]}" > "$bundle_dir/.new-projects"
+        # Write just the new repo names to a separate file for bundling
+        printf '%s\n' "${_new_repos[@]}" > "$bundle_dir/.new-projects"
 
-            docker run --rm \
-                -v "$volume:/session:ro" \
-                -v "$bundle_dir:/bundles" \
-                "$git_image" \
-                sh -c '
-                    git config --global --add safe.directory "*"
-                    while IFS= read -r proj; do
-                        [ -z "$proj" ] && continue
-                        safe=$(echo "$proj" | tr "/" "_")
-                        (
-                            cd "/session/$proj" 2>/dev/null || exit 1
-                            git bundle create "/tmp/${safe}.bundle" HEAD 2>&1 && \
-                                mv "/tmp/${safe}.bundle" "/bundles/${safe}.bundle"
-                        ) &
-                    done < /bundles/.new-projects
-                    wait
-                ' 2>/dev/null || true
+        docker run --rm \
+            -v "$volume:/session:ro" \
+            -v "$bundle_dir:/bundles" \
+            "$git_image" \
+            sh -c '
+                git config --global --add safe.directory "*"
+                while IFS= read -r proj; do
+                    [ -z "$proj" ] && continue
+                    safe=$(echo "$proj" | tr "/" "_")
+                    (
+                        cd "/session/$proj" 2>/dev/null || exit 1
+                        git bundle create "/tmp/${safe}.bundle" HEAD 2>&1 && \
+                            mv "/tmp/${safe}.bundle" "/bundles/${safe}.bundle"
+                    ) &
+                done < /bundles/.new-projects
+                wait
+            ' 2>/dev/null || true
 
-            # Extract each new repo: branch into existing host repo, or clone if truly new
-            for _new_name in "${_new_repos[@]}"; do
-                local _safe_name="${_new_name//\//_}"
-                local _bundle="$bundle_dir/${_safe_name}.bundle"
+        # Extract each new repo: branch into existing host repo, or clone if truly new
+        for _new_name in "${_new_repos[@]}"; do
+            local _safe_name="${_new_name//\//_}"
+            local _bundle="$bundle_dir/${_safe_name}.bundle"
 
-                if [[ ! -s "$_bundle" ]]; then
-                    warn "  $_new_name (no git data in bundle)"
+            if [[ ! -s "$_bundle" ]]; then
+                warn "  $_new_name (no git data in bundle)"
+                continue
+            fi
+
+            # Determine target: config lookup → org-sibling inference → cwd fallback
+            local _target_dir
+            _target_dir=$(resolve_repo_host_path "$_new_name" "$projects")
+
+            if [[ -d "$_target_dir" ]] && is_git_repo "$_target_dir"; then
+                # Host repo exists — extract as a branch (same as Phase 3 logic)
+                if ! git -C "$_target_dir" fetch "$_bundle" HEAD 2>/dev/null; then
+                    error "  $_new_name fetch failed"
+                    fail_count=$((fail_count + 1))
                     continue
                 fi
-
-                # Determine target: config lookup → org-sibling inference → cwd fallback
-                local _target_dir
-                _target_dir=$(resolve_repo_host_path "$_new_name" "$projects")
-
-                if [[ -d "$_target_dir" ]] && is_git_repo "$_target_dir"; then
-                    # Host repo exists — extract as a branch (same as Phase 3 logic)
-                    if ! git -C "$_target_dir" fetch "$_bundle" HEAD 2>/dev/null; then
-                        error "  $_new_name fetch failed"
-                        fail_count=$((fail_count + 1))
-                        continue
-                    fi
-                    local _fetched_head
-                    _fetched_head=$(git -C "$_target_dir" rev-parse FETCH_HEAD 2>/dev/null)
-                    local _compare_base
-                    local _branch_exists=false
-                    if git -C "$_target_dir" show-ref --verify --quiet "refs/heads/$session_name" 2>/dev/null; then
-                        _compare_base=$(git -C "$_target_dir" rev-parse "refs/heads/$session_name" 2>/dev/null)
-                        _branch_exists=true
-                    else
-                        _compare_base=$(git -C "$_target_dir" rev-parse HEAD 2>/dev/null)
-                    fi
-                    if [[ "$_compare_base" == "$_fetched_head" ]] && $_branch_exists; then
-                        echo "  $_new_name (no changes)"
-                        continue
-                    fi
-                    git -C "$_target_dir" branch -f "$session_name" FETCH_HEAD 2>/dev/null
-                    if $_branch_exists; then
-                        local _n_commits
-                        _n_commits=$(git -C "$_target_dir" rev-list --count "$_compare_base".."$session_name" 2>/dev/null || echo "?")
-                        success "  $_new_name → branch '$session_name' in $_target_dir ($_n_commits commit(s))"
-                    else
-                        success "  $_new_name → branch '$session_name' in $_target_dir"
-                    fi
-                    success_count=$((success_count + 1))
-                elif [[ -d "$_target_dir" ]]; then
-                    warn "  $_new_name → skipped (directory exists but not a git repo: $_target_dir)"
-                    fail_count=$((fail_count + 1))
+                local _fetched_head
+                _fetched_head=$(git -C "$_target_dir" rev-parse FETCH_HEAD 2>/dev/null)
+                local _compare_base
+                local _branch_exists=false
+                if git -C "$_target_dir" show-ref --verify --quiet "refs/heads/$session_name" 2>/dev/null; then
+                    _compare_base=$(git -C "$_target_dir" rev-parse "refs/heads/$session_name" 2>/dev/null)
+                    _branch_exists=true
                 else
-                    # Truly new repo — clone from bundle
-                    if git clone "$_bundle" "$_target_dir" 2>/dev/null; then
-                        # Ensure main branch exists (bundles only have HEAD ref)
-                        git -C "$_target_dir" checkout -b main 2>/dev/null || true
-                        git -C "$_target_dir" branch -f "$session_name" HEAD 2>/dev/null || true
-                        local _commit_count
-                        _commit_count=$(git -C "$_target_dir" rev-list --count HEAD 2>/dev/null || echo "?")
-                        success "  $_new_name → cloned to $_target_dir ($_commit_count commit(s))"
-                        success_count=$((success_count + 1))
-                    else
-                        error "  $_new_name → clone failed"
-                        fail_count=$((fail_count + 1))
-                    fi
+                    _compare_base=$(git -C "$_target_dir" rev-parse HEAD 2>/dev/null)
                 fi
-            done
-        fi
+                if [[ "$_compare_base" == "$_fetched_head" ]] && $_branch_exists; then
+                    echo "  $_new_name (no changes)"
+                    continue
+                fi
+                git -C "$_target_dir" branch -f "$session_name" FETCH_HEAD 2>/dev/null
+                if $_branch_exists; then
+                    local _n_commits
+                    _n_commits=$(git -C "$_target_dir" rev-list --count "$_compare_base".."$session_name" 2>/dev/null || echo "?")
+                    success "  $_new_name → branch '$session_name' in $_target_dir ($_n_commits commit(s))"
+                else
+                    success "  $_new_name → branch '$session_name' in $_target_dir"
+                fi
+                success_count=$((success_count + 1))
+            elif [[ -d "$_target_dir" ]]; then
+                warn "  $_new_name → skipped (directory exists but not a git repo: $_target_dir)"
+                fail_count=$((fail_count + 1))
+            else
+                # Truly new repo — clone from bundle
+                if git clone "$_bundle" "$_target_dir" 2>/dev/null; then
+                    # Ensure main branch exists (bundles only have HEAD ref)
+                    git -C "$_target_dir" checkout -b main 2>/dev/null || true
+                    git -C "$_target_dir" branch -f "$session_name" HEAD 2>/dev/null || true
+                    local _commit_count
+                    _commit_count=$(git -C "$_target_dir" rev-list --count HEAD 2>/dev/null || echo "?")
+                    success "  $_new_name → cloned to $_target_dir ($_commit_count commit(s))"
+                    success_count=$((success_count + 1))
+                else
+                    error "  $_new_name → clone failed"
+                    fail_count=$((fail_count + 1))
+                fi
+            fi
+        done
     fi
 
     echo ""

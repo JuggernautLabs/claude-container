@@ -220,6 +220,13 @@ _status_verify() {
         return 0
     fi
 
+    # Build set of known config project names
+    local -A _config_names
+    while IFS='|' read -r _cn _cp; do
+        [[ -z "$_cn" ]] && continue
+        _config_names[$_cn]=1
+    done <<< "$projects"
+
     info "Verifying session '$session_name' against '$target_branch'"
     echo ""
 
@@ -228,12 +235,24 @@ _status_verify() {
     local extracted_only=0
     local not_extracted=0
     local missing=0
+    local new_repos=0
 
     local i=0
     for proj_name in "${_all_names[@]}"; do
         local session_head="${_all_heads[$i]}"
         local proj_path="${_all_paths[$i]}"
         i=$((i + 1))
+
+        # Detect repos created in-session (not in original config)
+        if [[ -z "${_config_names[$proj_name]:-}" ]]; then
+            if [[ -d "$proj_path" ]]; then
+                info "  $proj_name: new (created in session, host exists at $proj_path)"
+            else
+                warn "  $proj_name: new (created in session, no host repo)"
+            fi
+            new_repos=$((new_repos + 1))
+            continue
+        fi
 
         local status
         status=$(check_repo_sync_status "$session_head" "$proj_path" "$session_name" "$target_branch")
@@ -266,6 +285,9 @@ _status_verify() {
     local total=${#_all_names[@]}
     local ok=$((synced + unchanged))
     echo "  $ok/$total ok ($synced synced, $unchanged unchanged), $extracted_only extracted-only, $not_extracted pending, $missing missing"
+    if [[ $new_repos -gt 0 ]]; then
+        echo "  $new_repos new repo(s) created in session (use 'pull' to extract)"
+    fi
 
     if [[ $not_extracted -gt 0 ]] || [[ $missing -gt 0 ]]; then
         return 1
