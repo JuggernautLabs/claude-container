@@ -723,11 +723,33 @@ if $USE_GIT_SESSION; then
         info "Session config: $session_config"
     fi
 
+    # Track whether session already exists (for --discover-repos on re-entry)
+    _session_existed=false
+    if docker volume inspect "$GIT_SESSION_VOLUME" &>/dev/null; then
+        _session_existed=true
+    fi
+
     # Handle --clone-from: clone volumes from existing session if target doesn't exist
-    if [[ -n "$CLONE_FROM" ]] && ! docker volume inspect "$GIT_SESSION_VOLUME" &>/dev/null; then
+    if [[ -n "$CLONE_FROM" ]] && ! $_session_existed; then
         session_clone "$CLONE_FROM" "$SESSION_NAME"
     else
         create_git_session "$SESSION_NAME" "$WORKSPACE_DIR"
+    fi
+
+    # If --discover-repos was used on an existing session, add any new repos
+    # (create_multi_project_session returns early for existing volumes, so
+    # discovered repos would be silently dropped without this)
+    if $_session_existed && [[ ${#DISCOVER_REPOS_DIRS[@]} -gt 0 ]]; then
+        _disc_config="$SESSIONS_CONFIG_DIR/${SESSION_NAME}.yml"
+        if [[ -f "$_disc_config" ]]; then
+            # Build name|path pairs from discovered config
+            _bulk_repos=""
+            while IFS='|' read -r _dname _dpath _dbranch _dtrack _dsource; do
+                [[ -z "$_dname" ]] && continue
+                _bulk_repos+="$_dname|$_dpath"$'\n'
+            done <<< "$(parse_config_file "$_disc_config")"
+            session_add_repos_bulk "$SESSION_NAME" "$_bulk_repos"
+        fi
     fi
 
     # Persist session metadata so resuming only needs: claude-container -s <name>

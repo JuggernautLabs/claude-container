@@ -447,6 +447,141 @@ session_restart() {
     exec "$script_path" --session "$session" --continue "${extra_args[@]}"
 }
 
+# Bulk-add repos to an existing session (parallel cloning)
+# Usage: session_add_repos_bulk <session_name> <repos>
+#   repos = newline-separated "workspace_name|host_path" pairs
+# Skips repos that already exist in the session.
+session_add_repos_bulk() {
+    local session="$1"
+    local repos="$2"
+    local volume="claude-session-${session}"
+
+    if ! docker volume inspect "$volume" &>/dev/null; then
+        error "Session not found: $session"
+        return 1
+    fi
+
+    local git_image="${IMAGE_NAME:-$DEFAULT_IMAGE}"
+    local host_uid
+    host_uid=$(get_host_uid)
+
+    # Read existing session config to filter already-present repos
+    local existing_config
+    existing_config=$(read_session_config "$volume" 2>/dev/null || true)
+    local existing_names=""
+    if [[ -n "$existing_config" ]]; then
+        while IFS='|' read -r _pname _ppath; do
+            [[ -z "$_pname" ]] && continue
+            existing_names+="$_pname"$'\n'
+        done <<< "$(parse_session_projects "$existing_config")"
+    fi
+
+    # Collect new repos to add
+    local -a new_names=()
+    local -a new_paths=()
+    while IFS='|' read -r ws_name host_path; do
+        [[ -z "$ws_name" ]] && continue
+        if echo "$existing_names" | grep -qxF "$ws_name"; then
+            continue
+        fi
+        new_names+=("$ws_name")
+        new_paths+=("$host_path")
+    done <<< "$repos"
+
+    if [[ ${#new_names[@]} -eq 0 ]]; then
+        info "All discovered repos already in session"
+        return 0
+    fi
+
+    info "Adding ${#new_names[@]} new repo(s) to session..."
+
+    # Clone in parallel (same pattern as create_multi_project_session)
+    local pids=()
+    local log_dir="$CACHE_DIR/add-logs-$$"
+    mkdir -p "$log_dir"
+    local start_time=$SECONDS
+
+    for i in "${!new_names[@]}"; do
+        local proj_name="${new_names[$i]}"
+        local source_path="${new_paths[$i]}"
+        local safe_log_name="${proj_name//\//_}"
+
+        (
+            docker run --rm \
+                --user "$host_uid:$host_uid" \
+                -v "$source_path:/source:ro" \
+                -v "$volume:/session" \
+                "$git_image" \
+                sh -c "
+                    mkdir -p /session/$(dirname "$proj_name") && \
+                    git -c safe.directory='*' clone --depth 1 /source '/session/$proj_name' && \
+                    cd '/session/$proj_name' && \
+                    git remote remove origin 2>/dev/null || true && \
+                    git config user.email 'claude@container' && \
+                    git config user.name 'Claude' && \
+                    du -sh '/session/$proj_name' | cut -f1
+                " > "$log_dir/$safe_log_name.log" 2>&1
+            echo $? > "$log_dir/$safe_log_name.status"
+        ) &
+        pids+=($!)
+    done
+
+    # Wait and report
+    local failed=0
+    local remaining=${#pids[@]}
+
+    while [[ $remaining -gt 0 ]]; do
+        wait -n "${pids[@]}" 2>/dev/null || true
+        for i in "${!pids[@]}"; do
+            [[ -z "${pids[$i]}" ]] && continue
+            local safe_log_name="${new_names[$i]//\//_}"
+            local status_file="$log_dir/$safe_log_name.status"
+            if [[ -f "$status_file" ]]; then
+                local elapsed=$((SECONDS - start_time))
+                local status=$(cat "$status_file")
+                if [[ "$status" == "0" ]]; then
+                    local size=$(tail -1 "$log_dir/$safe_log_name.log")
+                    success "  ${new_names[$i]} (${size})"
+                else
+                    error "  ${new_names[$i]} failed"
+                    cat "$log_dir/$safe_log_name.log" >&2
+                    failed=1
+                fi
+                pids[$i]=""
+                remaining=$((remaining - 1))
+            fi
+        done
+    done
+
+    rm -rf "$log_dir"
+
+    # Update .claude-projects.yml in one batch
+    local config_append=""
+    for i in "${!new_names[@]}"; do
+        config_append+="  \"${new_names[$i]}\":
+    path: ${new_paths[$i]}
+"
+    done
+
+    if [[ -n "$config_append" ]]; then
+        echo "$config_append" | docker run --rm -i \
+            --user "$host_uid:$host_uid" \
+            -v "$volume:/session" \
+            "$git_image" \
+            sh -c 'cat >> /session/.claude-projects.yml' 2>/dev/null || true
+    fi
+
+    # Update manifest
+    write_repo_manifest "$volume"
+
+    if [[ "$failed" == "1" ]]; then
+        warn "Some repos failed to clone"
+        return 1
+    fi
+
+    success "Added ${#new_names[@]} new repo(s) to session '$session'"
+}
+
 # Add a new repo to an existing session
 # Usage: session_add_repo <session_name> <repo_path> [workspace_path]
 session_add_repo() {
