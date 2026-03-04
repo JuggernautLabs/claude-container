@@ -3,16 +3,22 @@
 # List all claude-container sessions
 #
 # Usage:
-#   claude-container list                  # full table with sizes
+#   claude-container list                  # fast: names + last opened
+#   claude-container list --sizes          # include disk usage (slow)
 #   claude-container list --name-only      # just session names
 
 cmd_list() {
     local name_only=false
+    local show_sizes=false
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --name-only|-n)
                 name_only=true
+                shift
+                ;;
+            --sizes|-S)
+                show_sizes=true
                 shift
                 ;;
             --help|-h)
@@ -32,7 +38,7 @@ cmd_list() {
         esac
     done
 
-    session_list "$name_only"
+    session_list "$name_only" "$show_sizes"
 }
 
 _list_help() {
@@ -42,14 +48,18 @@ Usage: claude-container list [options]
 List all claude-container sessions.
 
 Options:
-  --name-only, -n    Print only session names (no sizes, fast)
+  --sizes, -S        Include disk usage per volume (slow — runs du in container)
+  --name-only, -n    Print only session names (no table)
   --help, -h         Show this help
 
 Examples:
-  # Full table with disk usage per volume
+  # List sessions with last-opened time (fast)
   claude-container list
 
-  # Just session names (fast, no Docker scan)
+  # Include disk usage (slower)
+  claude-container list --sizes
+
+  # Just session names
   claude-container list --name-only
 
   # Use in scripts

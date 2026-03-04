@@ -192,6 +192,7 @@ session_cleanup_unused() {
 # Usage: session_list
 session_list() {
     local name_only="${1:-false}"
+    local show_sizes="${2:-false}"
 
     # Get all claude volumes
     local all_volumes
@@ -218,43 +219,106 @@ session_list() {
         return 0
     fi
 
-    # Get all sizes in one container run (with total)
-    echo "Scanning $(echo "$all_volumes" | wc -l | tr -d ' ') volumes..."
-    local sizes_with_total
-    sizes_with_total=$(get_volume_sizes_batch_with_total "$all_volumes")
+    local sessions_config="${SESSIONS_CONFIG_DIR:-$HOME/.config/claude-container/sessions}"
 
-    # Parse sizes into associative array
+    # Sizes mode: scan volumes (slow)
     declare -A vol_sizes
-    local total_human="?"
-    while IFS='|' read -r vol size; do
-        [[ -z "$vol" ]] && continue
-        if [[ "$vol" == "TOTAL" ]]; then
-            total_human="$size"
-        else
-            vol_sizes[$vol]="$size"
+    local total_human=""
+    if [[ "$show_sizes" == "true" ]]; then
+        echo "Scanning $(echo "$all_volumes" | wc -l | tr -d ' ') volumes..."
+        local sizes_with_total
+        sizes_with_total=$(get_volume_sizes_batch_with_total "$all_volumes")
+
+        while IFS='|' read -r vol size; do
+            [[ -z "$vol" ]] && continue
+            if [[ "$vol" == "TOTAL" ]]; then
+                total_human="$size"
+            else
+                vol_sizes[$vol]="$size"
+            fi
+        done <<< "$sizes_with_total"
+    fi
+
+    # Compute last-opened for each session (fast — just stat on host files)
+    local now_epoch
+    now_epoch=$(date +%s)
+
+    _format_last_opened() {
+        local env_file="$1"
+        if [[ ! -f "$env_file" ]]; then
+            echo "-"
+            return
         fi
-    done <<< "$sizes_with_total"
+        local mtime_epoch
+        mtime_epoch=$(stat -f %m "$env_file" 2>/dev/null || stat -c %Y "$env_file" 2>/dev/null || echo "0")
+        if [[ "$mtime_epoch" -le 0 ]]; then
+            echo "-"
+            return
+        fi
+        local days_ago=$(( (now_epoch - mtime_epoch) / 86400 ))
+        if [[ $days_ago -eq 0 ]]; then
+            echo "today"
+        elif [[ $days_ago -eq 1 ]]; then
+            echo "yesterday"
+        elif [[ $days_ago -lt 30 ]]; then
+            echo "${days_ago}d ago"
+        else
+            date -r "$mtime_epoch" "+%Y-%m-%d" 2>/dev/null \
+                || date -d "@$mtime_epoch" "+%Y-%m-%d" 2>/dev/null \
+                || echo "${days_ago}d ago"
+        fi
+    }
 
     # Display table
     echo ""
-    printf "%-30s %10s %10s %10s %10s %10s\n" "SESSION" "WORKSPACE" "STATE" "CARGO" "NPM" "PIP"
-    printf "%-30s %10s %10s %10s %10s %10s\n" "-------" "---------" "-----" "-----" "---" "---"
+    if [[ "$show_sizes" == "true" ]]; then
+        printf "%-30s %12s %10s %10s %10s %10s %10s\n" "SESSION" "LAST OPENED" "WORKSPACE" "STATE" "CARGO" "NPM" "PIP"
+        printf "%-30s %12s %10s %10s %10s %10s %10s\n" "-------" "-----------" "---------" "-----" "-----" "---" "---"
+    else
+        printf "%-30s %12s\n" "SESSION" "LAST OPENED"
+        printf "%-30s %12s\n" "-------" "-----------"
+    fi
 
-    for session in $(echo "${!sessions[@]}" | tr ' ' '\n' | sort); do
-        local ws="${vol_sizes[claude-session-$session]:-"-"}"
-        local st="${vol_sizes[claude-state-$session]:-"-"}"
-        local ca="${vol_sizes[claude-cargo-$session]:-"-"}"
-        local np="${vol_sizes[claude-npm-$session]:-"-"}"
-        local pi="${vol_sizes[claude-pip-$session]:-"-"}"
-        printf "%-30s %10s %10s %10s %10s %10s\n" "$session" "$ws" "$st" "$ca" "$np" "$pi"
+    # Sort sessions by most recently used (mtime descending), then alphabetical fallback
+    local _sorted_sessions=""
+    for _s in "${!sessions[@]}"; do
+        local _env="$sessions_config/${_s}.env"
+        local _mt=0
+        if [[ -f "$_env" ]]; then
+            _mt=$(stat -f %m "$_env" 2>/dev/null || stat -c %Y "$_env" 2>/dev/null || echo "0")
+        fi
+        _sorted_sessions+="$_mt $_s"$'\n'
     done
+    _sorted_sessions=$(echo "$_sorted_sessions" | sort -t' ' -k1 -rn -k2)
+
+    while read -r _mtime session; do
+        [[ -z "$session" ]] && continue
+        local last_opened
+        last_opened=$(_format_last_opened "$sessions_config/${session}.env")
+
+        if [[ "$show_sizes" == "true" ]]; then
+            local ws="${vol_sizes[claude-session-$session]:-"-"}"
+            local st="${vol_sizes[claude-state-$session]:-"-"}"
+            local ca="${vol_sizes[claude-cargo-$session]:-"-"}"
+            local np="${vol_sizes[claude-npm-$session]:-"-"}"
+            local pi="${vol_sizes[claude-pip-$session]:-"-"}"
+            printf "%-30s %12s %10s %10s %10s %10s %10s\n" "$session" "$last_opened" "$ws" "$st" "$ca" "$np" "$pi"
+        else
+            printf "%-30s %12s\n" "$session" "$last_opened"
+        fi
+    done <<< "$_sorted_sessions"
 
     echo ""
-    echo "Total disk usage: $total_human"
-    echo ""
+    if [[ -n "$total_human" ]]; then
+        echo "Total disk usage: $total_human"
+        echo ""
+    fi
     echo "Commands:"
-    echo "  Delete session:  claude-container --delete <name>"
+    echo "  Delete session:  claude-container -s <name> --delete"
     echo "  Pull session:    claude-container pull -s <name>"
+    if [[ "$show_sizes" != "true" ]]; then
+        echo "  Show sizes:      claude-container list --sizes"
+    fi
 }
 
 # Delete a specific session and all its volumes

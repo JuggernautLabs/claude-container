@@ -60,6 +60,13 @@ Ask if they want to continue an existing conversation (adds `--continue` flag).
 ### Optional: Docker Access
 Ask if they need Docker commands inside the container (adds `--docker` flag).
 
+### Optional: Port Exposure
+Ask if they need to expose any ports (e.g., web servers, APIs). Each port adds `--port <port>`.
+- `--port 3000` maps port 3000 on both host and container
+- `--port 8080:80` maps host 8080 to container 80
+- Ports are persisted in session metadata — they stick across re-entries
+- Multiple `--port` flags can be stacked
+
 ### Optional: Custom Dockerfile
 Ask if they want a custom Dockerfile instead of the default image.
 
@@ -79,6 +86,7 @@ Options:
 - `--as-user` - user mode
 - `--continue` - continue conversation
 - `--docker` - Docker access
+- `--port <port>` - expose port (repeatable)
 - `--dockerfile [path]` - custom Dockerfile
 
 ## Step 3: Validate with --no-run
@@ -149,8 +157,14 @@ claude-container -s my-feature --continue
 # With Docker access
 claude-container -s my-feature --docker
 
+# Expose ports (persisted across re-entries)
+claude-container -s my-feature --port 3000 --port 8080:80
+
 # Custom Dockerfile
 claude-container -s my-feature --dockerfile
+
+# Clone an existing session (e.g., to add ports to running work)
+claude-container -s new-session --clone-from old-session --port 3000
 ```
 
 ## Pulling Changes to Host
@@ -199,12 +213,23 @@ Rebase:
 ## Session Management
 
 ```bash
-# List sessions
-claude-container --sessions
+# List sessions (fast: names + last opened, sorted by most recent)
+claude-container list
+
+# List with disk usage (slower — scans volumes)
+claude-container list --sizes
+
+# List names only
+claude-container list --name-only
 
 # Delete session
 claude-container -s my-feature --delete
 claude-container -s my-feature --delete --yes
+
+# Remove repos from session
+claude-container remove -s my-feature --include cllient          # remove matching
+claude-container remove -s my-feature --include juggernaut --exclude substrate  # combine
+claude-container remove -s my-feature --include '*tui*' --dry-run  # preview
 
 # Repair corrupted config
 claude-container -s my-feature --repair
@@ -262,8 +287,12 @@ Long-running sessions:
 | Push + rebase | `claude-container push -s NAME main --rebase` |
 | Check sync state | `claude-container status -s NAME main` |
 | Delete session | `claude-container -s NAME --delete -y` |
+| Remove repos | `claude-container remove -s NAME --include PATTERN` |
 | Repair session | `claude-container -s NAME --repair` |
-| List sessions | `claude-container --sessions` |
+| List sessions | `claude-container list` |
+| List with sizes | `claude-container list --sizes` |
+| Clone session | `claude-container -s NEW --clone-from OLD` |
+| Expose ports | `claude-container -s NAME --port 3000` |
 | With Docker | `claude-container -s NAME --docker` |
 | Custom Dockerfile | `claude-container -s NAME --dockerfile` |
 | Shell only | `claude-container -s NAME --shell` |
