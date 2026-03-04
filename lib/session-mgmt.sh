@@ -956,11 +956,43 @@ session_sync() {
     local -a conflict_projects=()
     local -a dirty_projects=()
     local -a summary_lines=()
+    local _util_image="${GIT_UTIL_IMAGE:-alpine/git}"
+
+    # Fast path: get all session HEADs + dirty/rebase status in ONE docker run
+    local _sync_scan
+    _sync_scan=$(docker run --rm --entrypoint sh \
+        -v "$volume:/session:ro" \
+        "$_util_image" \
+        -c '
+            git config --global --add safe.directory "*"
+            for d in /session/*/ /session/*/*/; do
+                [ -d "$d/.git" ] || continue
+                name="${d#/session/}"
+                name="${name%/}"
+                head=$(cd "$d" && git rev-parse HEAD 2>/dev/null)
+                [ -z "$head" ] && continue
+                dirty=$(cd "$d" && git status --porcelain 2>/dev/null | head -1)
+                rebase="no"
+                [ -d "$d/.git/rebase-merge" ] || [ -d "$d/.git/rebase-apply" ] && rebase="yes"
+                echo "$name|$head|${dirty:+dirty}|$rebase"
+            done
+        ' 2>/dev/null) || true
+
+    # Build lookups
+    declare -A _sync_head _sync_dirty _sync_rebase
+    while IFS='|' read -r _sn _sh _sd _sr; do
+        [[ -z "$_sn" ]] && continue
+        _sync_head[$_sn]="$_sh"
+        [[ -n "$_sd" ]] && _sync_dirty[$_sn]=1
+        [[ "$_sr" == "yes" ]] && _sync_rebase[$_sn]=1
+    done <<< "$_sync_scan"
+
+    # Validate projects and find which actually need rebasing
+    local -a _need_rebase=()  # "name|path" entries that need docker run
 
     while IFS='|' read -r proj_name proj_path; do
         [[ -z "$proj_name" ]] && continue
 
-        # Skip if original repo doesn't exist
         if [[ ! -d "$proj_path" ]]; then
             warn "  Skipping $proj_name (original not found: $proj_path)"
             skip_count=$((skip_count + 1))
@@ -968,7 +1000,6 @@ session_sync() {
             continue
         fi
 
-        # Check if target branch exists in original repo
         if ! git -C "$proj_path" show-ref --verify --quiet "refs/heads/$target_branch" 2>/dev/null; then
             warn "  Skipping $proj_name (branch '$target_branch' not found)"
             skip_count=$((skip_count + 1))
@@ -976,89 +1007,109 @@ session_sync() {
             continue
         fi
 
-        info "  Syncing $proj_name..."
-
-        # Check for stale rebase in progress — abort it so we can start fresh
-        local rebase_in_progress
-        rebase_in_progress=$(docker run --rm \
-            -v "$volume:/session:ro" \
-            "$git_image" \
-            sh -c "test -d '/session/$proj_name/.git/rebase-merge' -o -d '/session/$proj_name/.git/rebase-apply' && echo 'yes' || echo 'no'" 2>/dev/null)
-
-        if [[ "$rebase_in_progress" == "yes" ]]; then
-            warn "    $proj_name has stale rebase in progress, aborting to start fresh..."
-            local host_uid_abort
-            host_uid_abort=$(get_host_uid)
-            docker run --rm \
-                --user "$host_uid_abort:$host_uid_abort" \
-                -v "$volume:/session" \
-                "$git_image" \
-                sh -c "cd '/session/$proj_name' && git -c safe.directory='*' rebase --abort" 2>/dev/null || true
-        fi
-
-        # Check for uncommitted/unstaged changes BEFORE rebasing
-        local dirty_status
-        dirty_status=$(docker run --rm \
-            -v "$volume:/session:ro" \
-            "$git_image" \
-            sh -c "git config --global --add safe.directory '*' && cd '/session/$proj_name' && git status --porcelain" 2>/dev/null)
-
-        if [[ -n "$dirty_status" ]]; then
-            warn "    $proj_name has uncommitted changes (will need manual commit/stash)"
-            # Show first few changed files
-            echo "$dirty_status" | head -3 | sed 's/^/      /'
-            local change_count
-            change_count=$(echo "$dirty_status" | wc -l | tr -d ' ')
-            if [[ $change_count -gt 3 ]]; then
-                echo "      ... and $((change_count - 3)) more"
-            fi
+        # Check dirty (from scan)
+        if [[ -n "${_sync_dirty[$proj_name]:-}" ]]; then
+            warn "  $proj_name has uncommitted changes (will need manual commit/stash)"
             dirty_count=$((dirty_count + 1))
             dirty_projects+=("$proj_name")
             summary_lines+=("- $proj_name: DIRTY (uncommitted changes)")
             continue
         fi
 
-        # Add remote, fetch, and rebase in one docker run
-        # Mount original repo read-only
-        local rebase_output
+        # Fast "already up to date" check: is host's target_branch HEAD an ancestor
+        # of the session HEAD? If so, session already contains all target commits.
+        local _session_h="${_sync_head[$proj_name]:-}"
+        local _target_h
+        _target_h=$(git -C "$proj_path" rev-parse "refs/heads/$target_branch" 2>/dev/null || echo "")
+
+        if [[ -n "$_session_h" && -n "$_target_h" ]]; then
+            # Check if target branch commit exists in session repo
+            # We can't use merge-base across different repos, but if the session
+            # was cloned from this host repo, the commit should be reachable.
+            # Quick check: if session HEAD == target HEAD, definitely up to date.
+            # Otherwise we need to actually run the rebase.
+            if [[ "$_session_h" == "$_target_h" ]]; then
+                echo -e "  ${BLUE}—${NC} $proj_name (up to date)"
+                success_count=$((success_count + 1))
+                summary_lines+=("- $proj_name: up to date")
+                continue
+            fi
+            # Check if target is ancestor of session HEAD on the host
+            # (works when session branch was extracted to host)
+            if git -C "$proj_path" show-ref --verify --quiet "refs/heads/$session_name" 2>/dev/null; then
+                local _local_session_h
+                _local_session_h=$(git -C "$proj_path" rev-parse "refs/heads/$session_name" 2>/dev/null)
+                if [[ "$_local_session_h" == "$_session_h" ]] && \
+                   git -C "$proj_path" merge-base --is-ancestor "$_target_h" "$_session_h" 2>/dev/null; then
+                    echo -e "  ${BLUE}—${NC} $proj_name (up to date)"
+                    success_count=$((success_count + 1))
+                    summary_lines+=("- $proj_name: up to date")
+                    continue
+                fi
+            fi
+        fi
+
+        _need_rebase+=("$proj_name|$proj_path")
+    done <<< "$projects"
+
+    # Only run docker containers for repos that actually need rebasing
+    if [[ ${#_need_rebase[@]} -gt 0 ]]; then
+        info "Rebasing ${#_need_rebase[@]} repo(s)..."
         local host_uid
         host_uid=$(get_host_uid)
 
-        # Note: git rebase exits non-zero on conflicts, so || true prevents
-        # set -e from killing the script before we can check the output
-        rebase_output=$(docker run --rm \
-            --user "$host_uid:$host_uid" \
-            -v "$volume:/session" \
-            -v "$proj_path:/upstream:ro" \
-            "$git_image" \
-            sh -c "
-                cd '/session/$proj_name'
-                git -c safe.directory='*' remote remove upstream 2>/dev/null || true
-                git -c safe.directory='*' remote add upstream /upstream
-                git -c safe.directory='*' fetch upstream '$target_branch' 2>&1
-                git -c safe.directory='*' rebase 'upstream/$target_branch' 2>&1
-            " 2>&1) || true
+        for _entry in "${_need_rebase[@]}"; do
+            local proj_name="${_entry%%|*}"
+            local proj_path="${_entry#*|}"
 
-        if echo "$rebase_output" | grep -qE "CONFLICT|Merge conflict|could not apply"; then
-            warn "    $proj_name has conflicts (Claude will resolve)"
-            conflict_count=$((conflict_count + 1))
-            conflict_projects+=("$proj_name")
-            summary_lines+=("- $proj_name: CONFLICTS (needs resolution)")
-        elif echo "$rebase_output" | grep -qE "error:|fatal:"; then
-            error "    $proj_name rebase failed:"
-            echo "$rebase_output" | grep -E "error:|fatal:" | head -3 | sed 's/^/      /'
-            skip_count=$((skip_count + 1))
-            summary_lines+=("- $proj_name: FAILED")
-        elif echo "$rebase_output" | grep -q "is up to date"; then
-            info "    $proj_name (already up to date)"
-            success_count=$((success_count + 1))
-            summary_lines+=("- $proj_name: up to date")
-        else
-            success "    $proj_name rebased successfully"
-            success_count=$((success_count + 1))
-            summary_lines+=("- $proj_name: rebased cleanly")
-        fi
-    done <<< "$projects"
+            info "  Syncing $proj_name..."
+
+            # Abort stale rebase if needed
+            if [[ -n "${_sync_rebase[$proj_name]:-}" ]]; then
+                warn "    $proj_name has stale rebase in progress, aborting..."
+                docker run --rm --entrypoint sh \
+                    --user "$host_uid:$host_uid" \
+                    -v "$volume:/session" \
+                    "$_util_image" \
+                    -c "cd '/session/$proj_name' && git -c safe.directory='*' rebase --abort" 2>/dev/null || true
+            fi
+
+            # Rebase: needs full image for potential conflict markers
+            local rebase_output
+            rebase_output=$(docker run --rm \
+                --user "$host_uid:$host_uid" \
+                -v "$volume:/session" \
+                -v "$proj_path:/upstream:ro" \
+                "$git_image" \
+                sh -c "
+                    cd '/session/$proj_name'
+                    git -c safe.directory='*' remote remove upstream 2>/dev/null || true
+                    git -c safe.directory='*' remote add upstream /upstream
+                    git -c safe.directory='*' fetch upstream '$target_branch' 2>&1
+                    git -c safe.directory='*' rebase 'upstream/$target_branch' 2>&1
+                " 2>&1) || true
+
+            if echo "$rebase_output" | grep -qE "CONFLICT|Merge conflict|could not apply"; then
+                warn "    $proj_name has conflicts (Claude will resolve)"
+                conflict_count=$((conflict_count + 1))
+                conflict_projects+=("$proj_name")
+                summary_lines+=("- $proj_name: CONFLICTS (needs resolution)")
+            elif echo "$rebase_output" | grep -qE "error:|fatal:"; then
+                error "    $proj_name rebase failed:"
+                echo "$rebase_output" | grep -E "error:|fatal:" | head -3 | sed 's/^/      /'
+                skip_count=$((skip_count + 1))
+                summary_lines+=("- $proj_name: FAILED")
+            elif echo "$rebase_output" | grep -q "is up to date"; then
+                success "  $proj_name rebased (already up to date)"
+                success_count=$((success_count + 1))
+                summary_lines+=("- $proj_name: up to date")
+            else
+                success "  $proj_name rebased successfully"
+                success_count=$((success_count + 1))
+                summary_lines+=("- $proj_name: rebased cleanly")
+            fi
+        done
+    fi
 
     echo ""
     if [[ $conflict_count -gt 0 ]]; then
@@ -1077,11 +1128,11 @@ session_sync() {
     # Store sync state for cleanup message on exit
     local host_uid_sync
     host_uid_sync=$(get_host_uid)
-    docker run --rm \
+    docker run --rm --entrypoint sh \
         --user "$host_uid_sync:$host_uid_sync" \
         -v "$volume:/session" \
-        "$git_image" \
-        sh -c "echo '$target_branch' > /session/.sync-branch" 2>/dev/null || true
+        "$_util_image" \
+        -c "echo '$target_branch' > /session/.sync-branch" 2>/dev/null || true
 
     # Build sync summary as initial prompt for Claude (mirrors merge-into-summary)
     if [[ $conflict_count -gt 0 || $dirty_count -gt 0 ]]; then
@@ -1118,11 +1169,11 @@ session_sync() {
         sync_summary+=$'\n'"This will signal completion and terminate the session."
 
         # Write sync summary to volume for container startup
-        printf '%s' "$sync_summary" | docker run --rm -i \
+        printf '%s' "$sync_summary" | docker run --rm --entrypoint sh -i \
             --user "$host_uid_sync:$host_uid_sync" \
             -v "$volume:/session" \
-            "$git_image" \
-            sh -c 'cat > /session/.sync-summary' 2>/dev/null || true
+            "$_util_image" \
+            -c 'cat > /session/.sync-summary' 2>/dev/null || true
     fi
 
     echo ""
