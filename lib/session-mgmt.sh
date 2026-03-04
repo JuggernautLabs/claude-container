@@ -782,7 +782,7 @@ session_sync() {
 
     if [[ -z "$config_content" ]]; then
         error "No .claude-projects.yml found in session"
-        echo "Single-project sessions are not yet supported for --sync"
+        echo "Single-project sessions are not yet supported for push --rebase"
         exit 1
     fi
 
@@ -1235,7 +1235,7 @@ session_refresh() {
             elif git merge-base --is-ancestor FETCH_HEAD \"\$local_head\"; then
                 echo 'SAME|$proj_name|up to date'
             else
-                echo 'DIVERGE|$proj_name|session and host have diverged (use --force or --sync to rebase)'
+                echo 'DIVERGE|$proj_name|session and host have diverged (use --force or push --rebase)'
             fi
             git remote remove _host 2>/dev/null || true
         ) &"
@@ -1344,7 +1344,7 @@ session_refresh() {
         warn "$skip_count project(s) skipped"
     fi
     if [[ $fail_count -gt 0 ]]; then
-        warn "$fail_count project(s) diverged (use --sync to rebase)"
+        warn "$fail_count project(s) diverged (use push --rebase)"
     fi
 }
 
@@ -1369,7 +1369,7 @@ session_merge_into() {
 
     if [[ -z "$config_content" ]]; then
         error "No .claude-projects.yml found in session"
-        echo "Single-project sessions are not yet supported for --merge-into"
+        echo "Single-project sessions are not yet supported for push --merge"
         exit 1
     fi
 

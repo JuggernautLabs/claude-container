@@ -57,6 +57,9 @@ Ask how they want to specify repositories:
 ### Optional: Continue Conversation
 Ask if they want to continue an existing conversation (adds `--continue` flag).
 
+### Optional: Dirty Changes
+Ask if they want to capture uncommitted host changes into the session as a WIP commit (adds `--dirty` flag).
+
 ### Optional: Docker Access
 Ask if they need Docker commands inside the container (adds `--docker` flag).
 
@@ -87,6 +90,10 @@ Options:
 - `--continue` - continue conversation
 - `--docker` - Docker access
 - `--port <port>` - expose port (repeatable)
+- `--dirty` - capture uncommitted host changes as a WIP commit
+- `--config-only` - generate config file only, don't create session
+- `--no-interactive` - exit with error if no token found
+- `--no-config` - skip auto-discovery of .claude-projects.yml
 - `--dockerfile [path]` - custom Dockerfile
 
 ## Step 3: Validate with --no-run
@@ -140,6 +147,9 @@ claude-container -s my-feature -a ~/dev/app -a ~/dev/lib
 
 # Config file
 claude-container -s my-feature --config .claude-projects.yml
+
+# Capture uncommitted host changes
+claude-container -s my-feature --dirty
 
 # Prepare without starting
 claude-container -s my-feature --no-run
@@ -295,4 +305,6 @@ Long-running sessions:
 | Expose ports | `claude-container -s NAME --port 3000` |
 | With Docker | `claude-container -s NAME --docker` |
 | Custom Dockerfile | `claude-container -s NAME --dockerfile` |
+| Start with dirty changes | `claude-container -s NAME --dirty` |
+| Show session image | `claude-container image -s NAME` |
 | Shell only | `claude-container -s NAME --shell` |

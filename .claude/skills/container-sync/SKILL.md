@@ -22,7 +22,8 @@ The `push <branch> --rebase` command:
 3. **Fetches** the target branch from upstream
 4. **Rebases** session work onto the updated branch
 5. **Reports** conflicts (if any) for Claude to resolve
-6. **Starts** the container for interactive conflict resolution
+6. **Writes** a `.sync-summary` prompt for Claude with per-project status and conflict resolution instructions
+7. **Starts** the container for interactive conflict resolution
 
 After resolving conflicts and exiting, the user should pull with `--force`.
 
@@ -32,7 +33,7 @@ If not provided as arguments, ask the user:
 
 ### Session Name
 - Which session to sync
-- Use `claude-container --sessions` to list available sessions
+- Use `claude-container list` to list available sessions
 
 ### Target Branch
 - Which branch to rebase onto (default: `main`)
@@ -124,7 +125,7 @@ The `--force` flag is needed because the branch already exists from previous ext
 ## Push Commands
 
 ```bash
-# Fast-forward from host (session branch)
+# Fast-forward from host (default, same as --ff)
 claude-container push -s my-feature
 
 # Fast-forward a single repo from a specific branch
@@ -150,6 +151,32 @@ claude-container push -s my-feature main --merge
 - Optional `,branch` overrides which host branch to push from
 - Ambiguous partial matches are rejected with a list of candidates
 - Works with `--force` to reset diverged or ahead repos to host HEAD
+
+## Pull Commands
+
+```bash
+# Pull updated work (force overwrite local branches)
+claude-container pull -s my-feature --force
+
+# Preview what pull would do (no changes)
+claude-container pull -s my-feature main --dry-run
+
+# Full reconcile cycle against main
+claude-container pull -s my-feature main --reconcile
+```
+
+## Status Commands
+
+```bash
+# Check sync state
+claude-container status -s my-feature main
+
+# Show dirty (uncommitted) files on host
+claude-container status -s my-feature --dirty
+
+# Check a single repo
+claude-container status -s my-feature main --repo synapse
+```
 
 ## After Sync Workflow
 
@@ -221,7 +248,7 @@ The session starts so you can commit or stash the changes inside the container.
 ### "Session not found"
 The session doesn't exist. Check available sessions:
 ```bash
-claude-container --sessions
+claude-container list
 ```
 
 ### "No .claude-projects.yml found"

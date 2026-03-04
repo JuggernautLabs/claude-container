@@ -340,8 +340,8 @@ claude-container -s my-feature --config .claude-projects.yml
 All session commands use the `--session/-s` flag:
 
 ```bash
-# List all sessions with disk usage
-claude-container --sessions
+# List all sessions
+claude-container list
 
 # Pull session to host (extract branches)
 claude-container pull -s my-feature
@@ -385,7 +385,7 @@ claude-container -s my-feature --import ~/.claude
 
 ```bash
 # List sessions
-claude-container --sessions
+claude-container list
 
 # Cleanup all volumes
 claude-container --cleanup
