@@ -461,7 +461,7 @@ session_add_repos_bulk() {
         return 1
     fi
 
-    local git_image="${IMAGE_NAME:-$DEFAULT_IMAGE}"
+    local git_image="${GIT_UTIL_IMAGE:-alpine/git}"
     local host_uid
     host_uid=$(get_host_uid)
 
@@ -476,7 +476,7 @@ session_add_repos_bulk() {
         done <<< "$(parse_session_projects "$existing_config")"
     fi
 
-    # Collect new repos to add
+    # Collect repos not yet in config
     local -a new_names=()
     local -a new_paths=()
     while IFS='|' read -r ws_name host_path; do
@@ -493,67 +493,79 @@ session_add_repos_bulk() {
         return 0
     fi
 
-    info "Adding ${#new_names[@]} new repo(s) to session..."
+    # Check which repos already exist in the volume (e.g. from a previous interrupted run)
+    local volume_dirs
+    volume_dirs=$(docker run --rm --entrypoint sh -v "$volume:/session:ro" "$git_image" \
+        -c '
+            for d in /session/*/ /session/*/*/; do
+                [ -d "$d/.git" ] || continue
+                name="${d#/session/}"
+                name="${name%/}"
+                echo "$name"
+            done
+        ' 2>/dev/null) || true
 
-    # Clone in parallel (same pattern as create_multi_project_session)
-    local pids=()
-    local log_dir="$CACHE_DIR/add-logs-$$"
-    mkdir -p "$log_dir"
-    local start_time=$SECONDS
-
+    local -a clone_names=()
+    local -a clone_paths=()
+    local -a skip_names=()
     for i in "${!new_names[@]}"; do
-        local proj_name="${new_names[$i]}"
-        local source_path="${new_paths[$i]}"
-        local safe_log_name="${proj_name//\//_}"
-
-        (
-            docker run --rm \
-                --user "$host_uid:$host_uid" \
-                -v "$source_path:/source:ro" \
-                -v "$volume:/session" \
-                "$git_image" \
-                sh -c "
-                    mkdir -p /session/$(dirname "$proj_name") && \
-                    git -c safe.directory='*' clone --depth 1 /source '/session/$proj_name' && \
-                    cd '/session/$proj_name' && \
-                    git remote remove origin 2>/dev/null || true && \
-                    git config user.email 'claude@container' && \
-                    git config user.name 'Claude' && \
-                    du -sh '/session/$proj_name' | cut -f1
-                " > "$log_dir/$safe_log_name.log" 2>&1
-            echo $? > "$log_dir/$safe_log_name.status"
-        ) &
-        pids+=($!)
+        if echo "$volume_dirs" | grep -qxF "${new_names[$i]}"; then
+            skip_names+=("${new_names[$i]}")
+        else
+            clone_names+=("${new_names[$i]}")
+            clone_paths+=("${new_paths[$i]}")
+        fi
     done
 
-    # Wait and report
+    if [[ ${#skip_names[@]} -gt 0 ]]; then
+        info "${#skip_names[@]} repo(s) already in volume, registering in config"
+    fi
+
     local failed=0
-    local remaining=${#pids[@]}
 
-    while [[ $remaining -gt 0 ]]; do
-        wait -n "${pids[@]}" 2>/dev/null || true
-        for i in "${!pids[@]}"; do
-            [[ -z "${pids[$i]}" ]] && continue
-            local safe_log_name="${new_names[$i]//\//_}"
-            local status_file="$log_dir/$safe_log_name.status"
-            if [[ -f "$status_file" ]]; then
-                local elapsed=$((SECONDS - start_time))
-                local status=$(cat "$status_file")
-                if [[ "$status" == "0" ]]; then
-                    local size=$(tail -1 "$log_dir/$safe_log_name.log")
-                    success "  ${new_names[$i]} (${size})"
-                else
-                    error "  ${new_names[$i]} failed"
-                    cat "$log_dir/$safe_log_name.log" >&2
-                    failed=1
-                fi
-                pids[$i]=""
-                remaining=$((remaining - 1))
-            fi
+    # Clone repos that don't exist yet in a SINGLE container
+    if [[ ${#clone_names[@]} -gt 0 ]]; then
+        info "Cloning ${#clone_names[@]} new repo(s)..."
+
+        local -a docker_mounts=()
+        local clone_script=""
+        for i in "${!clone_names[@]}"; do
+            local proj_name="${clone_names[$i]}"
+            local source_path="${clone_paths[$i]}"
+            local safe_name="${proj_name//\//_}"
+            docker_mounts+=("-v" "$source_path:/sources/$safe_name:ro")
+            clone_script+="(
+                mkdir -p /session/$(dirname "$proj_name") && \
+                git -c safe.directory='*' clone --depth 1 /sources/$safe_name '/session/$proj_name' && \
+                cd '/session/$proj_name' && \
+                git remote remove origin 2>/dev/null || true && \
+                git config user.email 'claude@container' && \
+                git config user.name 'Claude' && \
+                size=\$(du -sh '/session/$proj_name' | cut -f1) && \
+                echo \"OK|$proj_name|\$size\" || echo \"FAIL|$proj_name\"
+            ) &
+"
         done
-    done
+        clone_script+="wait"
 
-    rm -rf "$log_dir"
+        local clone_output
+        clone_output=$(docker run --rm --entrypoint sh \
+            --user "$host_uid:$host_uid" \
+            "${docker_mounts[@]}" \
+            -v "$volume:/session" \
+            "$git_image" \
+            -c "$clone_script" 2>&1) || true
+
+        while IFS='|' read -r status name size; do
+            [[ -z "$status" ]] && continue
+            if [[ "$status" == "OK" ]]; then
+                success "  $name ($size)"
+            else
+                error "  $name failed"
+                failed=1
+            fi
+        done <<< "$clone_output"
+    fi
 
     # Update .claude-projects.yml in one batch
     local config_append=""
@@ -564,11 +576,11 @@ session_add_repos_bulk() {
     done
 
     if [[ -n "$config_append" ]]; then
-        echo "$config_append" | docker run --rm -i \
+        echo "$config_append" | docker run --rm --entrypoint sh -i \
             --user "$host_uid:$host_uid" \
             -v "$volume:/session" \
             "$git_image" \
-            sh -c 'cat >> /session/.claude-projects.yml' 2>/dev/null || true
+            -c 'cat >> /session/.claude-projects.yml' 2>/dev/null || true
     fi
 
     # Update manifest
@@ -790,6 +802,9 @@ session_add_repo() {
                 fi
             fi
         " 2>/dev/null || true
+
+    # Update manifest so pull doesn't treat this repo as "new"
+    write_repo_manifest "$volume"
 }
 
 # Import a claude-code session into a container session
@@ -1757,6 +1772,7 @@ session_extract() {
     fi
 
     info "Extracting session '$session_name'..."
+    local _util_image="${GIT_UTIL_IMAGE:-alpine/git}"
 
     # Detect workspace changes (renames, additions, deletions) since session creation
     local _old_manifest _new_manifest
@@ -1770,15 +1786,15 @@ session_extract() {
 
     # Check if multi-project (has .claude-projects.yml)
     local has_config
-    has_config=$(docker run --rm -v "$volume:/session:ro" "$git_image" \
-        sh -c 'test -f /session/.claude-projects.yml && echo yes || echo no' 2>/dev/null)
+    has_config=$(docker run --rm --entrypoint sh -v "$volume:/session:ro" "$_util_image" \
+        -c 'test -f /session/.claude-projects.yml && echo yes || echo no' 2>/dev/null)
 
     if [[ "$has_config" == "yes" ]]; then
         local config_content
         config_content=$(read_session_config "$volume")
-        _extract_multi_project_direct "$session_name" "$volume" "$git_image" "$config_content" "$force"
+        _extract_multi_project_direct "$session_name" "$volume" "$_util_image" "$config_content" "$force" "$_old_manifest"
     else
-        _extract_single_project_direct "$session_name" "$volume" "$git_image" "$force"
+        _extract_single_project_direct "$session_name" "$volume" "$_util_image" "$force"
     fi
 }
 
@@ -1790,6 +1806,7 @@ _extract_multi_project_direct() {
     local git_image="$3"
     local config_content="$4"
     local force="$5"
+    local old_manifest="${6:-}"
 
     info "Multi-project session detected"
     echo ""
@@ -1828,36 +1845,164 @@ _extract_multi_project_direct() {
         return 0
     fi
 
-    # Phase 2: Create all bundles in a single container run (parallel)
-    info "Bundling ${#_valid_projects[@]} project(s)..."
-    docker run --rm \
-        -v "$volume:/session:ro" \
-        -v "$bundle_dir:/bundles" \
-        "$git_image" \
-        sh -c '
-            git config --global --add safe.directory "*"
-            while IFS= read -r proj; do
-                [ -z "$proj" ] && continue
-                safe=$(echo "$proj" | tr "/" "_")
-                (
-                    if cd "/session/$proj" 2>/dev/null; then
-                        git bundle create "/tmp/${safe}.bundle" HEAD 2>/dev/null && \
-                            mv "/tmp/${safe}.bundle" "/bundles/${safe}.bundle" 2>/dev/null || true
-                    fi
-                ) &
-            done < /bundles/.projects
-            wait
-        ' 2>/dev/null || true
+    # Build config name set (needed by Phase 2 for non-config repo detection + Phase 4)
+    declare -A _config_names
+    while IFS='|' read -r _pname _ppath; do
+        [[ -z "$_pname" ]] && continue
+        _config_names[$_pname]=1
+    done <<< "$projects"
+    for _mhr in "${_missing_host_repos[@]}"; do
+        _config_names[${_mhr%%|*}]=1
+    done
 
-    # Phase 3: Process each project on the host (fetch + branch — all local, fast)
+    # Phase 2: Get session HEADs + .git sizes (single fast docker run), then only bundle changed repos.
+    # Docker Desktop volume I/O is slow — bundling all repos takes ~90s for 20+ repos.
+    # By comparing HEADs first, we skip repos with no changes (typically most of them).
+    local _session_heads
+    _session_heads=$(docker run --rm --entrypoint sh \
+        -v "$volume:/session:ro" \
+        "$git_image" \
+        -c '
+            git config --global --add safe.directory "*"
+            for d in /session/*/ /session/*/*/; do
+                [ -d "$d/.git" ] || continue
+                name="${d#/session/}"
+                name="${name%/}"
+                head=$(cd "$d" && git rev-parse HEAD 2>/dev/null)
+                gitsize=$(du -sm "$d/.git" 2>/dev/null | cut -f1)
+                [ -n "$head" ] && echo "$name|$head|${gitsize:-0}"
+            done
+        ' 2>/dev/null) || true
+
+    # Build lookup: session_name → session_head, session_name → .git size (MB)
+    declare -A _session_head_map
+    declare -A _session_size_map
+    while IFS='|' read -r _sname _shead _ssize; do
+        [[ -z "$_sname" ]] && continue
+        _session_head_map[$_sname]="$_shead"
+        _session_size_map[$_sname]="${_ssize:-0}"
+    done <<< "$_session_heads"
+
+    # Determine which config repos actually need bundling (HEAD differs from host)
+    local -a _need_bundle=()
+    for _entry in "${_valid_projects[@]}"; do
+        local proj_name="${_entry%%|*}"
+        local proj_path="${_entry#*|}"
+        local _s_head="${_session_head_map[$proj_name]:-}"
+        [[ -z "$_s_head" ]] && continue
+
+        # Compare with host branch HEAD
+        local _h_head=""
+        if git -C "$proj_path" show-ref --verify --quiet "refs/heads/$session_name" 2>/dev/null; then
+            _h_head=$(git -C "$proj_path" rev-parse "refs/heads/$session_name" 2>/dev/null)
+        else
+            _h_head=$(git -C "$proj_path" rev-parse HEAD 2>/dev/null)
+        fi
+
+        local _short_s="${_s_head:0:7}"
+        local _short_h="${_h_head:0:7}"
+        if [[ "$_s_head" != "$_h_head" ]]; then
+            _need_bundle+=("$proj_name")
+        elif git -C "$proj_path" show-ref --verify --quiet "refs/heads/$session_name" 2>/dev/null; then
+            success "  $proj_name → $session_name @ $_short_h"
+        else
+            echo -e "  ${BLUE}—${NC} $proj_name $_short_s"
+        fi
+    done
+
+    # Also need bundles for Phase 4 repos (not in config).
+    # Use manifest to distinguish "known at creation" vs "truly new" repos.
+    # Known-at-creation repos that haven't changed on host are skipped (avoids
+    # bundling huge unchanged monorepos through slow Docker Desktop I/O).
+    declare -A _manifest_names
+    if [[ -n "$old_manifest" ]]; then
+        while IFS='|' read -r _mhash _mname; do
+            [[ -z "$_mname" ]] && continue
+            _manifest_names[$_mname]=1
+        done <<< "$old_manifest"
+    fi
+
+    for _sname in "${!_session_head_map[@]}"; do
+        [[ -z "${_config_names[$_sname]:-}" ]] || continue
+        # Not in config — check if it was already collected for missing-host
+        local _already=false
+        for _mhr in "${_missing_host_repos[@]}"; do
+            [[ "${_mhr%%|*}" == "$_sname" ]] && _already=true && break
+        done
+        $_already && continue
+
+        if [[ -n "${_manifest_names[$_sname]:-}" ]]; then
+            # Known at creation — check if host repo exists and has diverged
+            local _p4_host_path
+            _p4_host_path=$(resolve_repo_host_path "$_sname" "$projects")
+            if [[ -d "$_p4_host_path" ]] && is_git_repo "$_p4_host_path"; then
+                local _p4_h_head=""
+                if git -C "$_p4_host_path" show-ref --verify --quiet "refs/heads/$session_name" 2>/dev/null; then
+                    _p4_h_head=$(git -C "$_p4_host_path" rev-parse "refs/heads/$session_name" 2>/dev/null)
+                else
+                    _p4_h_head=$(git -C "$_p4_host_path" rev-parse HEAD 2>/dev/null)
+                fi
+                if [[ "${_session_head_map[$_sname]}" != "$_p4_h_head" ]]; then
+                    _need_bundle+=("$_sname")
+                else
+                    local _short_p4="${_p4_h_head:0:7}"
+                    if git -C "$_p4_host_path" show-ref --verify --quiet "refs/heads/$session_name" 2>/dev/null; then
+                        success "  $_sname → $session_name @ $_short_p4"
+                    else
+                        echo -e "  ${BLUE}—${NC} $_sname $_short_p4"
+                    fi
+                    _config_names[$_sname]=1  # prevent Phase 4 from re-collecting
+                fi
+            else
+                # Host repo gone/missing — needs extraction (direct clone in Phase 4)
+                :
+            fi
+        else
+            # Truly new (created inside container) — must bundle
+            _need_bundle+=("$_sname")
+        fi
+    done
+    # Missing-host repos also need bundles
+    for _mhr in "${_missing_host_repos[@]}"; do
+        _need_bundle+=("${_mhr%%|*}")
+    done
+
+    # Bundle only changed repos
+    if [[ ${#_need_bundle[@]} -gt 0 ]]; then
+        # Warn about large repos (>10MB .git) that will be slow to bundle
+        for _bname in "${_need_bundle[@]}"; do
+            local _bsize="${_session_size_map[$_bname]:-0}"
+            if [[ "$_bsize" -gt 10 ]]; then
+                warn "  $_bname has ${_bsize}MB .git — bundling may be slow"
+            fi
+        done
+        info "Bundling ${#_need_bundle[@]} changed repo(s)..."
+        printf '%s\n' "${_need_bundle[@]}" > "$bundle_dir/.to-bundle"
+
+        docker run --rm --entrypoint sh \
+            -v "$volume:/session:ro" \
+            -v "$bundle_dir:/bundles" \
+            "$git_image" \
+            -c '
+                git config --global --add safe.directory "*"
+                while IFS= read -r name; do
+                    [ -z "$name" ] && continue
+                    safe=$(echo "$name" | tr "/" "_")
+                    cd "/session/$name" 2>/dev/null || continue
+                    git bundle create "/tmp/${safe}.bundle" HEAD 2>/dev/null && \
+                        mv "/tmp/${safe}.bundle" "/bundles/${safe}.bundle" 2>/dev/null
+                done < /bundles/.to-bundle
+            ' 2>/dev/null || true
+    fi
+
+    # Phase 3: Process each changed project on the host (fetch + branch)
     for _entry in "${_valid_projects[@]}"; do
         local proj_name="${_entry%%|*}"
         local proj_path="${_entry#*|}"
         local bundle_file="$bundle_dir/${proj_name//\//_}.bundle"
 
-        # Check bundle was created
+        # Skip repos that weren't bundled (no changes)
         if [[ ! -s "$bundle_file" ]]; then
-            warn "  $proj_name (no git data)"
             continue
         fi
 
@@ -1941,33 +2086,12 @@ _extract_multi_project_direct() {
     done
 
     if [[ -n "$_new_manifest" ]]; then
-        local _old_manifest
-        _old_manifest=$(read_repo_manifest "$volume")
-
-        # Build set of known repos: use saved manifest if available, else config names
-        declare -A _known_names
-        if [[ -n "$_old_manifest" ]]; then
-            while IFS='|' read -r _hash _name; do
-                [[ -z "$_name" ]] && continue
-                _known_names[$_name]=1
-            done <<< "$_old_manifest"
-        else
-            # No manifest — fall back to config project names
-            while IFS='|' read -r _pname _ppath; do
-                [[ -z "$_pname" ]] && continue
-                _known_names[$_pname]=1
-            done <<< "$projects"
-        fi
-
-        # Also mark missing-host repos as known so they aren't double-counted
-        for _mhr in "${_missing_host_repos[@]}"; do
-            _known_names[${_mhr%%|*}]=1
-        done
-
-        # Find repos in live scan that aren't known
+        # Any repo in the volume that's NOT in the config needs extraction
+        # (covers both repos created inside the container and repos added
+        # via --add-repo/--discover-repos that aren't in config yet)
         while IFS='|' read -r _hash _name; do
             [[ -z "$_name" ]] && continue
-            if [[ -z "${_known_names[$_name]:-}" ]]; then
+            if [[ -z "${_config_names[$_name]:-}" ]]; then
                 _new_repos+=("$_name")
             fi
         done <<< "$_new_manifest"
@@ -1976,48 +2100,21 @@ _extract_multi_project_direct() {
     if [[ ${#_new_repos[@]} -gt 0 ]]; then
         info "Found ${#_new_repos[@]} repo(s) to extract (new or missing host path)"
 
-        # Bundle new repos
-        for _new_name in "${_new_repos[@]}"; do
-            echo "$_new_name"
-        done >> "$bundle_dir/.projects"
-
-        # Write just the new repo names to a separate file for bundling
-        printf '%s\n' "${_new_repos[@]}" > "$bundle_dir/.new-projects"
-
-        docker run --rm \
-            -v "$volume:/session:ro" \
-            -v "$bundle_dir:/bundles" \
-            "$git_image" \
-            sh -c '
-                git config --global --add safe.directory "*"
-                while IFS= read -r proj; do
-                    [ -z "$proj" ] && continue
-                    safe=$(echo "$proj" | tr "/" "_")
-                    (
-                        cd "/session/$proj" 2>/dev/null || exit 1
-                        git bundle create "/tmp/${safe}.bundle" HEAD 2>&1 && \
-                            mv "/tmp/${safe}.bundle" "/bundles/${safe}.bundle"
-                    ) &
-                done < /bundles/.new-projects
-                wait
-            ' 2>/dev/null || true
-
-        # Extract each new repo: branch into existing host repo, or clone if truly new
         for _new_name in "${_new_repos[@]}"; do
             local _safe_name="${_new_name//\//_}"
             local _bundle="$bundle_dir/${_safe_name}.bundle"
-
-            if [[ ! -s "$_bundle" ]]; then
-                warn "  $_new_name (no git data in bundle)"
-                continue
-            fi
 
             # Determine target: config lookup → org-sibling inference → cwd fallback
             local _target_dir
             _target_dir=$(resolve_repo_host_path "$_new_name" "$projects")
 
             if [[ -d "$_target_dir" ]] && is_git_repo "$_target_dir"; then
-                # Host repo exists — extract as a branch (same as Phase 3 logic)
+                # Host repo exists — extract as a branch via bundle
+                if [[ ! -s "$_bundle" ]]; then
+                    warn "  $_new_name (no bundle data)"
+                    fail_count=$((fail_count + 1))
+                    continue
+                fi
                 if ! git -C "$_target_dir" fetch "$_bundle" HEAD 2>/dev/null; then
                     error "  $_new_name fetch failed"
                     fail_count=$((fail_count + 1))
@@ -2050,9 +2147,35 @@ _extract_multi_project_direct() {
                 warn "  $_new_name → skipped (directory exists but not a git repo: $_target_dir)"
                 fail_count=$((fail_count + 1))
             else
-                # Truly new repo — clone from bundle
-                if git clone "$_bundle" "$_target_dir" 2>/dev/null; then
-                    # Ensure main branch exists (bundles only have HEAD ref)
+                # Host path missing — direct clone from session volume (avoids slow bundling)
+                local _target_parent
+                _target_parent=$(dirname "$_target_dir")
+                local _target_basename
+                _target_basename=$(basename "$_target_dir")
+                mkdir -p "$_target_parent"
+
+                local _git_size="${_session_size_map[$_new_name]:-0}"
+                if [[ "$_git_size" -gt 10 ]]; then
+                    warn "  $_new_name: ${_git_size}MB .git — cloning may be slow"
+                fi
+
+                local _git_user_name _git_user_email
+                _git_user_name=$(git config user.name 2>/dev/null || echo "Claude")
+                _git_user_email=$(git config user.email 2>/dev/null || echo "claude@container")
+
+                if docker run --rm --entrypoint sh \
+                    -v "$volume:/session:ro" \
+                    -v "$_target_parent:/target" \
+                    "$git_image" \
+                    -c "
+                        git config --global --add safe.directory '*'
+                        git clone '/session/$_new_name' '/target/$_target_basename' 2>&1
+                        cd '/target/$_target_basename'
+                        git remote remove origin 2>/dev/null || true
+                        git config user.email '$_git_user_email'
+                        git config user.name '$_git_user_name'
+                    " 2>/dev/null; then
+                    # Set up branches on host
                     git -C "$_target_dir" checkout -b main 2>/dev/null || true
                     git -C "$_target_dir" branch -f "$session_name" HEAD 2>/dev/null || true
                     local _commit_count
@@ -2066,6 +2189,10 @@ _extract_multi_project_direct() {
             fi
         done
     fi
+
+    # Update manifest so future pulls know about all repos (including ones
+    # added via --add-repo, --discover-repos, or created inside the container)
+    write_repo_manifest "$volume"
 
     echo ""
     if [[ $success_count -gt 0 ]]; then
@@ -2102,8 +2229,8 @@ _extract_single_project_direct() {
     trap "rm -f '$bundle_file'" EXIT
 
     # Write to temp file then cat to stdout (git can't write directly to /dev/stdout due to lock files)
-    if ! docker run --rm -v "$volume:/session:ro" "$git_image" \
-        sh -c "git config --global --add safe.directory '*' && cd /session && git bundle create /tmp/out.bundle HEAD && cat /tmp/out.bundle" > "$bundle_file" 2>/dev/null; then
+    if ! docker run --rm --entrypoint sh -v "$volume:/session:ro" "$git_image" \
+        -c "git config --global --add safe.directory '*' && cd /session && git bundle create /tmp/out.bundle HEAD && cat /tmp/out.bundle" > "$bundle_file" 2>/dev/null; then
         error "Failed to create git bundle from session"
         return 1
     fi

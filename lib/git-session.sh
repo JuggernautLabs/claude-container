@@ -25,15 +25,15 @@
 #   $1 - volume name
 write_repo_manifest() {
     local volume="$1"
-    local git_image="${IMAGE_NAME:-$DEFAULT_IMAGE}"
+    local git_image="${GIT_UTIL_IMAGE:-alpine/git}"
     local host_uid
     host_uid=$(get_host_uid)
 
-    docker run --rm \
+    docker run --rm --entrypoint sh \
         --user "$host_uid:$host_uid" \
         -v "$volume:/session" \
         "$git_image" \
-        sh -c '
+        -c '
             git config --global --add safe.directory "*"
             for d in /session/*/ /session/*/*/; do
                 [ -d "$d/.git" ] || continue
@@ -52,12 +52,10 @@ write_repo_manifest() {
 #   $1 - volume name
 read_repo_manifest() {
     local volume="$1"
-    local git_image="${IMAGE_NAME:-$DEFAULT_IMAGE}"
+    local git_image="${GIT_UTIL_IMAGE:-alpine/git}"
 
-    docker run --rm \
-        -v "$volume:/session:ro" \
-        "$git_image" \
-        cat /session/.repo-manifest 2>/dev/null || true
+    docker run --rm --entrypoint sh -v "$volume:/session:ro" "$git_image" \
+        -c 'cat /session/.repo-manifest' 2>/dev/null || true
 }
 
 # Scan current repo state in a session volume (live, not from saved manifest).
@@ -66,12 +64,12 @@ read_repo_manifest() {
 #   $1 - volume name
 scan_repo_manifest() {
     local volume="$1"
-    local git_image="${IMAGE_NAME:-$DEFAULT_IMAGE}"
+    local git_image="${GIT_UTIL_IMAGE:-alpine/git}"
 
-    docker run --rm \
+    docker run --rm --entrypoint sh \
         -v "$volume:/session:ro" \
         "$git_image" \
-        sh -c '
+        -c '
             git config --global --add safe.directory "*"
             for d in /session/*/ /session/*/*/; do
                 [ -d "$d/.git" ] || continue

@@ -14,6 +14,7 @@ set -e
 
 VERSION="0.2.0"
 DEFAULT_IMAGE="ghcr.io/hypermemetic/claude-container:latest"
+GIT_UTIL_IMAGE="alpine/git"  # Lightweight image for utility ops (bundle, config, manifest)
 
 # Config and cache directories
 CONFIG_DIR="$HOME/.config/claude-container"
@@ -372,12 +373,13 @@ Session Management (use with -s <session>):
   --sync <branch>          → push <branch> --rebase
   --refresh [branch]       → push [branch]
   --merge-into <branch>    → push <branch> --merge
+  --sessions               → list
   --auto-merge [branch]    Use with pull <branch> instead
 
   Modifiers: --force/-f, --yes/-y, --regex/-r
 
 Global Commands (no session required):
-  --sessions               List all sessions with disk usage
+  list                     List all sessions (use --sizes for disk usage)
   --cleanup                List and optionally delete all volumes
   --cleanup-unused         Delete unused volumes [--yes]
 

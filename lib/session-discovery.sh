@@ -17,10 +17,10 @@
 # Returns: YAML content on stdout (empty string if not found)
 read_session_config() {
     local volume="$1"
-    local git_image="${IMAGE_NAME:-$DEFAULT_IMAGE}"
+    local git_image="${GIT_UTIL_IMAGE:-alpine/git}"
 
-    docker run --rm -v "$volume:/session:ro" "$git_image" \
-        cat /session/.claude-projects.yml 2>/dev/null || echo ""
+    docker run --rm --entrypoint sh -v "$volume:/session:ro" "$git_image" \
+        -c 'cat /session/.claude-projects.yml' 2>/dev/null || echo ""
 }
 
 # Parse config YAML into name|path pairs on stdout.
@@ -44,10 +44,10 @@ parse_session_projects() {
 # Returns: name|head lines on stdout
 get_session_heads() {
     local volume="$1"
-    local git_image="${IMAGE_NAME:-$DEFAULT_IMAGE}"
+    local git_image="${GIT_UTIL_IMAGE:-alpine/git}"
 
-    docker run --rm -v "$volume:/session:ro" "$git_image" \
-        sh -c '
+    docker run --rm --entrypoint sh -v "$volume:/session:ro" "$git_image" \
+        -c '
             git config --global --add safe.directory "*"
             for d in /session/*/ /session/*/*/; do
                 [ -d "$d/.git" ] || continue
