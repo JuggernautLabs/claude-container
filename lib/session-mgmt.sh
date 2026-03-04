@@ -1176,8 +1176,18 @@ session_sync() {
             -c 'cat > /session/.sync-summary' 2>/dev/null || true
     fi
 
+    # If everything was clean (no conflicts, no dirty), no need to launch container
+    if [[ $conflict_count -eq 0 && $dirty_count -eq 0 ]]; then
+        echo ""
+        success "Rebase complete — no conflicts, no container needed."
+        echo ""
+        echo "To pull rebased changes to host:"
+        echo "  claude-container pull -s $session_name --force"
+        exit 0
+    fi
+
     echo ""
-    info "Starting container for review..."
+    info "Starting container for conflict resolution..."
     echo ""
 
     # Return to main script to continue container startup
