@@ -1009,7 +1009,7 @@ session_sync() {
 
         # Check dirty (from scan)
         if [[ -n "${_sync_dirty[$proj_name]:-}" ]]; then
-            warn "  $proj_name has uncommitted changes (will need manual commit/stash)"
+            warn "  $proj_name has uncommitted changes in session (will need manual commit/stash)"
             dirty_count=$((dirty_count + 1))
             dirty_projects+=("$proj_name")
             summary_lines+=("- $proj_name: DIRTY (uncommitted changes)")
@@ -1410,11 +1410,11 @@ session_refresh() {
             if [ -n \"\$dirty\" ]; then
                 dirty_count=\$(echo \"\$dirty\" | wc -l | tr -d ' ')
                 if [ '$force_reset' != 'true' ]; then
-                    echo 'DIRTY|$proj_name|'\$dirty_count' dirty file(s) — use --force to override'
+                    echo 'DIRTY|$proj_name|'\$dirty_count' dirty file(s) in session — use --force to override'
                     git remote remove _host 2>/dev/null || true
                     exit 0
                 else
-                    echo 'WARN|$proj_name|'\$dirty_count' dirty file(s) will be discarded'
+                    echo 'WARN|$proj_name|'\$dirty_count' dirty file(s) in session will be discarded'
                 fi
             fi
             if [ '$force_reset' = 'true' ]; then
@@ -1647,7 +1647,7 @@ session_merge_into() {
             sh -c "git config --global --add safe.directory '*' && cd '/session/$proj_name' && git status --porcelain" 2>/dev/null)
 
         if [[ -n "$dirty_status" ]]; then
-            warn "    $proj_name has uncommitted changes — skipping merge, mounting host repo for Claude"
+            warn "    $proj_name has uncommitted changes in session — skipping merge, mounting host repo for Claude"
             echo "$dirty_status" | head -3 | sed 's/^/      /'
             local change_count
             change_count=$(echo "$dirty_status" | wc -l | tr -d ' ')
