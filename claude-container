@@ -1177,6 +1177,9 @@ FINSCRIPT
 
 # Session exit message
 if $USE_GIT_SESSION; then
+    # Update last-active timestamp
+    [[ -n "$SESSION_NAME" && -f "$SESSIONS_CONFIG_DIR/${SESSION_NAME}.env" ]] && \
+        touch "$SESSIONS_CONFIG_DIR/${SESSION_NAME}.env"
     echo ""
     info "Session complete: $SESSION_NAME"
     echo ""

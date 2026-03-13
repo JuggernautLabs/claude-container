@@ -11,6 +11,7 @@
 cmd_pull() {
     local session_name=""
     local branch=""
+    local repo_filter=""
     local reconcile=false
     local force=false
     local dry_run=false
@@ -19,6 +20,10 @@ cmd_pull() {
         case "$1" in
             --session|-s)
                 session_name="$2"
+                shift 2
+                ;;
+            --repo)
+                repo_filter="$2"
                 shift 2
                 ;;
             --reconcile|-R)
@@ -74,6 +79,9 @@ cmd_pull() {
     if $force; then
         extract_args+=(--force)
     fi
+    if [[ -n "$repo_filter" ]]; then
+        extract_args+=(--repo "$repo_filter")
+    fi
 
     if $reconcile; then
         # Reconcile mode requires a branch
@@ -88,7 +96,7 @@ cmd_pull() {
 
     if $dry_run; then
         # Dry-run: check what would happen without extracting or merging
-        session_auto_merge "$session_name" "$branch" true
+        session_auto_merge "$session_name" "$branch" true "$repo_filter"
         return $?
     fi
 
@@ -98,7 +106,7 @@ cmd_pull() {
     # If branch specified, also merge into target
     if [[ -n "$branch" ]]; then
         echo ""
-        session_auto_merge "$session_name" "$branch"
+        session_auto_merge "$session_name" "$branch" false "$repo_filter"
     fi
 }
 
@@ -216,6 +224,7 @@ Arguments:
 
 Options:
   --session, -s <name>     Session name (required)
+  --repo <name>            Only pull this repo (partial name OK, e.g. 'gamma')
   --reconcile, -R          Full reconcile: stash dirty, merge target into session,
                            launch Claude for conflicts, then merge back
   --dry-run                Show what would happen without extracting or merging
@@ -256,6 +265,10 @@ Examples:
 
   # Preview what would happen (no changes made)
   claude-container pull -s myproj main --dry-run
+
+  # Pull a single repo
+  claude-container pull -s myproj --repo gamma
+  claude-container pull -s myproj main --repo plexus-gamma
 
   # Force extraction (overwrite diverged branches)
   claude-container pull -s myproj --force

@@ -53,7 +53,7 @@ Options:
   --help, -h         Show this help
 
 Examples:
-  # List sessions with last-opened time (fast)
+  # List sessions with last-active time (fast)
   claude-container list
 
   # Include disk usage (slower)

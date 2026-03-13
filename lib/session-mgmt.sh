@@ -239,62 +239,99 @@ session_list() {
         done <<< "$sizes_with_total"
     fi
 
-    # Compute last-opened for each session (fast — just stat on host files)
+    # Scan all session volumes in parallel for latest commit + file stat timestamps
     local now_epoch
     now_epoch=$(date +%s)
+    local git_image="${GIT_UTIL_IMAGE:-alpine/git}"
 
-    _format_last_opened() {
-        local env_file="$1"
-        if [[ ! -f "$env_file" ]]; then
+    _format_relative_time() {
+        local epoch="$1"
+        if [[ "$epoch" -le 0 ]]; then
             echo "-"
             return
         fi
-        local mtime_epoch
-        mtime_epoch=$(stat -f %m "$env_file" 2>/dev/null || stat -c %Y "$env_file" 2>/dev/null || echo "0")
-        if [[ "$mtime_epoch" -le 0 ]]; then
-            echo "-"
-            return
-        fi
-        local days_ago=$(( (now_epoch - mtime_epoch) / 86400 ))
+        local days_ago=$(( (now_epoch - epoch) / 86400 ))
         if [[ $days_ago -eq 0 ]]; then
-            echo "today"
+            local hours_ago=$(( (now_epoch - epoch) / 3600 ))
+            if [[ $hours_ago -eq 0 ]]; then
+                echo "<1h ago"
+            elif [[ $hours_ago -eq 1 ]]; then
+                echo "1h ago"
+            else
+                echo "${hours_ago}h ago"
+            fi
         elif [[ $days_ago -eq 1 ]]; then
             echo "yesterday"
         elif [[ $days_ago -lt 30 ]]; then
             echo "${days_ago}d ago"
         else
-            date -r "$mtime_epoch" "+%Y-%m-%d" 2>/dev/null \
-                || date -d "@$mtime_epoch" "+%Y-%m-%d" 2>/dev/null \
+            date -r "$epoch" "+%Y-%m-%d" 2>/dev/null \
+                || date -d "@$epoch" "+%Y-%m-%d" 2>/dev/null \
                 || echo "${days_ago}d ago"
         fi
     }
 
-    # Display table
+    # Single docker run mounting ALL session volumes — one container startup
+    declare -A _last_commit_epoch
+    declare -A _last_stat_epoch
+
+    local _vol_args=()
+    local _session_list=""
+    for _s in "${!sessions[@]}"; do
+        _vol_args+=("-v" "claude-session-${_s}:/sessions/${_s}:ro")
+        _session_list+="$_s"$'\n'
+    done
+
+    local _scan_output
+    _scan_output=$(docker run --rm --entrypoint sh \
+        "${_vol_args[@]}" "$git_image" \
+        -c '
+            git config --global --add safe.directory "*"
+            for sess_dir in /sessions/*/; do
+                [ -d "$sess_dir" ] || continue
+                name="${sess_dir#/sessions/}"
+                name="${name%/}"
+                cmax=0
+                for d in "$sess_dir"/*/ "$sess_dir"/*/*/; do
+                    [ -d "$d/.git" ] || continue
+                    t=$(cd "$d" && git log -1 --format=%ct 2>/dev/null || echo 0)
+                    [ "${t:-0}" -gt "$cmax" ] && cmax=${t:-0}
+                done
+                smax=$(find "$sess_dir" -maxdepth 4 -type f -not -path "*/.git/*" 2>/dev/null | xargs stat -c "%Y" 2>/dev/null | sort -rn | head -1)
+                echo "$name|$cmax|${smax:-0}"
+            done
+        ' 2>/dev/null || true)
+
+    while IFS='|' read -r _name _commit _stat; do
+        [[ -z "$_name" ]] && continue
+        _last_commit_epoch[$_name]="${_commit:-0}"
+        _last_stat_epoch[$_name]="${_stat:-0}"
+    done <<< "$_scan_output"
+
+    # Display table — sort by max(commit, stat) descending
     echo ""
     if [[ "$show_sizes" == "true" ]]; then
-        printf "%-30s %12s %10s %10s %10s %10s %10s\n" "SESSION" "LAST OPENED" "WORKSPACE" "STATE" "CARGO" "NPM" "PIP"
-        printf "%-30s %12s %10s %10s %10s %10s %10s\n" "-------" "-----------" "---------" "-----" "-----" "---" "---"
+        printf "%-26s %12s %12s %10s %10s %10s %10s %10s\n" "SESSION" "LAST COMMIT" "LAST EDIT" "WORKSPACE" "STATE" "CARGO" "NPM" "PIP"
+        printf "%-26s %12s %12s %10s %10s %10s %10s %10s\n" "-------" "-----------" "---------" "---------" "-----" "-----" "---" "---"
     else
-        printf "%-30s %12s\n" "SESSION" "LAST OPENED"
-        printf "%-30s %12s\n" "-------" "-----------"
+        printf "%-26s %12s %12s\n" "SESSION" "LAST COMMIT" "LAST EDIT"
+        printf "%-26s %12s %12s\n" "-------" "-----------" "---------"
     fi
 
-    # Sort sessions by most recently used (mtime descending), then alphabetical fallback
     local _sorted_sessions=""
     for _s in "${!sessions[@]}"; do
-        local _env="$sessions_config/${_s}.env"
-        local _mt=0
-        if [[ -f "$_env" ]]; then
-            _mt=$(stat -f %m "$_env" 2>/dev/null || stat -c %Y "$_env" 2>/dev/null || echo "0")
-        fi
-        _sorted_sessions+="$_mt $_s"$'\n'
+        local _c=${_last_commit_epoch[$_s]:-0}
+        local _f=${_last_stat_epoch[$_s]:-0}
+        local _max=$(( _c > _f ? _c : _f ))
+        _sorted_sessions+="$_max $_s"$'\n'
     done
     _sorted_sessions=$(echo "$_sorted_sessions" | sort -t' ' -k1 -rn -k2)
 
-    while read -r _mtime session; do
+    while read -r _sort_key session; do
         [[ -z "$session" ]] && continue
-        local last_opened
-        last_opened=$(_format_last_opened "$sessions_config/${session}.env")
+        local commit_time stat_time
+        commit_time=$(_format_relative_time "${_last_commit_epoch[$session]:-0}")
+        stat_time=$(_format_relative_time "${_last_stat_epoch[$session]:-0}")
 
         if [[ "$show_sizes" == "true" ]]; then
             local ws="${vol_sizes[claude-session-$session]:-"-"}"
@@ -302,9 +339,9 @@ session_list() {
             local ca="${vol_sizes[claude-cargo-$session]:-"-"}"
             local np="${vol_sizes[claude-npm-$session]:-"-"}"
             local pi="${vol_sizes[claude-pip-$session]:-"-"}"
-            printf "%-30s %12s %10s %10s %10s %10s %10s\n" "$session" "$last_opened" "$ws" "$st" "$ca" "$np" "$pi"
+            printf "%-26s %12s %12s %10s %10s %10s %10s %10s\n" "$session" "$commit_time" "$stat_time" "$ws" "$st" "$ca" "$np" "$pi"
         else
-            printf "%-30s %12s\n" "$session" "$last_opened"
+            printf "%-26s %12s %12s\n" "$session" "$commit_time" "$stat_time"
         fi
     done <<< "$_sorted_sessions"
 
@@ -1808,12 +1845,14 @@ session_merge_into() {
 session_extract() {
     local session_name="$1"
     local force=false
+    local repo_filter=""
 
     # Parse flags
     shift
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --force|-f) force=true; shift ;;
+            --repo) repo_filter="$2"; shift 2 ;;
             *) shift ;;
         esac
     done
@@ -1853,7 +1892,7 @@ session_extract() {
     if [[ "$has_config" == "yes" ]]; then
         local config_content
         config_content=$(read_session_config "$volume")
-        _extract_multi_project_direct "$session_name" "$volume" "$_util_image" "$config_content" "$force" "$_old_manifest"
+        _extract_multi_project_direct "$session_name" "$volume" "$_util_image" "$config_content" "$force" "$_old_manifest" "$repo_filter"
     else
         _extract_single_project_direct "$session_name" "$volume" "$_util_image" "$force"
     fi
@@ -1868,6 +1907,31 @@ _extract_multi_project_direct() {
     local config_content="$4"
     local force="$5"
     local old_manifest="${6:-}"
+    local repo_filter="${7:-}"
+
+    # Resolve partial repo name to full name if filter specified
+    if [[ -n "$repo_filter" ]]; then
+        local _all_projects
+        _all_projects=$(parse_session_projects "$config_content")
+        local _rf_matches=()
+        while IFS='|' read -r _rn _rp; do
+            [[ -z "$_rn" ]] && continue
+            if [[ "$_rn" == "$repo_filter" ]]; then
+                _rf_matches=("$_rn"); break
+            elif [[ "$_rn" == */"$repo_filter" || "$_rn" == *"$repo_filter"* ]]; then
+                _rf_matches+=("$_rn")
+            fi
+        done <<< "$_all_projects"
+        if [[ ${#_rf_matches[@]} -eq 0 ]]; then
+            error "No repo matching '$repo_filter' in session"
+            return 1
+        elif [[ ${#_rf_matches[@]} -gt 1 ]]; then
+            error "'$repo_filter' is ambiguous — matches ${#_rf_matches[@]} repos:"
+            for _m in "${_rf_matches[@]}"; do echo "  $_m"; done
+            return 1
+        fi
+        repo_filter="${_rf_matches[0]}"
+    fi
 
     info "Multi-project session detected"
     echo ""
@@ -1892,6 +1956,8 @@ _extract_multi_project_direct() {
     local _missing_host_repos=()
     while IFS='|' read -r proj_name proj_path; do
         [[ -z "$proj_name" ]] && continue
+        # Skip repos not matching filter
+        [[ -n "$repo_filter" && "$proj_name" != "$repo_filter" ]] && continue
         if [[ ! -d "$proj_path" ]]; then
             info "  $proj_name: host path missing ($proj_path) — will extract from session"
             _missing_host_repos+=("$proj_name|$proj_path")
@@ -1901,8 +1967,12 @@ _extract_multi_project_direct() {
         echo "$proj_name"
     done <<< "$projects" > "$bundle_dir/.projects"
 
-    if [[ ${#_valid_projects[@]} -eq 0 ]]; then
-        warn "No valid projects to extract"
+    if [[ ${#_valid_projects[@]} -eq 0 && ${#_missing_host_repos[@]} -eq 0 ]]; then
+        if [[ -n "$repo_filter" ]]; then
+            warn "No changes for '$repo_filter'"
+        else
+            warn "No valid projects to extract"
+        fi
         return 0
     fi
 
@@ -1915,6 +1985,9 @@ _extract_multi_project_direct() {
     for _mhr in "${_missing_host_repos[@]}"; do
         _config_names[${_mhr%%|*}]=1
     done
+
+    # Track non-config repos that need registering in .claude-projects.yml
+    local -a _register_repos=()
 
     # Phase 2: Get session HEADs + .git sizes (single fast docker run), then only bundle changed repos.
     # Docker Desktop volume I/O is slow — bundling all repos takes ~90s for 20+ repos.
@@ -2013,6 +2086,7 @@ _extract_multi_project_direct() {
                         echo -e "  ${BLUE}—${NC} $_sname $_short_p4"
                     fi
                     _config_names[$_sname]=1  # prevent Phase 4 from re-collecting
+                    _register_repos+=("$_sname|$_p4_host_path")
                 fi
             else
                 # Host repo gone/missing — needs extraction (direct clone in Phase 4)
@@ -2249,6 +2323,41 @@ _extract_multi_project_direct() {
                 fi
             fi
         done
+    fi
+
+    # Register non-config repos in .claude-projects.yml so
+    # downstream operations (merge, status, push) see them
+    # Includes: Phase 4 extracted repos + repos matched from manifest
+    for _new_name in "${_new_repos[@]}"; do
+        local _reg_path
+        _reg_path=$(resolve_repo_host_path "$_new_name" "$projects")
+        [[ ! -d "$_reg_path" ]] && continue
+        is_git_repo "$_reg_path" || continue
+        [[ -n "${_config_names[$_new_name]:-}" ]] && continue
+        _register_repos+=("$_new_name|$_reg_path")
+        _config_names[$_new_name]=1
+    done
+
+    if [[ ${#_register_repos[@]} -gt 0 ]]; then
+        local _updated_cfg
+        _updated_cfg=$(read_session_config "$volume")
+        local _registered=0
+        for _entry in "${_register_repos[@]}"; do
+            local _rname="${_entry%%|*}"
+            local _rpath="${_entry#*|}"
+            _updated_cfg=$(echo "$_updated_cfg" | yq eval ".projects.\"$_rname\".path = \"$_rpath\"" -)
+            _registered=$((_registered + 1))
+        done
+        if [[ $_registered -gt 0 ]]; then
+            local _host_uid
+            _host_uid=$(get_host_uid)
+            echo "$_updated_cfg" | docker run --rm -i --entrypoint sh \
+                --user "$_host_uid:$_host_uid" \
+                -v "$volume:/session" \
+                "$git_image" \
+                -c 'cat > /session/.claude-projects.yml' 2>/dev/null
+            info "Registered $_registered new repo(s) in session config"
+        fi
     fi
 
     # Update manifest so future pulls know about all repos (including ones
@@ -2607,6 +2716,7 @@ session_auto_merge() {
     local session_name="$1"
     local target_branch="${2:-main}"
     local dry_run="${3:-false}"
+    local repo_filter="${4:-}"
     local volume="claude-session-${session_name}"
     local git_image="${IMAGE_NAME:-$DEFAULT_IMAGE}"
 
@@ -2639,11 +2749,28 @@ session_auto_merge() {
     _result_dir=$(mktemp -d)
     trap "rm -rf '$_result_dir'" RETURN
 
+    # Resolve partial repo filter against project list
+    if [[ -n "$repo_filter" ]]; then
+        local _rf_matches=()
+        while IFS='|' read -r _rn _rp; do
+            [[ -z "$_rn" ]] && continue
+            if [[ "$_rn" == "$repo_filter" ]]; then
+                _rf_matches=("$_rn"); break
+            elif [[ "$_rn" == */"$repo_filter" || "$_rn" == *"$repo_filter"* ]]; then
+                _rf_matches+=("$_rn")
+            fi
+        done <<< "$projects"
+        if [[ ${#_rf_matches[@]} -eq 1 ]]; then
+            repo_filter="${_rf_matches[0]}"
+        fi
+    fi
+
     # Launch each merge in parallel
     local _pids=()
     local _proj_names=()
     while IFS='|' read -r proj_name proj_path; do
         [[ -z "$proj_name" ]] && continue
+        [[ -n "$repo_filter" && "$proj_name" != "$repo_filter" ]] && continue
 
         _proj_names+=("$proj_name")
 
@@ -2745,12 +2872,16 @@ session_auto_merge() {
                 current_branch=$(git -C "$proj_path" symbolic-ref --short HEAD 2>/dev/null || echo "")
 
                 if [[ "$current_branch" == "$target_branch" ]]; then
-                    git -C "$proj_path" merge "$session_name" --no-edit 2>/dev/null
+                    local _merge_out
+                    _merge_out=$(git -C "$proj_path" merge "$session_name" --no-edit 2>&1) || true
                     echo "OK|$proj_name|merged $session_name into $target_branch" > "$_result_file"
+                    [[ -n "$_merge_out" ]] && echo "$_merge_out" >> "$_result_file.detail"
                 else
                     if git -C "$proj_path" checkout "$target_branch" 2>/dev/null; then
-                        git -C "$proj_path" merge "$session_name" --no-edit 2>/dev/null
+                        local _merge_out
+                        _merge_out=$(git -C "$proj_path" merge "$session_name" --no-edit 2>&1) || true
                         echo "OK|$proj_name|merged $session_name into $target_branch" > "$_result_file"
+                        [[ -n "$_merge_out" ]] && echo "$_merge_out" >> "$_result_file.detail"
                         git -C "$proj_path" checkout "$current_branch" 2>/dev/null || true
                     else
                         echo "SKIP|$proj_name|could not checkout $target_branch" > "$_result_file"
@@ -2786,6 +2917,12 @@ session_auto_merge() {
         case "$_status" in
             OK)
                 success "  $_name: $_msg"
+                # Show merge detail indented under project header
+                if [[ -f "$_result_file.detail" ]]; then
+                    while IFS= read -r _detail_line; do
+                        echo "    $_detail_line"
+                    done < "$_result_file.detail"
+                fi
                 merge_ok=$((merge_ok + 1))
                 ;;
             SKIP)
