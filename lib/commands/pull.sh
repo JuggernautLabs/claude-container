@@ -232,12 +232,12 @@ Options:
   --help, -h               Show this help
 
 Modes:
-  No branch        Extract session branches to host repos only.
-  With branch      Extract + auto-merge into the target branch.
-                   Only clean merges are performed — repos that would conflict
-                   are skipped, and you'll be told to resolve in-container first.
-  --reconcile      Extract → stash dirty → merge target into session →
-                   resolve conflicts (launches container if needed) → merge back.
+  No branch (default)  Extract session branches to host repos only.
+  With branch          Extract + auto-merge into the target branch.
+                       Only clean merges are performed — repos that would conflict
+                       are skipped, and you'll be told to resolve in-container first.
+  --reconcile          Extract → stash dirty → merge target into session →
+                       resolve conflicts (launches container if needed) → merge back.
 
 Safety:
   Merging into a non-session branch (e.g. main) will only proceed if the merge

@@ -1124,6 +1124,7 @@ session_sync() {
                     git -c safe.directory='*' remote add upstream /upstream
                     git -c safe.directory='*' fetch upstream '$target_branch' 2>&1
                     git -c safe.directory='*' rebase 'upstream/$target_branch' 2>&1
+                    git -c safe.directory='*' remote remove upstream 2>/dev/null || true
                 " 2>&1) || true
 
             if echo "$rebase_output" | grep -qE "CONFLICT|Merge conflict|could not apply"; then
@@ -1483,7 +1484,7 @@ session_refresh() {
             elif git merge-base --is-ancestor FETCH_HEAD \"\$local_head\"; then
                 echo 'SAME|$proj_name|up to date'
             else
-                echo 'DIVERGE|$proj_name|session and host have diverged (use --force or push --rebase)'
+                echo 'DIVERGE|$proj_name|session and host have diverged'
             fi
             git remote remove _host 2>/dev/null || true
         ) &"
@@ -1592,7 +1593,10 @@ session_refresh() {
         warn "$skip_count project(s) skipped"
     fi
     if [[ $fail_count -gt 0 ]]; then
-        warn "$fail_count project(s) diverged (use push --rebase)"
+        warn "$fail_count project(s) diverged — options:"
+        echo "  push -s $session_name --merge       Merge host branch into session (launches container if conflicts)"
+        echo "  push -s $session_name --rebase       Rebase session onto host branch (launches container if conflicts)"
+        echo "  push -s $session_name --ff --force   Force-reset session to host HEAD (discards session changes)"
     fi
 }
 
@@ -1641,6 +1645,35 @@ session_merge_into() {
     local summary_lines=()  # Collect summary for Claude's initial prompt
     local dirty_mounts=()   # Collect proj_name|proj_path for .merge-into-mounts marker
 
+    # Phase 1: Single fast scan for merge-in-progress + dirty status across all repos
+    local _util_image="${GIT_UTIL_IMAGE:-alpine/git}"
+    local _merge_scan
+    _merge_scan=$(docker run --rm --entrypoint sh \
+        -v "$volume:/session:ro" "$_util_image" \
+        -c '
+            git config --global --add safe.directory "*"
+            for d in /session/*/ /session/*/*/; do
+                [ -d "$d/.git" ] || continue
+                name="${d#/session/}"; name="${name%/}"
+                merging="no"
+                [ -f "$d/.git/MERGE_HEAD" ] && merging="yes"
+                dirty=$(cd "$d" && git status --porcelain 2>/dev/null | wc -l | tr -d " ")
+                echo "$name|$merging|$dirty"
+            done
+        ' 2>/dev/null) || true
+
+    # Build lookup maps
+    declare -A _merge_status _dirty_file_count
+    while IFS='|' read -r _mn _mm _md; do
+        [[ -z "$_mn" ]] && continue
+        _merge_status[$_mn]="$_mm"
+        _dirty_file_count[$_mn]="${_md:-0}"
+    done <<< "$_merge_scan"
+
+    # Phase 2: Host-side checks + merge (only repos that need it)
+    local host_uid
+    host_uid=$(get_host_uid)
+
     while IFS='|' read -r proj_name proj_path; do
         [[ -z "$proj_name" ]] && continue
 
@@ -1660,50 +1693,51 @@ session_merge_into() {
             continue
         fi
 
-        info "  Merging into $proj_name..."
-
-        # Check for merge in progress
-        local merge_in_progress
-        merge_in_progress=$(docker run --rm \
-            -v "$volume:/session:ro" \
-            "$git_image" \
-            sh -c "test -f '/session/$proj_name/.git/MERGE_HEAD' && echo 'yes' || echo 'no'" 2>/dev/null)
-
-        if [[ "$merge_in_progress" == "yes" ]]; then
+        # Check for merge in progress (from scan)
+        if [[ "${_merge_status[$proj_name]:-no}" == "yes" ]]; then
             warn "    $proj_name has merge in progress (use git commit or git merge --abort)"
             summary_lines+=("CONFLICT: $proj_name (merge in progress)")
             conflict_count=$((conflict_count + 1))
             continue
         fi
 
-        # Check for uncommitted/unstaged changes BEFORE merging
-        local dirty_status
-        dirty_status=$(docker run --rm \
-            -v "$volume:/session:ro" \
-            "$git_image" \
-            sh -c "git config --global --add safe.directory '*' && cd '/session/$proj_name' && git status --porcelain" 2>/dev/null)
-
-        if [[ -n "$dirty_status" ]]; then
-            warn "    $proj_name has uncommitted changes in session — skipping merge, mounting host repo for Claude"
-            echo "$dirty_status" | head -3 | sed 's/^/      /'
-            local change_count
-            change_count=$(echo "$dirty_status" | wc -l | tr -d ' ')
-            if [[ $change_count -gt 3 ]]; then
-                echo "      ... and $((change_count - 3)) more"
-            fi
-            # Mount the host repo into the container so Claude can handle the merge
+        # Check for uncommitted changes (from scan)
+        local _dc="${_dirty_file_count[$proj_name]:-0}"
+        if [[ "$_dc" -gt 0 ]]; then
+            warn "    $proj_name has $_dc uncommitted file(s) in session — skipping merge, mounting host repo for Claude"
             EXTRA_DOCKER_ARGS+=("-v" "$proj_path:/host/$proj_name:ro")
             dirty_mounts+=("$proj_name|$proj_path")
-            summary_lines+=("DIRTY: $proj_name ($change_count uncommitted changes) — host repo mounted at /host/$proj_name")
+            summary_lines+=("DIRTY: $proj_name ($_dc uncommitted changes) — host repo mounted at /host/$proj_name")
             dirty_count=$((dirty_count + 1))
             continue
         fi
 
+        # Check if host target branch is already an ancestor of session HEAD
+        # (nothing to merge — session already has everything from target)
+        local _session_head _host_target_head
+        _session_head=$(docker run --rm --entrypoint sh \
+            -v "$volume:/session:ro" "$_util_image" \
+            -c "cd '/session/$proj_name' && git rev-parse HEAD 2>/dev/null" 2>/dev/null || echo "")
+        _host_target_head=$(git -C "$proj_path" rev-parse "refs/heads/$target_branch" 2>/dev/null || echo "")
+
+        if [[ -n "$_host_target_head" && -n "$_session_head" ]]; then
+            # Check if host target is already in session history
+            local _is_ancestor
+            _is_ancestor=$(docker run --rm --entrypoint sh \
+                -v "$volume:/session:ro" "$_util_image" \
+                -c "cd '/session/$proj_name' && git merge-base --is-ancestor '$_host_target_head' HEAD 2>/dev/null && echo yes || echo no" 2>/dev/null)
+            if [[ "$_is_ancestor" == "yes" ]]; then
+                info "    $proj_name (already up to date)"
+                summary_lines+=("OK: $proj_name (up to date)")
+                success_count=$((success_count + 1))
+                continue
+            fi
+        fi
+
+        info "  Merging into $proj_name..."
+
         # Add remote, fetch, and merge in one docker run
         local merge_output
-        local host_uid
-        host_uid=$(get_host_uid)
-
         merge_output=$(docker run --rm \
             --user "$host_uid:$host_uid" \
             -v "$volume:/session" \
@@ -1715,6 +1749,7 @@ session_merge_into() {
                 git -c safe.directory='*' remote add upstream /upstream
                 git -c safe.directory='*' fetch upstream '$target_branch' 2>&1
                 git -c safe.directory='*' merge 'upstream/$target_branch' --no-edit 2>&1 || true
+                git -c safe.directory='*' remote remove upstream 2>/dev/null || true
             " 2>&1)
 
         if echo "$merge_output" | grep -qE "CONFLICT|Merge conflict|Automatic merge failed"; then

@@ -4,15 +4,14 @@
 #
 # Usage:
 #   claude-container push -s <session> [branch] [options]
-#   claude-container push -s myproj                     # fast-forward from session-named branch
-#   claude-container push -s myproj main                # fast-forward from main
-#   claude-container push -s myproj main --rebase       # rebase session onto main
+#   claude-container push -s myproj main                # fast-forward from main (default)
 #   claude-container push -s myproj main --merge        # merge main into session
+#   claude-container push -s myproj main --rebase       # rebase session onto main
 
 cmd_push() {
     local session_name=""
     local branch=""
-    local strategy="ff"  # ff, rebase, merge
+    local strategy="ff"  # ff, merge, rebase
     local force=false
     local repo_filter=""
     local repo_branch=""
@@ -80,19 +79,11 @@ cmd_push() {
 
     case "$strategy" in
         ff)
-            # Fast-forward: fetch + ff from host branch
+            # Fast-forward: fetch + ff from host branch (default)
             # repo_branch (from --repo name,branch) overrides positional branch
-            local refresh_branch="${repo_branch:-${branch:-$session_name}}"
+            local refresh_branch="${repo_branch:-${branch:-main}}"
             session_refresh "$session_name" "$refresh_branch" "$repo_filter" "$force"
             return $?
-            ;;
-        rebase)
-            # Rebase session onto host branch
-            local rebase_branch="${branch:-main}"
-            session_sync "$session_name" "$rebase_branch"
-            # session_sync stores .sync-branch marker and returns to main script
-            # for container startup (conflicts need Claude). Exec back.
-            exec "$0" --session "$session_name"
             ;;
         merge)
             # Merge host branch into session
@@ -105,6 +96,14 @@ cmd_push() {
             # Conflicts — exec back for container startup with auto-merge
             exec "$0" --session "$session_name" --auto-merge
             ;;
+        rebase)
+            # Rebase session onto host branch
+            local rebase_branch="${branch:-main}"
+            session_sync "$session_name" "$rebase_branch"
+            # session_sync stores .sync-branch marker and returns to main script
+            # for container startup (conflicts need Claude). Exec back.
+            exec "$0" --session "$session_name"
+            ;;
     esac
 }
 
@@ -115,35 +114,35 @@ Usage: claude-container push -s <session> [branch] [options]
 Push host changes into a container session (host → container).
 
 Arguments:
-  branch                   Source branch to push from (default: session name for --ff, main for --rebase/--merge)
+  branch                   Source branch to push from (default: main)
 
 Options:
   --session, -s <name>     Session name (required)
   --repo <name>[,<branch>] Only push this repo, optionally from a specific branch.
                            Name can be partial (e.g. 'synapse' matches 'org/synapse').
   --ff                     Fast-forward from host branch (default)
-  --rebase                 Rebase session onto host branch
   --merge                  Merge host branch into session
+  --rebase                 Rebase session onto host branch
   --force, -f              Force operation
   --help, -h               Show this help
 
 Strategies (mutually exclusive):
-  --ff (default)   Fetch + fast-forward. No container needed unless diverged.
-  --rebase         Rebase session onto upstream. Launches container if conflicts.
-  --merge          Merge upstream into session. Launches container if conflicts.
+  --ff (default)     Fetch + fast-forward. If diverged, shows all available options.
+  --merge            Merge upstream into session. Launches container if conflicts.
+  --rebase           Rebase session onto upstream. Launches container if conflicts.
 
 Examples:
-  # Fast-forward session from host (session-named branch)
-  claude-container push -s myproj
-
-  # Fast-forward from main
+  # Fast-forward from main (default)
   claude-container push -s myproj main
 
-  # Rebase session onto main
-  claude-container push -s myproj main --rebase
+  # Fast-forward from main (main is default branch)
+  claude-container push -s myproj
 
-  # Merge main into session (for conflict resolution)
+  # Merge main into session (launches container if conflicts)
   claude-container push -s myproj main --merge
+
+  # Rebase session onto main (launches container if conflicts)
+  claude-container push -s myproj main --rebase
 
   # Push a single repo's main branch into session
   claude-container push -s myproj --repo synapse,main
