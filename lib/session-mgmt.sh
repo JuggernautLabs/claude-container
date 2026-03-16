@@ -1374,17 +1374,25 @@ session_refresh() {
 
     # Resolve repo filter before processing
     if [[ -n "$repo_filter" ]]; then
-        local _matches=()
+        local _suffix_matches=() _substr_matches=()
         while IFS='|' read -r _rn _rp; do
             [[ -z "$_rn" ]] && continue
             if [[ "$_rn" == "$repo_filter" ]]; then
-                # Exact match — use it directly, skip ambiguity check
-                _matches=("$_rn")
-                break
+                _suffix_matches=("$_rn"); break  # exact match
             elif [[ "$_rn" == */"$repo_filter" ]]; then
-                _matches+=("$_rn")
+                _suffix_matches+=("$_rn")
+            elif [[ "$_rn" == *"$repo_filter"* ]]; then
+                _substr_matches+=("$_rn")
             fi
         done <<< "$projects"
+
+        # Prefer suffix matches; fall back to substring
+        local _matches=()
+        if [[ ${#_suffix_matches[@]} -gt 0 ]]; then
+            _matches=("${_suffix_matches[@]}")
+        else
+            _matches=("${_substr_matches[@]}")
+        fi
 
         if [[ ${#_matches[@]} -eq 0 ]]; then
             error "No repo matching '$repo_filter' in session"
@@ -1815,13 +1823,18 @@ session_merge_into() {
     done
     if [[ $conflict_count -gt 0 ]]; then
         merge_summary+=$'\n\n'"$conflict_count project(s) have merge conflicts that need resolution."
-        merge_summary+=$'\n\n'"Resolve all merge conflicts autonomously. The session branch contains the work we want to keep — when conflicts arise, prefer the session (HEAD/ours) side. The '$target_branch' branch changes should be incorporated where they don't conflict, but session work takes priority."
+        merge_summary+=$'\n\n'"Resolve all merge conflicts. The '$target_branch' branch is incoming work that should generally be accepted — prefer the incoming (theirs/'$target_branch') side unless it would remove or overwrite substantive session work."
+        merge_summary+=$'\n\n'"IMPORTANT: If resolving a conflict would discard or significantly alter work from the session (HEAD/ours), do NOT silently drop it. Instead, raise this to the human with:"
+        merge_summary+=$'\n'"  - What the session had (ours)"
+        merge_summary+=$'\n'"  - What the incoming branch has (theirs)"
+        merge_summary+=$'\n'"  - Why they conflict"
+        merge_summary+=$'\n'"  - Your recommendation"
         merge_summary+=$'\n\n'"For each conflicted project:"
         merge_summary+=$'\n'"1. Find all files with <<<<<<< markers: grep -r '<<<<<<< HEAD' ."
-        merge_summary+=$'\n'"2. Edit each file to resolve conflicts, keeping our (HEAD) changes"
+        merge_summary+=$'\n'"2. Edit each file to resolve conflicts, preferring incoming changes unless they remove session work"
         merge_summary+=$'\n'"3. git add the resolved files"
         merge_summary+=$'\n'"4. git commit to complete the merge"
-        merge_summary+=$'\n\n'"Do not ask for clarification unless a conflict is genuinely ambiguous (e.g. both sides made substantive changes to the same logic). Just resolve and commit."
+        merge_summary+=$'\n\n'"Resolve autonomously when the incoming side clearly wins (new additions, non-overlapping changes, formatting). Ask the human when both sides made substantive changes to the same logic or when accepting incoming would remove session work."
     fi
     if [[ $dirty_count -gt 0 ]]; then
         merge_summary+=$'\n\n'"$dirty_count project(s) had uncommitted changes in the session and could not be auto-merged. The host repos are mounted read-only at /host/{project_name} so you can complete the merge manually."
@@ -1881,6 +1894,7 @@ session_extract() {
     local session_name="$1"
     local force=false
     local repo_filter=""
+    local result_dir=""
 
     # Parse flags
     shift
@@ -1888,6 +1902,7 @@ session_extract() {
         case "$1" in
             --force|-f) force=true; shift ;;
             --repo) repo_filter="$2"; shift 2 ;;
+            --result-dir) result_dir="$2"; shift 2 ;;
             *) shift ;;
         esac
     done
@@ -1906,7 +1921,9 @@ session_extract() {
         return 1
     fi
 
-    info "Extracting session '$session_name'..."
+    if [[ -z "$result_dir" ]]; then
+        info "Extracting session '$session_name'..."
+    fi
     local _util_image="${GIT_UTIL_IMAGE:-alpine/git}"
 
     # Detect workspace changes (renames, additions, deletions) since session creation
@@ -1927,7 +1944,7 @@ session_extract() {
     if [[ "$has_config" == "yes" ]]; then
         local config_content
         config_content=$(read_session_config "$volume")
-        _extract_multi_project_direct "$session_name" "$volume" "$_util_image" "$config_content" "$force" "$_old_manifest" "$repo_filter"
+        _extract_multi_project_direct "$session_name" "$volume" "$_util_image" "$config_content" "$force" "$_old_manifest" "$repo_filter" "$result_dir"
     else
         _extract_single_project_direct "$session_name" "$volume" "$_util_image" "$force"
     fi
@@ -1943,20 +1960,30 @@ _extract_multi_project_direct() {
     local force="$5"
     local old_manifest="${6:-}"
     local repo_filter="${7:-}"
+    local result_dir="${8:-}"
 
     # Resolve partial repo name to full name if filter specified
     if [[ -n "$repo_filter" ]]; then
         local _all_projects
         _all_projects=$(parse_session_projects "$config_content")
-        local _rf_matches=()
+        local _rf_suffix_matches=() _rf_substr_matches=()
         while IFS='|' read -r _rn _rp; do
             [[ -z "$_rn" ]] && continue
             if [[ "$_rn" == "$repo_filter" ]]; then
-                _rf_matches=("$_rn"); break
-            elif [[ "$_rn" == */"$repo_filter" || "$_rn" == *"$repo_filter"* ]]; then
-                _rf_matches+=("$_rn")
+                _rf_suffix_matches=("$_rn"); break  # exact match
+            elif [[ "$_rn" == */"$repo_filter" ]]; then
+                _rf_suffix_matches+=("$_rn")
+            elif [[ "$_rn" == *"$repo_filter"* ]]; then
+                _rf_substr_matches+=("$_rn")
             fi
         done <<< "$_all_projects"
+        # Prefer suffix matches; fall back to substring
+        local _rf_matches=()
+        if [[ ${#_rf_suffix_matches[@]} -gt 0 ]]; then
+            _rf_matches=("${_rf_suffix_matches[@]}")
+        else
+            _rf_matches=("${_rf_substr_matches[@]}")
+        fi
         if [[ ${#_rf_matches[@]} -eq 0 ]]; then
             error "No repo matching '$repo_filter' in session"
             return 1
@@ -1968,8 +1995,10 @@ _extract_multi_project_direct() {
         repo_filter="${_rf_matches[0]}"
     fi
 
-    info "Multi-project session detected"
-    echo ""
+    if [[ -z "$result_dir" ]]; then
+        info "Multi-project session detected"
+        echo ""
+    fi
 
     if ! command -v yq &>/dev/null; then
         error "yq required for multi-project extraction"
@@ -2073,9 +2102,23 @@ _extract_multi_project_direct() {
         if [[ "$_s_head" != "$_h_head" ]]; then
             _need_bundle+=("$proj_name")
         elif git -C "$proj_path" show-ref --verify --quiet "refs/heads/$session_name" 2>/dev/null; then
-            success "  $proj_name → $session_name @ $_short_h"
+            if [[ -n "$result_dir" ]]; then
+                _pull_result_set "$result_dir" "$proj_name" "repo_name" "$proj_name"
+                _pull_result_set "$result_dir" "$proj_name" "extract_status" "unchanged"
+                _pull_result_set "$result_dir" "$proj_name" "container_head" "$_s_head"
+                _pull_result_set "$result_dir" "$proj_name" "session_head" "$_h_head"
+            else
+                success "  $proj_name → $session_name @ $_short_h"
+            fi
         else
-            echo -e "  ${BLUE}—${NC} $proj_name $_short_s"
+            if [[ -n "$result_dir" ]]; then
+                _pull_result_set "$result_dir" "$proj_name" "repo_name" "$proj_name"
+                _pull_result_set "$result_dir" "$proj_name" "extract_status" "unchanged"
+                _pull_result_set "$result_dir" "$proj_name" "container_head" "$_s_head"
+                _pull_result_set "$result_dir" "$proj_name" "session_head" "$_h_head"
+            else
+                echo -e "  ${BLUE}—${NC} $proj_name $_short_s"
+            fi
         fi
     done
 
@@ -2115,7 +2158,12 @@ _extract_multi_project_direct() {
                     _need_bundle+=("$_sname")
                 else
                     local _short_p4="${_p4_h_head:0:7}"
-                    if git -C "$_p4_host_path" show-ref --verify --quiet "refs/heads/$session_name" 2>/dev/null; then
+                    if [[ -n "$result_dir" ]]; then
+                        _pull_result_set "$result_dir" "$_sname" "repo_name" "$_sname"
+                        _pull_result_set "$result_dir" "$_sname" "extract_status" "unchanged"
+                        _pull_result_set "$result_dir" "$_sname" "container_head" "${_session_head_map[$_sname]}"
+                        _pull_result_set "$result_dir" "$_sname" "session_head" "$_p4_h_head"
+                    elif git -C "$_p4_host_path" show-ref --verify --quiet "refs/heads/$session_name" 2>/dev/null; then
                         success "  $_sname → $session_name @ $_short_p4"
                     else
                         echo -e "  ${BLUE}—${NC} $_sname $_short_p4"
@@ -2178,7 +2226,14 @@ _extract_multi_project_direct() {
 
         # Fetch from bundle
         if ! git -C "$proj_path" fetch "$bundle_file" HEAD 2>/dev/null; then
-            error "  $proj_name fetch failed"
+            if [[ -n "$result_dir" ]]; then
+                _pull_result_set "$result_dir" "$proj_name" "repo_name" "$proj_name"
+                _pull_result_set "$result_dir" "$proj_name" "extract_status" "failed"
+                _pull_result_set "$result_dir" "$proj_name" "extract_detail" "fetch failed"
+                _pull_result_set "$result_dir" "$proj_name" "container_head" "${_session_head_map[$proj_name]:-}"
+            else
+                error "  $proj_name fetch failed"
+            fi
             fail_count=$((fail_count + 1))
             continue
         fi
@@ -2201,7 +2256,14 @@ _extract_multi_project_direct() {
         fi
 
         if [[ "$_compare_base" == "$fetched_head" ]]; then
-            echo "  $proj_name (no changes)"
+            if [[ -n "$result_dir" ]]; then
+                _pull_result_set "$result_dir" "$proj_name" "repo_name" "$proj_name"
+                _pull_result_set "$result_dir" "$proj_name" "extract_status" "unchanged"
+                _pull_result_set "$result_dir" "$proj_name" "container_head" "$fetched_head"
+                _pull_result_set "$result_dir" "$proj_name" "session_head" "$_compare_base"
+            else
+                echo "  $proj_name (no changes)"
+            fi
             continue
         fi
 
@@ -2210,7 +2272,24 @@ _extract_multi_project_direct() {
             if git -C "$proj_path" merge-base --is-ancestor "$_compare_base" "$fetched_head" 2>/dev/null; then
                 : # fast-forward — safe to update
             elif [[ "$force" != "true" ]]; then
-                warn "Skipping $proj_name (branch '$session_name' has diverged, use --force)"
+                # Diverged without --force — compute divergence counts
+                if [[ -n "$result_dir" ]]; then
+                    local _merge_base
+                    _merge_base=$(git -C "$proj_path" merge-base "$_compare_base" "$fetched_head" 2>/dev/null || echo "")
+                    local _container_ahead=0 _host_ahead=0
+                    if [[ -n "$_merge_base" ]]; then
+                        _container_ahead=$(git -C "$proj_path" rev-list --count "$_merge_base".."$fetched_head" 2>/dev/null || echo "?")
+                        _host_ahead=$(git -C "$proj_path" rev-list --count "$_merge_base".."$_compare_base" 2>/dev/null || echo "?")
+                    fi
+                    _pull_result_set "$result_dir" "$proj_name" "repo_name" "$proj_name"
+                    _pull_result_set "$result_dir" "$proj_name" "extract_status" "diverged"
+                    _pull_result_set "$result_dir" "$proj_name" "diverge_container_ahead" "$_container_ahead"
+                    _pull_result_set "$result_dir" "$proj_name" "diverge_host_ahead" "$_host_ahead"
+                    _pull_result_set "$result_dir" "$proj_name" "container_head" "$fetched_head"
+                    _pull_result_set "$result_dir" "$proj_name" "session_head" "$_compare_base"
+                else
+                    warn "Skipping $proj_name (branch '$session_name' has diverged, use --force)"
+                fi
                 fail_count=$((fail_count + 1))
                 continue
             fi
@@ -2223,7 +2302,15 @@ _extract_multi_project_direct() {
             git -C "$proj_path" branch -f "$session_name" FETCH_HEAD 2>/dev/null
         else
             if ! git -C "$proj_path" branch "$session_name" FETCH_HEAD 2>/dev/null; then
-                error "  $proj_name branch creation failed"
+                if [[ -n "$result_dir" ]]; then
+                    _pull_result_set "$result_dir" "$proj_name" "repo_name" "$proj_name"
+                    _pull_result_set "$result_dir" "$proj_name" "extract_status" "failed"
+                    _pull_result_set "$result_dir" "$proj_name" "extract_detail" "branch creation failed"
+                    _pull_result_set "$result_dir" "$proj_name" "container_head" "$fetched_head"
+                    _pull_result_set "$result_dir" "$proj_name" "session_head" "$_compare_base"
+                else
+                    error "  $proj_name branch creation failed"
+                fi
                 fail_count=$((fail_count + 1))
                 continue
             fi
@@ -2235,12 +2322,21 @@ _extract_multi_project_direct() {
         local files_changed
         files_changed=$(git -C "$proj_path" diff --stat --name-only "$_compare_base".."$session_name" 2>/dev/null | wc -l | tr -d ' ')
 
-        if $_branch_checked_out; then
-            success "  $proj_name → updated checked-out branch '$session_name' ($commit_count commit(s), $files_changed file(s))"
-        elif $_branch_exists; then
-            success "  $proj_name → updated branch '$session_name' ($commit_count commit(s), $files_changed file(s))"
+        if [[ -n "$result_dir" ]]; then
+            _pull_result_set "$result_dir" "$proj_name" "repo_name" "$proj_name"
+            _pull_result_set "$result_dir" "$proj_name" "extract_status" "updated"
+            _pull_result_set "$result_dir" "$proj_name" "extract_commits" "$commit_count"
+            _pull_result_set "$result_dir" "$proj_name" "extract_files" "$files_changed"
+            _pull_result_set "$result_dir" "$proj_name" "container_head" "$fetched_head"
+            _pull_result_set "$result_dir" "$proj_name" "session_head" "$(git -C "$proj_path" rev-parse "refs/heads/$session_name" 2>/dev/null)"
         else
-            success "  $proj_name → branch '$session_name' ($commit_count commit(s), $files_changed file(s))"
+            if $_branch_checked_out; then
+                success "  $proj_name → updated checked-out branch '$session_name' ($commit_count commit(s), $files_changed file(s))"
+            elif $_branch_exists; then
+                success "  $proj_name → updated branch '$session_name' ($commit_count commit(s), $files_changed file(s))"
+            else
+                success "  $proj_name → branch '$session_name' ($commit_count commit(s), $files_changed file(s))"
+            fi
         fi
         success_count=$((success_count + 1))
     done
@@ -2281,12 +2377,24 @@ _extract_multi_project_direct() {
             if [[ -d "$_target_dir" ]] && is_git_repo "$_target_dir"; then
                 # Host repo exists — extract as a branch via bundle
                 if [[ ! -s "$_bundle" ]]; then
-                    warn "  $_new_name (no bundle data)"
+                    if [[ -n "$result_dir" ]]; then
+                        _pull_result_set "$result_dir" "$_new_name" "repo_name" "$_new_name"
+                        _pull_result_set "$result_dir" "$_new_name" "extract_status" "failed"
+                        _pull_result_set "$result_dir" "$_new_name" "extract_detail" "no bundle data"
+                    else
+                        warn "  $_new_name (no bundle data)"
+                    fi
                     fail_count=$((fail_count + 1))
                     continue
                 fi
                 if ! git -C "$_target_dir" fetch "$_bundle" HEAD 2>/dev/null; then
-                    error "  $_new_name fetch failed"
+                    if [[ -n "$result_dir" ]]; then
+                        _pull_result_set "$result_dir" "$_new_name" "repo_name" "$_new_name"
+                        _pull_result_set "$result_dir" "$_new_name" "extract_status" "failed"
+                        _pull_result_set "$result_dir" "$_new_name" "extract_detail" "fetch failed"
+                    else
+                        error "  $_new_name fetch failed"
+                    fi
                     fail_count=$((fail_count + 1))
                     continue
                 fi
@@ -2301,20 +2409,41 @@ _extract_multi_project_direct() {
                     _compare_base=$(git -C "$_target_dir" rev-parse HEAD 2>/dev/null)
                 fi
                 if [[ "$_compare_base" == "$_fetched_head" ]] && $_branch_exists; then
-                    echo "  $_new_name (no changes)"
+                    if [[ -n "$result_dir" ]]; then
+                        _pull_result_set "$result_dir" "$_new_name" "repo_name" "$_new_name"
+                        _pull_result_set "$result_dir" "$_new_name" "extract_status" "unchanged"
+                    else
+                        echo "  $_new_name (no changes)"
+                    fi
                     continue
                 fi
                 git -C "$_target_dir" branch -f "$session_name" FETCH_HEAD 2>/dev/null
-                if $_branch_exists; then
-                    local _n_commits
-                    _n_commits=$(git -C "$_target_dir" rev-list --count "$_compare_base".."$session_name" 2>/dev/null || echo "?")
-                    success "  $_new_name → branch '$session_name' in $_target_dir ($_n_commits commit(s))"
+                if [[ -n "$result_dir" ]]; then
+                    local _n_commits="?"
+                    if $_branch_exists; then
+                        _n_commits=$(git -C "$_target_dir" rev-list --count "$_compare_base".."$session_name" 2>/dev/null || echo "?")
+                    fi
+                    _pull_result_set "$result_dir" "$_new_name" "repo_name" "$_new_name"
+                    _pull_result_set "$result_dir" "$_new_name" "extract_status" "updated"
+                    _pull_result_set "$result_dir" "$_new_name" "extract_commits" "$_n_commits"
                 else
-                    success "  $_new_name → branch '$session_name' in $_target_dir"
+                    if $_branch_exists; then
+                        local _n_commits
+                        _n_commits=$(git -C "$_target_dir" rev-list --count "$_compare_base".."$session_name" 2>/dev/null || echo "?")
+                        success "  $_new_name → branch '$session_name' in $_target_dir ($_n_commits commit(s))"
+                    else
+                        success "  $_new_name → branch '$session_name' in $_target_dir"
+                    fi
                 fi
                 success_count=$((success_count + 1))
             elif [[ -d "$_target_dir" ]]; then
-                warn "  $_new_name → skipped (directory exists but not a git repo: $_target_dir)"
+                if [[ -n "$result_dir" ]]; then
+                    _pull_result_set "$result_dir" "$_new_name" "repo_name" "$_new_name"
+                    _pull_result_set "$result_dir" "$_new_name" "extract_status" "failed"
+                    _pull_result_set "$result_dir" "$_new_name" "extract_detail" "directory exists but not a git repo"
+                else
+                    warn "  $_new_name → skipped (directory exists but not a git repo: $_target_dir)"
+                fi
                 fail_count=$((fail_count + 1))
             else
                 # Host path missing — direct clone from session volume (avoids slow bundling)
@@ -2350,10 +2479,22 @@ _extract_multi_project_direct() {
                     git -C "$_target_dir" branch -f "$session_name" HEAD 2>/dev/null || true
                     local _commit_count
                     _commit_count=$(git -C "$_target_dir" rev-list --count HEAD 2>/dev/null || echo "?")
-                    success "  $_new_name → cloned to $_target_dir ($_commit_count commit(s))"
+                    if [[ -n "$result_dir" ]]; then
+                        _pull_result_set "$result_dir" "$_new_name" "repo_name" "$_new_name"
+                        _pull_result_set "$result_dir" "$_new_name" "extract_status" "cloned"
+                        _pull_result_set "$result_dir" "$_new_name" "extract_commits" "$_commit_count"
+                    else
+                        success "  $_new_name → cloned to $_target_dir ($_commit_count commit(s))"
+                    fi
                     success_count=$((success_count + 1))
                 else
-                    error "  $_new_name → clone failed"
+                    if [[ -n "$result_dir" ]]; then
+                        _pull_result_set "$result_dir" "$_new_name" "repo_name" "$_new_name"
+                        _pull_result_set "$result_dir" "$_new_name" "extract_status" "failed"
+                        _pull_result_set "$result_dir" "$_new_name" "extract_detail" "clone failed"
+                    else
+                        error "  $_new_name → clone failed"
+                    fi
                     fail_count=$((fail_count + 1))
                 fi
             fi
@@ -2399,16 +2540,19 @@ _extract_multi_project_direct() {
     # added via --add-repo, --discover-repos, or created inside the container)
     write_repo_manifest "$volume"
 
-    echo ""
-    if [[ $success_count -gt 0 ]]; then
-        success "Extracted $success_count repo(s) from session '$session_name'"
+    # Suppress summary when using unified reporting (result_dir mode)
+    if [[ -z "$result_dir" ]]; then
         echo ""
-        echo "To see changes:  git log main..$session_name"
-        echo "Checkout:        git checkout $session_name"
-        echo "Merge:           git merge $session_name"
-    fi
-    if [[ $fail_count -gt 0 ]]; then
-        warn "$fail_count repo(s) skipped or failed"
+        if [[ $success_count -gt 0 ]]; then
+            success "Extracted $success_count repo(s) from session '$session_name'"
+            echo ""
+            echo "To see changes:  git log main..$session_name"
+            echo "Checkout:        git checkout $session_name"
+            echo "Merge:           git merge $session_name"
+        fi
+        if [[ $fail_count -gt 0 ]]; then
+            warn "$fail_count repo(s) skipped or failed"
+        fi
     fi
 }
 
@@ -2752,6 +2896,8 @@ session_auto_merge() {
     local target_branch="${2:-main}"
     local dry_run="${3:-false}"
     local repo_filter="${4:-}"
+    local squash="${5:-true}"
+    local _unified_result_dir="${6:-}"
     local volume="claude-session-${session_name}"
     local git_image="${IMAGE_NAME:-$DEFAULT_IMAGE}"
 
@@ -2769,12 +2915,14 @@ session_auto_merge() {
         return 1
     fi
 
-    if [[ "$dry_run" == "true" ]]; then
-        info "Dry run: checking merge of '$session_name' into '$target_branch'..."
-    else
-        info "Merging session '$session_name' into '$target_branch'..."
+    if [[ -z "$_unified_result_dir" ]]; then
+        if [[ "$dry_run" == "true" ]]; then
+            info "Dry run: checking merge of '$session_name' into '$target_branch'..."
+        else
+            info "Merging session '$session_name' into '$target_branch'..."
+        fi
+        echo ""
     fi
-    echo ""
 
     local projects
     projects=$(parse_session_projects "$config_content")
@@ -2786,18 +2934,33 @@ session_auto_merge() {
 
     # Resolve partial repo filter against project list
     if [[ -n "$repo_filter" ]]; then
-        local _rf_matches=()
+        local _rf_suffix_matches=() _rf_substr_matches=()
         while IFS='|' read -r _rn _rp; do
             [[ -z "$_rn" ]] && continue
             if [[ "$_rn" == "$repo_filter" ]]; then
-                _rf_matches=("$_rn"); break
-            elif [[ "$_rn" == */"$repo_filter" || "$_rn" == *"$repo_filter"* ]]; then
-                _rf_matches+=("$_rn")
+                _rf_suffix_matches=("$_rn"); break  # exact match
+            elif [[ "$_rn" == */"$repo_filter" ]]; then
+                _rf_suffix_matches+=("$_rn")
+            elif [[ "$_rn" == *"$repo_filter"* ]]; then
+                _rf_substr_matches+=("$_rn")
             fi
         done <<< "$projects"
-        if [[ ${#_rf_matches[@]} -eq 1 ]]; then
-            repo_filter="${_rf_matches[0]}"
+        # Prefer suffix matches; fall back to substring
+        local _rf_matches=()
+        if [[ ${#_rf_suffix_matches[@]} -gt 0 ]]; then
+            _rf_matches=("${_rf_suffix_matches[@]}")
+        else
+            _rf_matches=("${_rf_substr_matches[@]}")
         fi
+        if [[ ${#_rf_matches[@]} -eq 0 ]]; then
+            error "No repo matching '$repo_filter' in session"
+            return 1
+        elif [[ ${#_rf_matches[@]} -gt 1 ]]; then
+            error "'$repo_filter' is ambiguous — matches ${#_rf_matches[@]} repos:"
+            for _m in "${_rf_matches[@]}"; do echo "  $_m"; done
+            return 1
+        fi
+        repo_filter="${_rf_matches[0]}"
     fi
 
     # Launch each merge in parallel
@@ -2813,44 +2976,147 @@ session_auto_merge() {
         (
             local _result_file="$_result_dir/${proj_name//\//_}"
 
+            # Helper: write to both internal result file and unified result dir
+            _write_merge_result() {
+                local status="$1" name="$2" msg="$3"
+                echo "${status}|${name}|${msg}" > "$_result_file"
+                if [[ -n "$_unified_result_dir" ]]; then
+                    _pull_result_set "$_unified_result_dir" "$name" "merge_status" "$status"
+                    _pull_result_set "$_unified_result_dir" "$name" "merge_detail" "$msg"
+                    # Write target branch HEAD for display
+                    local _t_head
+                    _t_head=$(git -C "$proj_path" rev-parse "refs/heads/$target_branch" 2>/dev/null || echo "")
+                    [[ -n "$_t_head" ]] && _pull_result_set "$_unified_result_dir" "$name" "target_head" "$_t_head"
+                fi
+            }
+
+            # If unified reporting: check extract status, skip stale/failed repos
+            if [[ -n "$_unified_result_dir" ]]; then
+                local _ext_status
+                _ext_status=$(_pull_result_get "$_unified_result_dir" "$proj_name" "extract_status")
+                case "$_ext_status" in
+                    diverged)
+                        local _c_ahead _h_ahead
+                        _c_ahead=$(_pull_result_get "$_unified_result_dir" "$proj_name" "diverge_container_ahead")
+                        _h_ahead=$(_pull_result_get "$_unified_result_dir" "$proj_name" "diverge_host_ahead")
+                        _write_merge_result "SKIP" "$proj_name" "skipped (stale branch, extraction diverged)"
+                        exit 0
+                        ;;
+                    failed)
+                        local _ext_detail
+                        _ext_detail=$(_pull_result_get "$_unified_result_dir" "$proj_name" "extract_detail")
+                        _write_merge_result "SKIP" "$proj_name" "skipped (extraction failed: $_ext_detail)"
+                        exit 0
+                        ;;
+                esac
+            fi
+
             if [[ ! -d "$proj_path" ]]; then
-                echo "SKIP|$proj_name|repo not found: $proj_path" > "$_result_file"
+                _write_merge_result "SKIP" "$proj_name" "repo not found: $proj_path"
                 exit 0
             fi
 
             # Skip repos where no session branch exists (nothing to merge — unchanged)
             if ! git -C "$proj_path" show-ref --verify --quiet "refs/heads/$session_name" 2>/dev/null; then
+                _write_merge_result "SKIP" "$proj_name" "no session branch (extraction may have been skipped)"
                 exit 0
-            fi
-
-            # Skip if session is already merged into target (nothing to do)
-            if git -C "$proj_path" show-ref --verify --quiet "refs/heads/$target_branch" 2>/dev/null; then
-                if git -C "$proj_path" merge-base --is-ancestor "$session_name" "$target_branch" 2>/dev/null; then
-                    echo "OK|$proj_name|already up to date" > "$_result_file"
-                    exit 0
-                fi
             fi
 
             # Check if target repo is dirty
             local orig_dirty
             orig_dirty=$(git -C "$proj_path" status --porcelain 2>/dev/null)
             if [[ -n "$orig_dirty" ]]; then
-                echo "SKIP|$proj_name|host has uncommitted changes" > "$_result_file"
+                _write_merge_result "SKIP" "$proj_name" "host has uncommitted changes"
                 exit 0
             fi
 
             # If target branch doesn't exist, create it from session branch
             if ! git -C "$proj_path" show-ref --verify --quiet "refs/heads/$target_branch" 2>/dev/null; then
-                if [ '$dry_run' != 'true' ]; then
+                if [[ "$dry_run" != "true" ]]; then
                     git -C "$proj_path" branch "$target_branch" "$session_name" 2>/dev/null
                 fi
-                echo "OK|$proj_name|would create '$target_branch' from $session_name" > "$_result_file"
+                _write_merge_result "OK" "$proj_name" "created '$target_branch' from $session_name"
                 exit 0
             fi
 
-            # Check if already up to date (session is ancestor of target)
+            # --- Squash-base tracking (authoritative when exists) ---
+            if [[ "$squash" == "true" ]]; then
+                local _squash_ref="refs/claude-container/squash-base/${session_name}"
+                local _squash_base
+                _squash_base=$(git -C "$proj_path" rev-parse --verify "$_squash_ref" 2>/dev/null || echo "")
+
+                # Validate squash-base is an ancestor of current session.
+                # If not (different lineage from force-extract or rebase),
+                # the ref is stale — clear it and fall through to generic checks.
+                if [[ -n "$_squash_base" ]] && \
+                   ! git -C "$proj_path" merge-base --is-ancestor "$_squash_base" "$session_name" 2>/dev/null; then
+                    git -C "$proj_path" update-ref -d "$_squash_ref" 2>/dev/null || true
+                    _squash_base=""
+                fi
+
+                if [[ -n "$_squash_base" ]]; then
+                    local _new_count
+                    _new_count=$(git -C "$proj_path" rev-list --count "${_squash_base}..${session_name}" 2>/dev/null || echo "0")
+
+                    if [[ "$_new_count" == "0" ]]; then
+                        _write_merge_result "OK" "$proj_name" "squash-merged (no new commits since last squash)"
+                        exit 0
+                    fi
+
+                    if [[ "$dry_run" == "true" ]]; then
+                        _write_merge_result "OK" "$proj_name" "would squash-merge into $target_branch ($_new_count new)"
+                        exit 0
+                    fi
+
+                    # Cherry-pick only new commits since last squash
+                    local current_branch
+                    current_branch=$(git -C "$proj_path" symbolic-ref --short HEAD 2>/dev/null || echo "")
+                    local _need_checkout_back=false
+                    if [[ "$current_branch" != "$target_branch" ]]; then
+                        if ! git -C "$proj_path" checkout "$target_branch" 2>/dev/null; then
+                            _write_merge_result "SKIP" "$proj_name" "could not checkout $target_branch"
+                            exit 0
+                        fi
+                        _need_checkout_back=true
+                    fi
+
+                    if git -C "$proj_path" cherry-pick --no-commit "${_squash_base}..${session_name}" >/dev/null 2>&1; then
+                        local _commit_out
+                        _commit_out=$(git -C "$proj_path" commit -m "Squash merge $session_name into $target_branch ($_new_count new commit(s))" 2>&1) || true
+                        local _new_session_head
+                        _new_session_head=$(git -C "$proj_path" rev-parse "$session_name" 2>/dev/null)
+                        git -C "$proj_path" update-ref "$_squash_ref" "$_new_session_head"
+                        _write_merge_result "OK" "$proj_name" "squash-merged into $target_branch ($_new_count new)"
+                    else
+                        local _conflict_files=""
+                        _conflict_files=$(git -C "$proj_path" diff --name-only --diff-filter=U 2>/dev/null | head -5 | tr '\n' ', ')
+                        _conflict_files="${_conflict_files%,}"
+                        git -C "$proj_path" cherry-pick --abort 2>/dev/null || true
+                        if [[ -n "$_unified_result_dir" && -n "$_conflict_files" ]]; then
+                            _pull_result_set "$_unified_result_dir" "$proj_name" "conflict_files" "$_conflict_files"
+                        fi
+                        _write_merge_result "CONFLICT" "$proj_name" "would conflict"
+                    fi
+
+                    if $_need_checkout_back; then
+                        git -C "$proj_path" checkout "$current_branch" 2>/dev/null || true
+                    fi
+                    exit 0
+                fi
+            fi
+
+            # --- Generic ancestry checks (no squash-base exists) ---
+
+            # Check if session is already ancestor of target (true merge ancestry)
             if git -C "$proj_path" merge-base --is-ancestor "$session_name" "$target_branch" 2>/dev/null; then
-                echo "OK|$proj_name|already up to date" > "$_result_file"
+                _write_merge_result "OK" "$proj_name" "already up to date"
+                exit 0
+            fi
+
+            # Check if trees are identical (handles prior manual squash-merge
+            # where no squash-base ref was saved)
+            if git -C "$proj_path" diff --quiet "$session_name" "$target_branch" -- 2>/dev/null; then
+                _write_merge_result "OK" "$proj_name" "content identical to $target_branch"
                 exit 0
             fi
 
@@ -2874,17 +3140,28 @@ session_auto_merge() {
                 fi
 
                 if ! $_checkout_ok; then
-                    echo "SKIP|$proj_name|could not checkout $target_branch" > "$_result_file"
+                    _write_merge_result "SKIP" "$proj_name" "could not checkout $target_branch"
                     exit 0
                 fi
 
-                if ! git -C "$proj_path" merge --no-commit --no-ff "$session_name" 2>/dev/null; then
-                    # Conflicts detected — abort and skip
+                local _dryrun_rc=0
+                if ! git -C "$proj_path" merge --no-commit --no-ff "$session_name" >/dev/null 2>&1; then
+                    _dryrun_rc=1
+                fi
+
+                if [[ $_dryrun_rc -ne 0 ]]; then
+                    # Conflicts detected — capture conflicting file names, then abort
+                    local _conflict_files=""
+                    _conflict_files=$(git -C "$proj_path" diff --name-only --diff-filter=U 2>/dev/null | head -5 | tr '\n' ', ')
+                    _conflict_files="${_conflict_files%,}"
                     git -C "$proj_path" merge --abort 2>/dev/null || true
                     if [[ "$current_branch" != "$target_branch" ]]; then
                         git -C "$proj_path" checkout "$current_branch" 2>/dev/null || true
                     fi
-                    echo "CONFLICT|$proj_name|would conflict" > "$_result_file"
+                    if [[ -n "$_unified_result_dir" && -n "$_conflict_files" ]]; then
+                        _pull_result_set "$_unified_result_dir" "$proj_name" "conflict_files" "$_conflict_files"
+                    fi
+                    _write_merge_result "CONFLICT" "$proj_name" "would conflict"
                     exit 0
                 fi
 
@@ -2896,31 +3173,61 @@ session_auto_merge() {
             fi
 
             # Safe to merge — either fast-forward or verified clean
-            if [ '$dry_run' = 'true' ]; then
-                if $is_ff; then
-                    echo "OK|$proj_name|would fast-forward into $target_branch" > "$_result_file"
+            if [[ "$dry_run" == "true" ]]; then
+                if [[ "$squash" == "true" ]]; then
+                    _write_merge_result "OK" "$proj_name" "would squash-merge into $target_branch"
+                elif $is_ff; then
+                    _write_merge_result "OK" "$proj_name" "would fast-forward into $target_branch"
                 else
-                    echo "OK|$proj_name|would merge cleanly into $target_branch" > "$_result_file"
+                    _write_merge_result "OK" "$proj_name" "would merge cleanly into $target_branch"
                 fi
             else
                 local current_branch
                 current_branch=$(git -C "$proj_path" symbolic-ref --short HEAD 2>/dev/null || echo "")
 
-                if [[ "$current_branch" == "$target_branch" ]]; then
+                # Checkout target branch if needed
+                local _need_checkout_back=false
+                if [[ "$current_branch" != "$target_branch" ]]; then
+                    if ! git -C "$proj_path" checkout "$target_branch" 2>/dev/null; then
+                        _write_merge_result "SKIP" "$proj_name" "could not checkout $target_branch"
+                        exit 0
+                    fi
+                    _need_checkout_back=true
+                fi
+
+                if [[ "$squash" == "true" ]]; then
+                    local _merge_out _merge_rc=0
+                    _merge_out=$(git -C "$proj_path" merge --squash "$session_name" 2>&1) || _merge_rc=$?
+                    if [[ $_merge_rc -ne 0 ]]; then
+                        # Squash merge failed (shouldn't happen — dry-run passed)
+                        git -C "$proj_path" reset --hard HEAD 2>/dev/null || true
+                        _write_merge_result "SKIP" "$proj_name" "squash-merge failed unexpectedly"
+                    elif git -C "$proj_path" diff --cached --quiet 2>/dev/null; then
+                        _write_merge_result "OK" "$proj_name" "already up to date"
+                    else
+                        local _commit_out _commit_rc=0
+                        _commit_out=$(git -C "$proj_path" commit --no-edit 2>&1) || _commit_rc=$?
+                        if [[ $_commit_rc -ne 0 ]]; then
+                            git -C "$proj_path" reset --hard HEAD 2>/dev/null || true
+                            _write_merge_result "SKIP" "$proj_name" "commit failed after squash"
+                        else
+                            # Save squash-base so future pulls only cherry-pick new commits
+                            local _squash_ref="refs/claude-container/squash-base/${session_name}"
+                            git -C "$proj_path" update-ref "$_squash_ref" "$(git -C "$proj_path" rev-parse "$session_name")" 2>/dev/null || true
+                            _write_merge_result "OK" "$proj_name" "squash-merged into $target_branch"
+                            { [[ -n "$_merge_out" ]] && echo "$_merge_out"; [[ -n "$_commit_out" ]] && echo "$_commit_out"; } >> "$_result_file.detail"
+                        fi
+                    fi
+                else
                     local _merge_out
                     _merge_out=$(git -C "$proj_path" merge "$session_name" --no-edit 2>&1) || true
-                    echo "OK|$proj_name|merged $session_name into $target_branch" > "$_result_file"
+                    _write_merge_result "OK" "$proj_name" "merged into $target_branch"
                     [[ -n "$_merge_out" ]] && echo "$_merge_out" >> "$_result_file.detail"
-                else
-                    if git -C "$proj_path" checkout "$target_branch" 2>/dev/null; then
-                        local _merge_out
-                        _merge_out=$(git -C "$proj_path" merge "$session_name" --no-edit 2>&1) || true
-                        echo "OK|$proj_name|merged $session_name into $target_branch" > "$_result_file"
-                        [[ -n "$_merge_out" ]] && echo "$_merge_out" >> "$_result_file.detail"
-                        git -C "$proj_path" checkout "$current_branch" 2>/dev/null || true
-                    else
-                        echo "SKIP|$proj_name|could not checkout $target_branch" > "$_result_file"
-                    fi
+                fi
+
+                # Return to original branch if we checked out
+                if $_need_checkout_back; then
+                    git -C "$proj_path" checkout "$current_branch" 2>/dev/null || true
                 fi
             fi
         ) &
@@ -2932,7 +3239,7 @@ session_auto_merge() {
         wait "$_pid" 2>/dev/null || true
     done
 
-    # Collect and display results
+    # Collect and display results (suppress when unified reporting is active)
     local merge_ok=0
     local merge_skip=0
     local merge_conflict=0
@@ -2951,40 +3258,54 @@ session_auto_merge() {
 
         case "$_status" in
             OK)
-                success "  $_name: $_msg"
-                # Show merge detail indented under project header
-                if [[ -f "$_result_file.detail" ]]; then
-                    while IFS= read -r _detail_line; do
-                        echo "    $_detail_line"
-                    done < "$_result_file.detail"
+                if [[ -z "$_unified_result_dir" ]]; then
+                    success "  $_name: $_msg"
+                    if [[ -f "$_result_file.detail" ]]; then
+                        while IFS= read -r _detail_line; do
+                            echo "    $_detail_line"
+                        done < "$_result_file.detail"
+                    fi
                 fi
                 merge_ok=$((merge_ok + 1))
                 ;;
             SKIP)
-                warn "  $_name: $_msg (skipped)"
+                if [[ -z "$_unified_result_dir" ]]; then
+                    warn "  $_name: $_msg (skipped)"
+                fi
                 merge_skip=$((merge_skip + 1))
                 ;;
             CONFLICT)
-                warn "  $_name: $_msg (skipped)"
+                if [[ -z "$_unified_result_dir" ]]; then
+                    warn "  $_name: $_msg (skipped)"
+                fi
                 merge_conflict=$((merge_conflict + 1))
                 ;;
         esac
     done
 
-    echo ""
-    if [[ $merge_ok -gt 0 ]]; then
-        success "$merge_ok project(s) merged into $target_branch"
-    fi
-    if [[ $merge_skip -gt 0 ]]; then
-        warn "$merge_skip project(s) skipped"
-    fi
-    if [[ $merge_conflict -gt 0 ]]; then
-        warn "$merge_conflict project(s) would conflict — skipped"
+    if [[ -z "$_unified_result_dir" ]]; then
         echo ""
-        echo "  Resolve conflicts in-container first, then pull again:"
-        echo "    claude-container push -s $session_name $target_branch --merge"
-        echo "    claude-container pull -s $session_name $target_branch"
-        return 2
+        if [[ $merge_ok -gt 0 ]]; then
+            success "$merge_ok project(s) merged into $target_branch"
+        fi
+        if [[ $merge_skip -gt 0 ]]; then
+            warn "$merge_skip project(s) skipped"
+        fi
+        if [[ $merge_conflict -gt 0 ]]; then
+            warn "$merge_conflict project(s) would conflict — skipped"
+            echo ""
+            echo "  Resolve conflicts in-container first, then pull again:"
+            echo "    claude-container pull -s $session_name $target_branch --reconcile"
+            return 2
+        fi
+        if [[ $merge_ok -eq 0 && $merge_skip -gt 0 && $merge_conflict -eq 0 ]]; then
+            echo "  Hint: extraction was skipped — try 'pull --force' or 'pull --reconcile'"
+        fi
+    else
+        # Return exit code for conflict reporting
+        if [[ $merge_conflict -gt 0 ]]; then
+            return 2
+        fi
     fi
 }
 

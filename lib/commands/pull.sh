@@ -7,6 +7,7 @@
 #   claude-container pull -s myproj                      # extract only
 #   claude-container pull -s myproj main                 # extract + merge into main
 #   claude-container pull -s myproj main --reconcile     # full reconcile cycle
+#   claude-container pull -s myproj --status             # read-only status check
 
 cmd_pull() {
     local session_name=""
@@ -15,6 +16,8 @@ cmd_pull() {
     local reconcile=false
     local force=false
     local dry_run=false
+    local squash=true
+    local status_only=false
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -34,8 +37,20 @@ cmd_pull() {
                 force=true
                 shift
                 ;;
+            --squash)
+                squash=true
+                shift
+                ;;
+            --no-squash)
+                squash=false
+                shift
+                ;;
             --dry-run)
                 dry_run=true
+                shift
+                ;;
+            --status)
+                status_only=true
                 shift
                 ;;
             --help|-h)
@@ -74,9 +89,21 @@ cmd_pull() {
         return 1
     fi
 
+    # Status check mode — read-only, no extraction or merge
+    if $status_only; then
+        _pull_status "$session_name" "$repo_filter"
+        return $?
+    fi
+
     # Extract session branches to host repos
     local extract_args=("$session_name")
     if $force; then
+        extract_args+=(--force)
+    fi
+    # When merging into a target branch, always force-extract.
+    # The session branch is just transport — container is source of truth.
+    # Main is protected by merge conflict detection.
+    if [[ -n "$branch" ]]; then
         extract_args+=(--force)
     fi
     if [[ -n "$repo_filter" ]]; then
@@ -90,23 +117,386 @@ cmd_pull() {
             echo "Usage: claude-container pull -s <session> <branch> --reconcile"
             return 1
         fi
+        # Reconcile uses legacy (non-unified) output
         _pull_reconcile "$session_name" "$branch" "$force"
         return $?
     fi
 
     if $dry_run; then
         # Dry-run: check what would happen without extracting or merging
-        session_auto_merge "$session_name" "$branch" true "$repo_filter"
+        session_auto_merge "$session_name" "$branch" true "$repo_filter" "$squash"
         return $?
     fi
 
-    # Extract
+    # --- Unified reporting mode ---
+    local _pull_result_dir
+    _pull_result_dir=$(mktemp -d)
+    trap "rm -rf '$_pull_result_dir'" RETURN
+
+    if [[ -n "$branch" ]]; then
+        info "Pulling session '$session_name' into '$branch'..."
+    else
+        info "Pulling session '$session_name'..."
+    fi
+    echo ""
+
+    # Extract with result tracking
+    extract_args+=(--result-dir "$_pull_result_dir")
     session_extract "${extract_args[@]}"
 
-    # If branch specified, also merge into target
+    # If branch specified, also merge into target with result tracking
+    local _merge_rc=0
     if [[ -n "$branch" ]]; then
-        echo ""
-        session_auto_merge "$session_name" "$branch" false "$repo_filter"
+        session_auto_merge "$session_name" "$branch" false "$repo_filter" "$squash" "$_pull_result_dir" || _merge_rc=$?
+    fi
+
+    # Render unified report
+    echo ""
+    _pull_report "$session_name" "$branch" "$_pull_result_dir" "$repo_filter"
+    return $_merge_rc
+}
+
+# Unified pull report — reads result files and renders per-repo output
+# Usage: _pull_report <session_name> <branch> <result_dir> [repo_filter]
+_pull_report() {
+    local session_name="$1"
+    local target_branch="$2"
+    local result_dir="$3"
+    local repo_filter="${4:-}"
+    local volume="claude-session-${session_name}"
+
+    # Collect all repos that have result files
+    local _pulled=0 _unchanged=0 _needs_attention=0 _conflicts=0
+
+    # Read config to iterate repos in order
+    local config_content
+    config_content=$(read_session_config "$volume")
+    local projects=""
+    if [[ -n "$config_content" ]]; then
+        projects=$(parse_session_projects "$config_content")
+    fi
+
+    # Collect repo names from result files (covers repos not in config too)
+    local -a _repo_names=()
+    local -A _repo_seen=()
+    # First: repos in config order
+    if [[ -n "$projects" ]]; then
+        while IFS='|' read -r _pname _ppath; do
+            [[ -z "$_pname" ]] && continue
+            [[ -n "$repo_filter" && "$_pname" != "$repo_filter" ]] && continue
+            local _rfile="${result_dir}/${_pname//\//_}"
+            if [[ -f "$_rfile" ]]; then
+                _repo_names+=("$_pname")
+                _repo_seen[$_pname]=1
+            fi
+        done <<< "$projects"
+    fi
+    # Then: any result files for repos not in config
+    for _rfile in "$result_dir"/*; do
+        [[ -f "$_rfile" ]] || continue
+        [[ "$_rfile" == *.detail ]] && continue
+        local _rname
+        _rname=$(_pull_result_get "$result_dir" "$(basename "$_rfile")" "repo_name" 2>/dev/null)
+        # repo_name might be stored with slashes, but file uses underscores
+        # Read it directly from the file
+        _rname=$(grep "^repo_name=" "$_rfile" 2>/dev/null | tail -1 | cut -d= -f2-)
+        [[ -z "$_rname" ]] && continue
+        if [[ -z "${_repo_seen[$_rname]:-}" ]]; then
+            _repo_names+=("$_rname")
+            _repo_seen[$_rname]=1
+        fi
+    done
+
+    for _repo in "${_repo_names[@]}"; do
+        local _ext_status _ext_commits _ext_files _ext_detail
+        _ext_status=$(_pull_result_get "$result_dir" "$_repo" "extract_status")
+        _ext_commits=$(_pull_result_get "$result_dir" "$_repo" "extract_commits")
+        _ext_files=$(_pull_result_get "$result_dir" "$_repo" "extract_files")
+        _ext_detail=$(_pull_result_get "$result_dir" "$_repo" "extract_detail")
+
+        local _merge_status _merge_detail _conflict_files
+        _merge_status=$(_pull_result_get "$result_dir" "$_repo" "merge_status")
+        _merge_detail=$(_pull_result_get "$result_dir" "$_repo" "merge_detail")
+        _conflict_files=$(_pull_result_get "$result_dir" "$_repo" "conflict_files")
+
+        local _c_ahead _h_ahead
+        _c_ahead=$(_pull_result_get "$result_dir" "$_repo" "diverge_container_ahead")
+        _h_ahead=$(_pull_result_get "$result_dir" "$_repo" "diverge_host_ahead")
+
+        # Read commit hashes for display
+        local _container_head _session_head _target_head
+        _container_head=$(_pull_result_get "$result_dir" "$_repo" "container_head")
+        _session_head=$(_pull_result_get "$result_dir" "$_repo" "session_head")
+        _target_head=$(_pull_result_get "$result_dir" "$_repo" "target_head")
+        local _short_container="${_container_head:0:7}"
+        local _short_session="${_session_head:0:7}"
+        local _short_target="${_target_head:0:7}"
+
+        # Render repo header with hashes
+        local _hash_info=""
+        if [[ -n "$_container_head" ]]; then
+            _hash_info="  container:${_short_container}"
+        fi
+        if [[ -n "$_session_head" ]]; then
+            _hash_info="${_hash_info}  session:${_short_session}"
+        fi
+        if [[ -n "$_target_head" && -n "$target_branch" ]]; then
+            _hash_info="${_hash_info}  ${target_branch}:${_short_target}"
+        fi
+        echo -e "  ${BLUE}$_repo${NC}${_hash_info}"
+
+        # Extract line
+        case "$_ext_status" in
+            updated)
+                local _ext_info=""
+                [[ -n "$_ext_commits" && "$_ext_commits" != "0" ]] && _ext_info="${_ext_commits} commits"
+                [[ -n "$_ext_files" && "$_ext_files" != "0" ]] && _ext_info="${_ext_info:+$_ext_info, }${_ext_files} files"
+                echo -e "    extract:  ${GREEN}✓${NC} updated${_ext_info:+ ($_ext_info)}"
+                _pulled=$((_pulled + 1))
+                ;;
+            cloned)
+                local _ext_info=""
+                [[ -n "$_ext_commits" ]] && _ext_info="${_ext_commits} commits"
+                echo -e "    extract:  ${GREEN}✓${NC} cloned${_ext_info:+ ($_ext_info)}"
+                _pulled=$((_pulled + 1))
+                ;;
+            synced_local)
+                echo -e "    extract:  ${GREEN}✓${NC} synced local into container"
+                _pulled=$((_pulled + 1))
+                ;;
+            unchanged)
+                echo -e "    extract:  ${BLUE}—${NC} no changes"
+                _unchanged=$((_unchanged + 1))
+                ;;
+            diverged)
+                local _div_info=""
+                [[ -n "$_c_ahead" && -n "$_h_ahead" ]] && _div_info=" (container +${_c_ahead}, host +${_h_ahead})"
+                echo -e "    extract:  ${YELLOW}⚠${NC} diverged${_div_info}"
+                _needs_attention=$((_needs_attention + 1))
+                ;;
+            failed)
+                echo -e "    extract:  ${RED}✗${NC} failed${_ext_detail:+ ($_ext_detail)}"
+                _needs_attention=$((_needs_attention + 1))
+                ;;
+            *)
+                # No extract result (e.g. status-only check)
+                ;;
+        esac
+
+        # Merge line (only if target branch was specified)
+        if [[ -n "$target_branch" && -n "$_merge_status" ]]; then
+            case "$_merge_status" in
+                OK)
+                    case "$_merge_detail" in
+                        "already up to date"|"squash-merged (no new"*)
+                            echo -e "    merge:    ${BLUE}—${NC} already up to date"
+                            ;;
+                        "content identical to"*)
+                            echo -e "    merge:    ${BLUE}—${NC} ${_merge_detail} (likely prior squash)"
+                            ;;
+                        *)
+                            echo -e "    merge:    ${GREEN}✓${NC} ${session_name} → ${target_branch}: $_merge_detail"
+                            ;;
+                    esac
+                    ;;
+                SKIP)
+                    echo -e "    merge:    ${BLUE}—${NC} skipped${_merge_detail:+ (${_merge_detail})}"
+                    ;;
+                CONFLICT)
+                    echo -e "    merge:    ${YELLOW}⚠${NC} ${session_name} → ${target_branch} would conflict${_conflict_files:+ ($_conflict_files)}"
+                    _conflicts=$((_conflicts + 1))
+                    ;;
+            esac
+        fi
+
+        # Action line for repos needing attention
+        if [[ "$_ext_status" == "diverged" ]]; then
+            echo -e "    action:   claude-container pull -s ${session_name} --force"
+            echo -e "         or:  claude-container push -s ${session_name} ${target_branch:-main} --merge"
+        elif [[ "$_merge_status" == "CONFLICT" ]]; then
+            echo -e "    action:   claude-container pull -s ${session_name} ${target_branch} --reconcile"
+        fi
+    done
+
+    # Summary
+    echo ""
+    local _summary_parts=()
+    if [[ $_pulled -gt 0 ]]; then
+        _summary_parts+=("$_pulled pulled${target_branch:+ into $target_branch}")
+    fi
+    if [[ $_unchanged -gt 0 ]]; then
+        _summary_parts+=("$_unchanged unchanged")
+    fi
+    if [[ $_needs_attention -gt 0 ]]; then
+        _summary_parts+=("$_needs_attention needs attention")
+    fi
+    if [[ $_conflicts -gt 0 ]]; then
+        _summary_parts+=("$_conflicts would conflict")
+    fi
+
+    if [[ ${#_summary_parts[@]} -gt 0 ]]; then
+        local _summary_line
+        _summary_line=$(IFS=', '; echo "${_summary_parts[*]}")
+        if [[ $_needs_attention -eq 0 && $_conflicts -eq 0 ]]; then
+            success "$_summary_line"
+        else
+            warn "$_summary_line"
+        fi
+    else
+        info "No repos processed"
+    fi
+}
+
+# Read-only status check — compares container HEADs vs host without extracting
+# Usage: _pull_status <session_name> [repo_filter]
+_pull_status() {
+    local session_name="$1"
+    local repo_filter="${2:-}"
+    local volume="claude-session-${session_name}"
+
+    # Verify session exists
+    if ! docker volume inspect "$volume" &>/dev/null; then
+        error "Session not found: $session_name"
+        return 1
+    fi
+
+    info "Checking session '$session_name'..."
+    echo ""
+
+    # Get container HEADs (single docker run)
+    local _session_heads
+    _session_heads=$(get_session_heads "$volume")
+
+    if [[ -z "$_session_heads" ]]; then
+        info "No repos found in session"
+        return 0
+    fi
+
+    # Read config for project list and paths
+    local config_content
+    config_content=$(read_session_config "$volume")
+    local projects=""
+    if [[ -n "$config_content" ]] && command -v yq &>/dev/null; then
+        projects=$(parse_session_projects "$config_content")
+    fi
+
+    # Build session HEAD lookup
+    declare -A _head_map
+    while IFS='|' read -r _sname _shead; do
+        [[ -z "$_sname" ]] && continue
+        _head_map[$_sname]="$_shead"
+    done <<< "$_session_heads"
+
+    local _up_to_date=0 _changed=0 _diverged=0 _not_extracted=0
+
+    # Iterate repos
+    local -a _repos_to_check=()
+    if [[ -n "$projects" ]]; then
+        while IFS='|' read -r _pname _ppath; do
+            [[ -z "$_pname" ]] && continue
+            _repos_to_check+=("$_pname|$_ppath")
+        done <<< "$projects"
+    fi
+    # Also check session repos not in config
+    for _sname in "${!_head_map[@]}"; do
+        local _found=false
+        for _entry in "${_repos_to_check[@]}"; do
+            [[ "${_entry%%|*}" == "$_sname" ]] && _found=true && break
+        done
+        if ! $_found; then
+            local _host_path=""
+            if [[ -n "$projects" ]]; then
+                _host_path=$(resolve_repo_host_path "$_sname" "$projects")
+            fi
+            _repos_to_check+=("$_sname|$_host_path")
+        fi
+    done
+
+    for _entry in "${_repos_to_check[@]}"; do
+        local _name="${_entry%%|*}"
+        local _path="${_entry#*|}"
+
+        # Apply repo filter
+        if [[ -n "$repo_filter" ]]; then
+            [[ "$_name" != *"$repo_filter"* ]] && continue
+        fi
+
+        local _s_head="${_head_map[$_name]:-}"
+        if [[ -z "$_s_head" ]]; then
+            continue  # repo not in container
+        fi
+
+        # Build hash display line
+        local _short_c="${_s_head:0:7}"
+        local _hash_line="  container:${_short_c}"
+
+        if [[ -z "$_path" || ! -d "$_path" ]]; then
+            echo -e "  ${BLUE}$_name${NC}  ${_hash_line}"
+            echo -e "    status:   ${YELLOW}⚠${NC} host path missing"
+            _not_extracted=$((_not_extracted + 1))
+            continue
+        fi
+
+        # Compare with host session branch
+        local _h_head=""
+        if git -C "$_path" show-ref --verify --quiet "refs/heads/$session_name" 2>/dev/null; then
+            _h_head=$(git -C "$_path" rev-parse "refs/heads/$session_name" 2>/dev/null)
+        fi
+        local _short_h="${_h_head:0:7}"
+        [[ -n "$_h_head" ]] && _hash_line="${_hash_line}  session:${_short_h}"
+
+        # Also show target branch HEAD if it exists
+        local _t_head=""
+        _t_head=$(git -C "$_path" rev-parse "refs/heads/main" 2>/dev/null || echo "")
+        [[ -n "$_t_head" ]] && _hash_line="${_hash_line}  main:${_t_head:0:7}"
+
+        echo -e "  ${BLUE}$_name${NC}  ${_hash_line}"
+
+        if [[ -z "$_h_head" ]]; then
+            echo -e "    status:   ${YELLOW}⚠${NC} not yet extracted"
+            _not_extracted=$((_not_extracted + 1))
+        elif [[ "$_s_head" == "$_h_head" ]]; then
+            echo -e "    status:   ${GREEN}✓${NC} up to date"
+            _up_to_date=$((_up_to_date + 1))
+        elif git -C "$_path" merge-base --is-ancestor "$_h_head" "$_s_head" 2>/dev/null; then
+            local _ahead
+            _ahead=$(git -C "$_path" rev-list --count "$_h_head".."$_s_head" 2>/dev/null || echo "?")
+            echo -e "    status:   ${BLUE}→${NC} container ahead by $_ahead commit(s)"
+            _changed=$((_changed + 1))
+        elif git -C "$_path" merge-base --is-ancestor "$_s_head" "$_h_head" 2>/dev/null; then
+            local _ahead
+            _ahead=$(git -C "$_path" rev-list --count "$_s_head".."$_h_head" 2>/dev/null || echo "?")
+            echo -e "    status:   ${BLUE}←${NC} host ahead by $_ahead commit(s)"
+            _changed=$((_changed + 1))
+        else
+            local _merge_base
+            _merge_base=$(git -C "$_path" merge-base "$_h_head" "$_s_head" 2>/dev/null || echo "")
+            local _c_ahead=0 _h_ahead=0
+            if [[ -n "$_merge_base" ]]; then
+                _c_ahead=$(git -C "$_path" rev-list --count "$_merge_base".."$_s_head" 2>/dev/null || echo "?")
+                _h_ahead=$(git -C "$_path" rev-list --count "$_merge_base".."$_h_head" 2>/dev/null || echo "?")
+            fi
+            echo -e "    status:   ${YELLOW}⚠${NC} diverged (container +${_c_ahead}, host +${_h_ahead})"
+            _diverged=$((_diverged + 1))
+        fi
+    done
+
+    # Summary
+    echo ""
+    local _parts=()
+    [[ $_up_to_date -gt 0 ]] && _parts+=("$_up_to_date up to date")
+    [[ $_changed -gt 0 ]] && _parts+=("$_changed changed")
+    [[ $_diverged -gt 0 ]] && _parts+=("$_diverged diverged")
+    [[ $_not_extracted -gt 0 ]] && _parts+=("$_not_extracted not extracted")
+
+    if [[ ${#_parts[@]} -gt 0 ]]; then
+        local _line
+        _line=$(IFS=', '; echo "${_parts[*]}")
+        if [[ $_diverged -eq 0 && $_not_extracted -eq 0 ]]; then
+            success "$_line"
+        else
+            warn "$_line"
+        fi
     fi
 }
 
@@ -225,10 +615,14 @@ Arguments:
 Options:
   --session, -s <name>     Session name (required)
   --repo <name>            Only pull this repo (partial name OK, e.g. 'gamma')
+  --status                 Read-only check: compare container vs host (no extraction)
   --reconcile, -R          Full reconcile: stash dirty, merge target into session,
                            launch Claude for conflicts, then merge back
+  --squash                 Squash-merge (default). Tracks prior squashes so repeat pulls
+                           only merge new commits — no conflicts from squash history.
+  --no-squash              Regular merge. Preserves full session commit history on target.
   --dry-run                Show what would happen without extracting or merging
-  --force, -f              Force extraction even if branches diverged
+  --force, -f              Force extraction even if branches diverged (container wins)
   --help, -h               Show this help
 
 Modes:
@@ -236,6 +630,8 @@ Modes:
   With branch          Extract + auto-merge into the target branch.
                        Only clean merges are performed — repos that would conflict
                        are skipped, and you'll be told to resolve in-container first.
+  --status             Read-only check: shows which repos have changed, diverged,
+                       or need extraction. No modifications made.
   --reconcile          Extract → stash dirty → merge target into session →
                        resolve conflicts (launches container if needed) → merge back.
 
@@ -244,13 +640,15 @@ Safety:
   would complete without conflicts. If conflicts are detected, the repo is
   skipped and you'll see:
 
-    claude-container push -s <session> <branch> --merge
-    claude-container pull -s <session> <branch>
+    claude-container pull -s <session> <branch> --reconcile
 
   This ensures conflicts are always resolved in the container where Claude can
   help, never on the host where they'd block you.
 
 Examples:
+  # Check what's changed (read-only)
+  claude-container pull -s myproj --status
+
   # Extract session branches to host repos
   claude-container pull -s myproj
 

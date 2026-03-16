@@ -108,3 +108,14 @@ spin() {
     done
     printf "    \b\b\b\b"
 }
+
+# Pull result helpers — per-repo key=value files for unified reporting
+# Each repo gets one file (slashes → underscores), append-safe
+_pull_result_set() {
+    local dir="$1" repo="$2" key="$3" val="$4"
+    echo "${key}=${val}" >> "${dir}/${repo//\//_}"
+}
+_pull_result_get() {
+    local dir="$1" repo="$2" key="$3"
+    grep "^${key}=" "${dir}/${repo//\//_}" 2>/dev/null | tail -1 | cut -d= -f2-
+}
