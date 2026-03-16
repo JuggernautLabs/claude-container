@@ -11,22 +11,54 @@ Claude Code's `--dangerously-skip-permissions` flag lets Claude work autonomousl
 - **Persistence**: Conversation history, caches, and changes survive container restarts
 - **Flexibility**: Extract changes as a branch, then review and merge normally
 
-## Quick Start
+## Common Workflows
+
+### The basics: start → work → pull
 
 ```bash
-# 1. Set up authentication
-export CLAUDE_CODE_OAUTH_TOKEN=$(claude auth status | grep -o 'oauth:[^ ]*')
+# Start a session
+claude-container -s my-feature --discover-repos ~/dev/myorg
 
-# 2. Start a session
-claude-container -s my-feature
+# Claude works in the container... exit when done
 
-# 3. Work with Claude in the container...
-
-# 4. Pull changes to host and merge into main
+# Pull changes and squash-merge into main
 claude-container pull -s my-feature main
+```
 
-# 5. Or just extract as a branch
-claude-container pull -s my-feature
+### Live development: watch changes as they happen
+
+```bash
+# In terminal 1: run your dev server
+cd ~/dev/myorg/plexus-gamma && bun dev
+
+# In terminal 2: watch for container changes, auto-pull
+claude-container watch -s my-feature --repo gamma -i 2 -- \
+  claude-container pull -s my-feature main
+```
+
+### Keep sessions up to date with main
+
+```bash
+# Fast-forward (if session is behind main)
+claude-container push -s my-feature main
+
+# Merge main into session (Claude resolves conflicts)
+claude-container push -s my-feature main --merge
+
+# Serve main as a branch the agent can merge at its own pace
+claude-container push -s my-feature main --as host/main
+# Agent inside container runs: git merge host/main
+```
+
+### Handle conflicts
+
+```bash
+# Option A: full reconcile (stash, merge, resolve, merge back)
+claude-container pull -s my-feature main --reconcile
+
+# Option B: push main into session, let Claude resolve, then pull clean
+claude-container push -s my-feature main --merge
+claude-container pull -s my-feature main
 ```
 
 ## Installation
@@ -62,183 +94,42 @@ ln -s $(pwd)/claude-container /usr/local/bin/
   sudo apt-get install pv  # Ubuntu/Debian
   ```
 
-## Workflow
-
-```
- CREATE SESSION                    WORK IN CONTAINER
- claude-container -s my-feature    Claude has full access:
- --discover-repos ~/dev/myorg      read/write files, run commands,
-                                   install packages, make commits
-         │                                  │
-         ▼                                  ▼
- ┌──────────────────┐             ┌──────────────────┐
- │  Bundle repos    │────────────▶│  Claude works    │
- │  into volume     │             │  in /workspace   │
- └──────────────────┘             └──────────────────┘
-                                            │
-                                            ▼
- PULL & MERGE                     VERIFY
- claude-container pull            claude-container status
- -s my-feature main               -s my-feature main
-         │                                  │
-         ▼                                  ▼
- ┌──────────────────┐             ┌──────────────────┐
- │  Extract branches│             │  Compare hashes  │
- │  + auto-merge    │             │  session vs host │
- └──────────────────┘             └──────────────────┘
-
- If dirty or conflicts:
- claude-container pull -s my-feature main --reconcile
- → stash dirty work → merge → launch Claude for conflicts → fin
-```
-
-### Long-Running Sessions: Syncing with Upstream
-
-For long-lived sessions where the upstream branch has changed:
-
-```bash
-# Rebase session onto updated main
-claude-container push -s my-feature main --rebase
-
-# Claude resolves any rebase conflicts interactively
-# Then pull the rebased work
-claude-container pull -s my-feature --force
-```
-
-## Full Workflow: Session to Merged Code
-
-A complete walkthrough from a dirty workspace to everything merged into `main`.
-
-### 1. Start a session
-
-You have a workspace with several repos. Some have uncommitted work — that's fine.
-
-```bash
-claude-container -s my-feature \
-  --discover-repos ~/dev/myorg \
-  --dir ~/dev/myorg/repo-a
-```
-
-- `--discover-repos` walks `~/dev/myorg/`, finds every directory containing `.git`
-- `--dir` sets `repo-a` as Claude's working directory inside the container
-- Each repo is **bundled** into a Docker volume (git objects only, not build artifacts)
-- A manifest is saved so new repos created inside the session can be detected later
-
-Claude starts in the container with all your repos at `/workspace/`.
-
-### 2. Work and exit
-
-Claude works, makes commits, creates files. When done, exit the container (`Ctrl+C` or let Claude finish). Nothing has changed on your host — all work lives in the Docker volume.
-
-### 3. Check status
-
-```bash
-# Compare session commit hashes against host main branch
-claude-container status -s my-feature main
-
-# Example output:
-#   repo-a
-#     session: abc1234def56
-#     host:    789012345678
-#     result:  MISMATCH (session ahead)
-#   repo-b
-#     hash:    aabbccddee00
-#     result:  MATCH
-#   repo-c
-#     session: 111222333444
-#     host:    (no branch 'main')
-#     result:  NO BRANCH
-
-# Check a single repo
-claude-container status -s my-feature main --repo repo-a
-```
-
-### 4a. Clean path — pull and merge
-
-If your host repos are clean and the session already incorporates `main`:
-
-```bash
-claude-container pull -s my-feature main
-```
-
-This extracts session branches to each host repo, then merges them into `main`. For each repo:
-- Creates/updates a `my-feature` branch matching the session HEAD
-- Merges `my-feature` into `main` via `git merge --no-edit`
-- Skips repos where nothing changed
-- **Skips** repos where the merge would conflict — tells you to resolve in-container first
-
-If any repos are skipped due to conflicts:
-
-```bash
-# Merge main INTO the session (Claude resolves conflicts in-container)
-claude-container push -s my-feature main --merge
-
-# Then pull again (now guaranteed clean)
-claude-container pull -s my-feature main
-```
-
-### 4b. Messy path — reconcile
-
-If your host repos have uncommitted changes or you expect conflicts, use `--reconcile`:
-
-```bash
-claude-container pull -s my-feature main --reconcile
-```
-
-**Phase 1 — Extract**: Creates `my-feature` branches on the host from session data.
-
-**Phase 2 — Stash dirty work**: For each host repo with uncommitted changes:
-- Creates a branch `main-my-feature-stash-<timestamp>`
-- Commits all dirty files there
-- Returns to the original branch — worktree is now clean
-- Your uncommitted work is safe on the stash branch
-
-**Phase 3 — Merge target into session**: Merges `main` INTO each session repo (inside the Docker volume). If everything merges cleanly, extracts and auto-merges. Done.
-
-If there are conflicts, a new Claude container launches with a prompt describing every conflict. Claude resolves the `<<<<<<< HEAD` markers, commits, then runs:
-
-```bash
-fin "resolved config merge conflict in repo-a"
-```
-
-`fin` signals completion and terminates the container. The exit handler extracts the resolved state and auto-merges into `main`.
-
-### 5. Verify
-
-```bash
-# Hash comparison — every repo should show MATCH
-claude-container status -s my-feature main
-
-# Classification view — synced, unchanged, extracted-only, pending, missing
-claude-container status -s my-feature
-```
-
-### Summary
-
-```bash
-# start
-claude-container -s my-feature --discover-repos ~/dev/myorg --dir ~/dev/myorg/repo-a
-
-# work, exit
-
-# pull session branches to host
-claude-container pull -s my-feature
-
-# merge main into session first (Claude resolves conflicts)
-claude-container push -s my-feature main --merge
-
-# now merge into main on host (guaranteed clean)
-claude-container pull -s my-feature main
-
-# verify
-claude-container status -s my-feature main
-```
-
 ## Subcommands
 
-### push
+### pull — container → host
 
-Push host changes into a container session (host → container).
+Extract session branches and optionally merge into a target branch.
+
+```bash
+claude-container pull -s <session> [branch] [options]
+```
+
+| Flag | Description |
+|------|-------------|
+| `--status` | Read-only check: compare container vs host (no extraction) |
+| `--repo <name>` | Only pull this repo (partial name OK) |
+| `--reconcile, -R` | Full cycle: stash, merge, resolve conflicts, merge back |
+| `--squash` | Squash-merge into target (default) |
+| `--no-squash` | Regular merge (preserves full commit history) |
+| `--dry-run` | Preview what would happen |
+| `--force, -f` | Force extraction if branches diverged |
+
+**Squash-merge tracking**: Repeat pulls only merge NEW commits since the last squash. No conflicts from re-merging old work.
+
+**Auto-force when merging**: When a target branch is specified, extraction automatically force-updates the session branch from the container. The session branch is just transport — main is protected by conflict detection.
+
+**Output format**: Unified per-repo report showing extract/merge/action lines with commit hashes:
+```
+  hypermemetic/plexus-gamma  container:abc1234  session:abc1234  main:def5678
+    extract:  ✓ updated (3 commits, 5 files)
+    merge:    ✓ synapse-cc-ux → main: squash-merged into main (3 new)
+
+✓ 1 pulled into main
+```
+
+### push — host → container
+
+Push host changes into a container session.
 
 ```bash
 claude-container push -s <session> [branch] [options]
@@ -247,31 +138,51 @@ claude-container push -s <session> [branch] [options]
 | Flag | Description |
 |------|-------------|
 | `--repo <name>[,<branch>]` | Only push this repo, optionally from a specific branch |
+| `--as <branch>` | Don't merge — place host branch in container as `<branch>` |
 | `--ff` | Fast-forward from host branch (default) |
-| `--rebase` | Rebase session onto host branch |
-| `--merge` | Merge host branch into session |
+| `--merge` | Merge host branch into session (launches container if conflicts) |
+| `--rebase` | Rebase session onto host branch (launches container if conflicts) |
 | `--force, -f` | Force operation (reset diverged repos to host HEAD) |
 
-Repo names support partial matching (`synapse` matches `org/synapse`). Ambiguous matches are rejected with a list of candidates.
+**`--as` for agent-driven merges**: Places the host branch in the container without merging. The agent decides when and how to merge:
+```bash
+claude-container push -s my-feature main --as host/main
+# Agent runs: git merge host/main
+```
 
-### pull
+### watch — trigger commands on session changes
 
-Pull session changes to host (container → host).
+Watch a session for new commits and run a command when changes are detected.
 
 ```bash
-claude-container pull -s <session> [branch] [options]
+claude-container watch -s <session> [options] -- <command...>
 ```
 
 | Flag | Description |
 |------|-------------|
-| `--reconcile, -R` | Stash dirty work, merge, resolve conflicts, merge back |
-| `--force, -f` | Force extraction even if branches diverged |
+| `--repo <name>` | Only watch this repo |
+| `--interval, -i <secs>` | Poll interval (default: 5) |
 
-No branch = extract only. With branch = extract + auto-merge.
+Changes that arrive while the command is running are coalesced — the command re-runs once after completion, not once per change.
 
-### status
+```bash
+# Pull on every change
+claude-container watch -s my-feature -- claude-container pull -s my-feature main
 
-Check sync state (read-only, no changes).
+# Watch one repo, fast polling
+claude-container watch -s my-feature --repo gamma -i 2 -- \
+  claude-container pull -s my-feature
+
+# Chain with a build
+claude-container watch -s my-feature --repo gamma -- sh -c \
+  'claude-container pull -s my-feature && cd ~/dev/myproj && bun run build'
+
+# Serve host branch to agent whenever local main changes
+claude-container watch -s my-feature -- \
+  claude-container push -s my-feature main --as host/main
+```
+
+### status — read-only sync check
 
 ```bash
 claude-container status -s <session> [branch] [options]
@@ -283,9 +194,15 @@ claude-container status -s <session> [branch] [options]
 
 No branch = sync classification. With branch = hash comparison.
 
-### reconcile
+### list — show all sessions
 
-Merge multiple sessions into a unified branch, sequentially.
+```bash
+claude-container list
+```
+
+Shows sessions with last commit and edit times.
+
+### reconcile — merge multiple sessions
 
 ```bash
 claude-container reconcile <branch> [session...] [options]
@@ -293,30 +210,23 @@ claude-container reconcile <branch> [session...] [options]
 
 | Flag | Description |
 |------|-------------|
-| `--include <regex>` | Only process matching sessions (repeatable) |
-| `--exclude <regex>` | Skip matching sessions (repeatable, wins over include) |
-| `--dry-run` | Preview what would happen without merging |
-| `--yes, -y` | Skip confirmation prompt |
-| `--continue` | Resume an interrupted reconcile |
-| `--force, -f` | Force extraction even if branches diverged |
+| `--include <regex>` | Only process matching sessions |
+| `--exclude <regex>` | Skip matching sessions |
+| `--dry-run` | Preview without merging |
+| `--yes, -y` | Skip confirmation |
+| `--continue` | Resume interrupted reconcile |
 
-Omit session names to auto-discover all sessions with unmerged work.
+## How Pull + Squash Works
 
-## Workflow Guides
+When you `pull -s X main`, the session's commits are squash-merged into a single commit on main:
 
-Detailed guides for common workflows:
+1. **First pull**: `git merge --squash` + commit. Saves a squash-base ref.
+2. **Repeat pulls**: Cherry-picks only commits AFTER the squash-base. One commit per pull, carrying the original session commit messages.
+3. **Conflict detection**: Dry-runs the merge first. If it would conflict, reports the files and suggests `--reconcile`.
 
-- **[Data Transfer Overview](docs/workflows/data-transfer.md)** -- How data moves between host and container, choosing the right tool
-- **[Basic Session](docs/workflows/basic-session.md)** -- Create, work, pull, merge
-- **[Multi-Project](docs/workflows/multi-project.md)** -- Discover repos, work across multiple repos, handle new repos
-- **[Reconcile](docs/workflows/reconcile.md)** -- Merge with dirty worktrees and conflicts, AI-assisted resolution
-- **[Multi-Session Reconcile](docs/workflows/multi-session-reconcile.md)** -- Merge multiple sessions into one branch
-- **[Refresh](docs/workflows/refresh.md)** -- Pull host changes into an active session
-- **[Verification](docs/workflows/verification.md)** -- Hash checks, sync status, scripting with exit codes
+The squash-base ref (`refs/claude-container/squash-base/<session>`) tracks what was already merged. If the session branch is force-extracted from a different lineage, stale refs are automatically cleared.
 
-## Commands
-
-### Starting Sessions
+## Starting Sessions
 
 ```bash
 # Single project (clones current directory)
@@ -334,90 +244,6 @@ claude-container -s my-feature --discover-repos ~/dev/myproject
 # Multiple projects via config file
 claude-container -s my-feature --config .claude-projects.yml
 ```
-
-### Session Management
-
-All session commands use the `--session/-s` flag:
-
-```bash
-# List all sessions
-claude-container list
-
-# Pull session to host (extract branches)
-claude-container pull -s my-feature
-claude-container pull -s my-feature --force  # Overwrite existing branches
-
-# Pull and merge into main
-claude-container pull -s my-feature main
-
-# Push host changes into session
-claude-container push -s my-feature main              # Fast-forward
-claude-container push -s my-feature main --rebase     # Rebase onto main
-claude-container push -s my-feature develop --rebase  # Rebase onto develop
-claude-container push -s my-feature --repo api,main   # Push main into one repo
-claude-container push -s my-feature --repo api --force # Force-reset one repo
-
-# Reconcile multiple sessions into main
-claude-container reconcile main s1 s2 s3              # Named sessions
-claude-container reconcile main                       # Auto-discover
-claude-container reconcile main --dry-run             # Preview
-claude-container reconcile --continue                 # Resume
-
-# Check sync state
-claude-container status -s my-feature main
-
-# Delete a session
-claude-container -s my-feature --delete
-claude-container -s my-feature --delete --yes     # Skip confirmation
-claude-container -s 'test-.*' --delete --regex    # Pattern match
-
-# Repair corrupted session config
-claude-container -s my-feature --repair
-
-# Restart session (fixes permissions)
-claude-container -s my-feature --restart
-
-# Import claude-code session data
-claude-container -s my-feature --import ~/.claude
-```
-
-### Global Commands (no session required)
-
-```bash
-# List sessions
-claude-container list
-
-# Cleanup all volumes
-claude-container --cleanup
-
-# Cleanup unused volumes
-claude-container --cleanup-unused
-claude-container --cleanup-unused --yes
-```
-
-### Options
-
-| Flag | Description |
-|------|-------------|
-| `-s, --session <name>` | Session name (required) |
-| `--from <branch>` | Create session from specific branch |
-| `-c, --continue` | Continue the most recent conversation |
-| `--discover-repos <dir>` | Auto-discover git repos in directory |
-| `-C, --config <path>` | Path to `.claude-projects.yml` |
-| `-a, --add-repo <path>` | Add a repo to the session |
-| `--no-git-session` | Mount cwd directly (no isolation) |
-| `--shell, --bash` | Start bash instead of Claude |
-| `--docker` | Mount Docker socket |
-| `--dockerfile [path]` | Use Dockerfile (auto-detected or from config) |
-| `--no-run` | Set up session without starting |
-
-### Action Modifiers
-
-| Flag | Description |
-|------|-------------|
-| `-f, --force` | Overwrite existing branches/data |
-| `-y, --yes` | Skip confirmation prompts |
-| `-r, --regex` | Use regex pattern matching |
 
 ## Multi-Project Sessions
 
@@ -455,16 +281,45 @@ Inside the container:
     └── web/
 ```
 
-Extraction creates branches in each repo that has changes:
-```
-→ Multi-project session detected
+## Session Management
 
-  backend/api (no changes)
-✓ backend/workers → branch 'fullstack-feature' (2 commit(s), 4 file(s))
-✓ frontend/web → branch 'fullstack-feature' (5 commit(s), 12 file(s))
+```bash
+# List all sessions
+claude-container list
 
-✓ Created branch 'fullstack-feature' in 2 repo(s)
+# Delete a session
+claude-container -s my-feature --delete
+claude-container -s my-feature --delete --yes     # Skip confirmation
+claude-container -s 'test-.*' --delete --regex    # Pattern match
+
+# Repair corrupted session config
+claude-container -s my-feature --repair
+
+# Restart session (fixes permissions)
+claude-container -s my-feature --restart
+
+# Import claude-code session data
+claude-container -s my-feature --import ~/.claude
 ```
+
+## Options
+
+| Flag | Description |
+|------|-------------|
+| `-s, --session <name>` | Session name (required) |
+| `--from <branch>` | Create session from specific branch |
+| `-c, --continue` | Continue the most recent conversation |
+| `--discover-repos <dir>` | Auto-discover git repos in directory |
+| `-C, --config <path>` | Path to `.claude-projects.yml` |
+| `-a, --add-repo <path>` | Add a repo to the session |
+| `--no-git-session` | Mount cwd directly (no isolation) |
+| `--shell, --bash` | Start bash instead of Claude |
+| `--docker` | Mount Docker socket |
+| `--dockerfile [path]` | Use Dockerfile (auto-detected or from config) |
+| `--no-run` | Set up session without starting |
+| `-f, --force` | Overwrite existing branches/data |
+| `-y, --yes` | Skip confirmation prompts |
+| `-r, --regex` | Use regex pattern matching |
 
 ## Architecture
 
@@ -506,56 +361,13 @@ If you see paths like `/path/to/repo||true|`:
 claude-container -s my-feature --repair
 ```
 
-## Development
-
-To contribute to claude-container using claude-container itself:
-
-```bash
-# Clone the repo
-git clone https://github.com/juggernautlabs/claude-container.git
-cd claude-container
-
-# Create a development session
-./claude-container -s dev-feature
-
-# Work with Claude in the container...
-# The container has access to the cloned claude-container repo
-
-# Exit and pull your changes
-./claude-container pull -s dev-feature main
-```
-
-### Running Tests
-
-```bash
-# Run all workflow tests
-./tests/test-workflows.sh
-
-# Run specific test
-./tests/test-workflows.sh sync_uncommitted
-
-# List available tests
-./tests/test-workflows.sh --help
-```
-
-### Syncing with Upstream
-
-For long-running development sessions:
-
-```bash
-# Push main into session (rebase)
-./claude-container push -s dev-feature main --rebase
-
-# Pull updated work
-./claude-container pull -s dev-feature --force
-```
-
 ## Security
 
 - **Tokens**: Stored in file mount, not environment variables
 - **Git remotes**: Stripped from cloned repos (Claude can't push)
 - **Rootish mode**: Non-root user with passwordless sudo
 - **Isolation**: Changes stay in volumes until explicitly extracted
+- **Workspace trust**: Auto-accepted inside containers (safe — isolated environment)
 
 ## License
 
