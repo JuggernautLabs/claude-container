@@ -1608,6 +1608,139 @@ session_refresh() {
     fi
 }
 
+# Serve a host branch into the container as a named branch (no merge).
+# The agent can then: git merge <target_as>
+# Usage: session_serve <session_name> <source_branch> <target_as> [repo_filter]
+session_serve() {
+    local session_name="$1"
+    local source_branch="${2:-main}"
+    local target_as="${3:-host/$source_branch}"
+    local repo_filter="${4:-}"
+    local volume="claude-session-${session_name}"
+    local git_image="${IMAGE_NAME:-$DEFAULT_IMAGE}"
+
+    if ! docker volume inspect "$volume" &>/dev/null; then
+        error "Session not found: $session_name"
+        return 1
+    fi
+
+    if ! command -v yq &>/dev/null; then
+        error "yq required"
+        return 1
+    fi
+
+    local config_content
+    config_content=$(read_session_config "$volume")
+    [[ -z "$config_content" ]] && { error "No config in session"; return 1; }
+
+    local projects
+    projects=$(parse_session_projects "$config_content")
+
+    # Resolve repo filter
+    if [[ -n "$repo_filter" ]]; then
+        local _matches=() _suffix=() _substr=()
+        while IFS='|' read -r _rn _rp; do
+            [[ -z "$_rn" ]] && continue
+            if [[ "$_rn" == "$repo_filter" ]]; then _matches=("$_rn"); break
+            elif [[ "$_rn" == */"$repo_filter" ]]; then _suffix+=("$_rn")
+            elif [[ "$_rn" == *"$repo_filter"* ]]; then _substr+=("$_rn")
+            fi
+        done <<< "$projects"
+        [[ ${#_matches[@]} -eq 0 ]] && _matches=("${_suffix[@]:-${_substr[@]}}")
+        if [[ ${#_matches[@]} -eq 0 ]]; then
+            error "No repo matching '$repo_filter'"
+            return 1
+        elif [[ ${#_matches[@]} -gt 1 ]]; then
+            error "'$repo_filter' is ambiguous (${#_matches[@]} matches)"
+            return 1
+        fi
+        repo_filter="${_matches[0]}"
+    fi
+
+    info "Serving '$source_branch' as '$target_as' into session '$session_name'..."
+    echo ""
+
+    # Build mounts and serve script
+    local _mount_args=("-v" "$volume:/session")
+    local _serve_script=""
+    local -a _valid=()
+
+    while IFS='|' read -r proj_name proj_path; do
+        [[ -z "$proj_name" ]] && continue
+        [[ -n "$repo_filter" && "$proj_name" != "$repo_filter" ]] && continue
+        [[ ! -d "$proj_path" ]] && { warn "  Skipping $proj_name (not found)"; continue; }
+
+        if ! git -C "$proj_path" show-ref --verify --quiet "refs/heads/$source_branch" 2>/dev/null; then
+            warn "  Skipping $proj_name (no branch '$source_branch')"
+            continue
+        fi
+
+        local _safe="${proj_name//\//_}"
+        _mount_args+=("-v" "$proj_path:/host-${_safe}:ro")
+        _valid+=("$proj_name")
+
+        _serve_script+="
+        (
+            cd '/session/$proj_name' 2>/dev/null || { echo 'SKIP|$proj_name|dir not found'; exit 0; }
+            git remote remove _host 2>/dev/null || true
+            git remote add _host '/host-${_safe}'
+            if ! git fetch _host '$source_branch' 2>/dev/null; then
+                echo 'SKIP|$proj_name|fetch failed'
+                git remote remove _host 2>/dev/null || true
+                exit 0
+            fi
+            # Create/update the target branch from fetched content
+            git branch -f '$target_as' FETCH_HEAD 2>/dev/null
+            new_head=\$(git rev-parse --short '$target_as')
+            echo 'OK|$proj_name|'\$new_head
+            git remote remove _host 2>/dev/null || true
+        ) &"
+    done <<< "$projects"
+
+    if [[ ${#_valid[@]} -eq 0 ]]; then
+        warn "No repos to serve"
+        return 0
+    fi
+
+    local host_uid
+    host_uid=$(get_host_uid)
+
+    local serve_output
+    serve_output=$(docker run --rm \
+        --user "$host_uid:$host_uid" \
+        -e HOME=/tmp \
+        "${_mount_args[@]}" \
+        "$git_image" \
+        sh -c "
+            git config --global --add safe.directory '*'
+            git config --global user.email 'claude-container@local'
+            git config --global user.name 'claude-container'
+            $_serve_script
+            wait
+        " 2>/dev/null)
+
+    local _ok=0 _skip=0
+    while IFS='|' read -r _status _name _detail; do
+        [[ -z "$_status" ]] && continue
+        case "$_status" in
+            OK)
+                success "  $_name → $target_as ($_detail)"
+                _ok=$((_ok + 1))
+                ;;
+            SKIP)
+                warn "  $_name: $_detail"
+                _skip=$((_skip + 1))
+                ;;
+        esac
+    done <<< "$serve_output"
+
+    echo ""
+    if [[ $_ok -gt 0 ]]; then
+        success "$_ok repo(s) served. Agent can: git merge $target_as"
+    fi
+    [[ $_skip -gt 0 ]] && warn "$_skip repo(s) skipped"
+}
+
 # Merge a branch into the session for conflict resolution
 # Similar to session_sync but uses git merge instead of rebase
 # Usage: session_merge_into <session_name> <target_branch>
@@ -3226,8 +3359,19 @@ session_auto_merge() {
                     fi
 
                     if git -C "$proj_path" cherry-pick --no-commit "${_squash_base}..${session_name}" >/dev/null 2>&1; then
+                        # Build commit message from original session commits
+                        local _squash_msg
+                        _squash_msg=$(git -C "$proj_path" log --format="%s" "${_squash_base}..${session_name}" 2>/dev/null | head -20)
                         local _commit_out
-                        _commit_out=$(git -C "$proj_path" commit -m "Squash merge $session_name into $target_branch ($_new_count new commit(s))" 2>&1) || true
+                        if [[ "$_new_count" == "1" ]]; then
+                            # Single commit: use its message directly
+                            _commit_out=$(git -C "$proj_path" commit -m "$_squash_msg" 2>&1) || true
+                        else
+                            # Multiple commits: list them under a summary header
+                            _commit_out=$(git -C "$proj_path" commit -m "$(printf '%s\n\n%s' \
+                                "$session_name → $target_branch ($_new_count commits)" \
+                                "$_squash_msg")" 2>&1) || true
+                        fi
                         local _new_session_head
                         _new_session_head=$(git -C "$proj_path" rev-parse "$session_name" 2>/dev/null)
                         git -C "$proj_path" update-ref "$_squash_ref" "$_new_session_head"

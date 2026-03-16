@@ -11,7 +11,8 @@
 cmd_push() {
     local session_name=""
     local branch=""
-    local strategy="ff"  # ff, merge, rebase
+    local target_as=""
+    local strategy="ff"  # ff, merge, rebase, serve
     local force=false
     local repo_filter=""
     local repo_branch=""
@@ -30,6 +31,11 @@ cmd_push() {
                 else
                     repo_filter="$2"
                 fi
+                shift 2
+                ;;
+            --as)
+                target_as="$2"
+                strategy="serve"
                 shift 2
                 ;;
             --ff)
@@ -78,6 +84,12 @@ cmd_push() {
     fi
 
     case "$strategy" in
+        serve)
+            # Serve: push host branch into container as a named branch (no merge)
+            local serve_branch="${repo_branch:-${branch:-main}}"
+            session_serve "$session_name" "$serve_branch" "$target_as" "$repo_filter"
+            return $?
+            ;;
         ff)
             # Fast-forward: fetch + ff from host branch (default)
             # repo_branch (from --repo name,branch) overrides positional branch
@@ -120,6 +132,8 @@ Options:
   --session, -s <name>     Session name (required)
   --repo <name>[,<branch>] Only push this repo, optionally from a specific branch.
                            Name can be partial (e.g. 'synapse' matches 'org/synapse').
+  --as <branch>            Don't merge — just place host branch in container as <branch>.
+                           Agent in container can merge at its own pace.
   --ff                     Fast-forward from host branch (default)
   --merge                  Merge host branch into session
   --rebase                 Rebase session onto host branch
@@ -127,6 +141,8 @@ Options:
   --help, -h               Show this help
 
 Strategies (mutually exclusive):
+  --as <branch>      Place host branch in container without merging. The agent can
+                     then: git merge <branch>  (e.g. git merge host/main)
   --ff (default)     Fetch + fast-forward. If diverged, shows all available options.
   --merge            Merge upstream into session. Launches container if conflicts.
   --rebase           Rebase session onto upstream. Launches container if conflicts.
