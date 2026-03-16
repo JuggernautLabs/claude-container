@@ -1651,12 +1651,13 @@ session_merge_into() {
     local skip_count=0
     local dirty_count=0
     local summary_lines=()  # Collect summary for Claude's initial prompt
-    local dirty_mounts=()   # Collect proj_name|proj_path for .merge-into-mounts marker
+    local mount_repos=()    # Collect proj_name|proj_path for .merge-into-mounts marker
 
     # Phase 1: Single fast scan for merge-in-progress + dirty status across all repos
     local _util_image="${GIT_UTIL_IMAGE:-alpine/git}"
     local _merge_scan
     _merge_scan=$(docker run --rm --entrypoint sh \
+        -e HOME=/tmp \
         -v "$volume:/session:ro" "$_util_image" \
         -c '
             git config --global --add safe.directory "*"
@@ -1678,7 +1679,9 @@ session_merge_into() {
         _dirty_file_count[$_mn]="${_md:-0}"
     done <<< "$_merge_scan"
 
-    # Phase 2: Host-side checks + merge (only repos that need it)
+    # Phase 2: Host-side filtering (NO docker)
+    # Classify each repo: skip, dirty, merge-in-progress, or merge candidate
+    local merge_candidates=()  # "proj_name|proj_path|host_target_head" for ancestry check + merge
     local host_uid
     host_uid=$(get_host_uid)
 
@@ -1705,6 +1708,8 @@ session_merge_into() {
         if [[ "${_merge_status[$proj_name]:-no}" == "yes" ]]; then
             warn "    $proj_name has merge in progress (use git commit or git merge --abort)"
             summary_lines+=("CONFLICT: $proj_name (merge in progress)")
+            EXTRA_DOCKER_ARGS+=("-v" "$proj_path:/host/$proj_name:ro")
+            mount_repos+=("$proj_name|$proj_path")
             conflict_count=$((conflict_count + 1))
             continue
         fi
@@ -1714,71 +1719,166 @@ session_merge_into() {
         if [[ "$_dc" -gt 0 ]]; then
             warn "    $proj_name has $_dc uncommitted file(s) in session — skipping merge, mounting host repo for Claude"
             EXTRA_DOCKER_ARGS+=("-v" "$proj_path:/host/$proj_name:ro")
-            dirty_mounts+=("$proj_name|$proj_path")
+            mount_repos+=("$proj_name|$proj_path")
             summary_lines+=("DIRTY: $proj_name ($_dc uncommitted changes) — host repo mounted at /host/$proj_name")
             dirty_count=$((dirty_count + 1))
             continue
         fi
 
-        # Check if host target branch is already an ancestor of session HEAD
-        # (nothing to merge — session already has everything from target)
-        local _session_head _host_target_head
-        _session_head=$(docker run --rm --entrypoint sh \
-            -v "$volume:/session:ro" "$_util_image" \
-            -c "cd '/session/$proj_name' && git rev-parse HEAD 2>/dev/null" 2>/dev/null || echo "")
+        # Merge candidate: get host target head for ancestry check
+        local _host_target_head
         _host_target_head=$(git -C "$proj_path" rev-parse "refs/heads/$target_branch" 2>/dev/null || echo "")
-
-        if [[ -n "$_host_target_head" && -n "$_session_head" ]]; then
-            # Check if host target is already in session history
-            local _is_ancestor
-            _is_ancestor=$(docker run --rm --entrypoint sh \
-                -v "$volume:/session:ro" "$_util_image" \
-                -c "cd '/session/$proj_name' && git merge-base --is-ancestor '$_host_target_head' HEAD 2>/dev/null && echo yes || echo no" 2>/dev/null)
-            if [[ "$_is_ancestor" == "yes" ]]; then
-                info "    $proj_name (already up to date)"
-                summary_lines+=("OK: $proj_name (up to date)")
-                success_count=$((success_count + 1))
-                continue
-            fi
-        fi
-
-        info "  Merging into $proj_name..."
-
-        # Add remote, fetch, and merge in one docker run
-        local merge_output
-        merge_output=$(docker run --rm \
-            --user "$host_uid:$host_uid" \
-            -v "$volume:/session" \
-            -v "$proj_path:/upstream:ro" \
-            "$git_image" \
-            sh -c "
-                cd '/session/$proj_name'
-                git -c safe.directory='*' remote remove upstream 2>/dev/null || true
-                git -c safe.directory='*' remote add upstream /upstream
-                git -c safe.directory='*' fetch upstream '$target_branch' 2>&1
-                git -c safe.directory='*' merge 'upstream/$target_branch' --no-edit 2>&1 || true
-                git -c safe.directory='*' remote remove upstream 2>/dev/null || true
-            " 2>&1)
-
-        if echo "$merge_output" | grep -qE "CONFLICT|Merge conflict|Automatic merge failed"; then
-            warn "    $proj_name has conflicts (Claude will resolve)"
-            summary_lines+=("CONFLICT: $proj_name (merge conflicts)")
-            conflict_count=$((conflict_count + 1))
-        elif echo "$merge_output" | grep -qE "error:|fatal:"; then
-            error "    $proj_name merge failed:"
-            echo "$merge_output" | grep -E "error:|fatal:" | head -3 | sed 's/^/      /'
-            summary_lines+=("FAIL: $proj_name (merge error)")
-            skip_count=$((skip_count + 1))
-        elif echo "$merge_output" | grep -q "Already up to date"; then
-            info "    $proj_name (already up to date)"
-            summary_lines+=("OK: $proj_name (up to date)")
-            success_count=$((success_count + 1))
+        if [[ -n "$_host_target_head" ]]; then
+            merge_candidates+=("$proj_name|$proj_path|$_host_target_head")
         else
-            success "    $proj_name merged successfully"
-            summary_lines+=("OK: $proj_name (merged)")
-            success_count=$((success_count + 1))
+            warn "  Skipping $proj_name (could not resolve '$target_branch' head)"
+            summary_lines+=("SKIP: $proj_name (could not resolve branch head)")
+            skip_count=$((skip_count + 1))
         fi
     done <<< "$projects"
+
+    # Phase 3: Batch ancestry check - 1 docker run
+    # Pipe "name|host_target_head" lines in, get "name|ancestor" or "name|needs_merge" out
+    local needs_merge=()  # "proj_name|proj_path" entries that need actual merge
+    declare -A _candidate_path  # proj_name -> proj_path lookup
+
+    if [[ ${#merge_candidates[@]} -gt 0 ]]; then
+        # Build input and lookup map
+        local ancestry_input=""
+        for candidate in "${merge_candidates[@]}"; do
+            local _cname _cpath _chead
+            IFS='|' read -r _cname _cpath _chead <<< "$candidate"
+            _candidate_path[$_cname]="$_cpath"
+            ancestry_input+="${_cname}|${_chead}"$'\n'
+        done
+
+        local ancestry_output
+        ancestry_output=$(printf '%s' "$ancestry_input" | docker run --rm -i --entrypoint sh \
+            -e HOME=/tmp \
+            -v "$volume:/session:ro" "$_util_image" \
+            -c '
+                git config --global --add safe.directory "*"
+                while IFS="|" read -r name host_head; do
+                    [ -z "$name" ] && continue
+                    if [ ! -d "/session/$name/.git" ]; then
+                        echo "$name|error|no_git_dir"
+                        continue
+                    fi
+                    cd "/session/$name"
+                    if git merge-base --is-ancestor "$host_head" HEAD 2>/dev/null; then
+                        echo "$name|ancestor"
+                    else
+                        echo "$name|needs_merge"
+                    fi
+                done
+            ' 2>/dev/null) || true
+
+        # Parse ancestry results
+        while IFS='|' read -r _aname _astatus _adetail; do
+            [[ -z "$_aname" ]] && continue
+            local _apath="${_candidate_path[$_aname]}"
+            if [[ "$_astatus" == "ancestor" ]]; then
+                info "    $_aname (already up to date)"
+                summary_lines+=("OK: $_aname (up to date)")
+                success_count=$((success_count + 1))
+            elif [[ "$_astatus" == "needs_merge" ]]; then
+                needs_merge+=("$_aname|$_apath")
+            else
+                warn "  Skipping $_aname (ancestry check error: $_adetail)"
+                summary_lines+=("SKIP: $_aname (ancestry check error)")
+                skip_count=$((skip_count + 1))
+            fi
+        done <<< "$ancestry_output"
+    fi
+
+    # Phase 4: Batch merge - 1 docker run
+    # Mount session volume + ALL host repos that need merging as -v "$proj_path:/upstream/$proj_name:ro"
+    if [[ ${#needs_merge[@]} -gt 0 ]]; then
+        info "  Merging ${#needs_merge[@]} repo(s)..."
+
+        # Build docker volume args and input list
+        local merge_docker_args=()
+        local merge_input=""
+        for entry in "${needs_merge[@]}"; do
+            local _mname _mpath
+            IFS='|' read -r _mname _mpath <<< "$entry"
+            merge_docker_args+=("-v" "$_mpath:/upstream/$_mname:ro")
+            merge_input+="${_mname}"$'\n'
+        done
+
+        local merge_output
+        merge_output=$(printf '%s' "$merge_input" | docker run --rm -i \
+            --user "$host_uid:$host_uid" \
+            -e HOME=/tmp \
+            -v "$volume:/session" \
+            "${merge_docker_args[@]}" \
+            -e "TARGET_BRANCH=$target_branch" \
+            "$git_image" \
+            sh -c '
+                git config --global --add safe.directory "*"
+                git config --global user.email "claude-container@local"
+                git config --global user.name "claude-container"
+                while IFS= read -r name; do
+                    [ -z "$name" ] && continue
+                    cd "/session/$name" 2>/dev/null || { echo "$name|error|cd failed"; continue; }
+                    git remote remove upstream 2>/dev/null || true
+                    git remote add upstream "/upstream/$name"
+                    fetch_out=$(git fetch upstream "$TARGET_BRANCH" 2>&1) || {
+                        echo "$name|error|fetch failed: $(echo "$fetch_out" | tr "\n" " ")"
+                        git remote remove upstream 2>/dev/null || true
+                        continue
+                    }
+                    merge_out=$(git merge "upstream/$TARGET_BRANCH" --no-edit 2>&1)
+                    merge_rc=$?
+                    git remote remove upstream 2>/dev/null || true
+                    flat_out=$(echo "$merge_out" | tr "\n" " ")
+                    if echo "$merge_out" | grep -qE "CONFLICT|Merge conflict|Automatic merge failed"; then
+                        echo "$name|conflict|$flat_out"
+                    elif [ $merge_rc -ne 0 ]; then
+                        echo "$name|error|$flat_out"
+                    elif echo "$merge_out" | grep -q "Already up to date"; then
+                        echo "$name|uptodate"
+                    else
+                        echo "$name|merged"
+                    fi
+                done
+            ' 2>&1) || true
+
+        # Parse merge results
+        while IFS='|' read -r _rname _rstatus _rdetail; do
+            [[ -z "$_rname" ]] && continue
+            local _rpath="${_candidate_path[$_rname]}"
+            case "$_rstatus" in
+                merged)
+                    success "    $_rname merged successfully"
+                    summary_lines+=("OK: $_rname (merged)")
+                    success_count=$((success_count + 1))
+                    ;;
+                uptodate)
+                    info "    $_rname (already up to date)"
+                    summary_lines+=("OK: $_rname (up to date)")
+                    success_count=$((success_count + 1))
+                    ;;
+                conflict)
+                    warn "    $_rname has conflicts (Claude will resolve)"
+                    summary_lines+=("CONFLICT: $_rname (merge conflicts)")
+                    EXTRA_DOCKER_ARGS+=("-v" "$_rpath:/host/$_rname:ro")
+                    mount_repos+=("$_rname|$_rpath")
+                    conflict_count=$((conflict_count + 1))
+                    ;;
+                error)
+                    error "    $_rname merge failed: $_rdetail"
+                    summary_lines+=("FAIL: $_rname (merge error)")
+                    skip_count=$((skip_count + 1))
+                    ;;
+                *)
+                    warn "    $_rname unexpected status: $_rstatus"
+                    summary_lines+=("SKIP: $_rname (unexpected status)")
+                    skip_count=$((skip_count + 1))
+                    ;;
+            esac
+        done <<< "$merge_output"
+    fi
 
     echo ""
     if [[ $conflict_count -gt 0 ]]; then
@@ -1803,11 +1903,10 @@ session_merge_into() {
     if [[ $conflict_count -eq 0 ]] && [[ $dirty_count -eq 0 ]]; then
         echo ""
         success "Merge complete — nothing for Claude to resolve."
-        # Store merge-into state for extract on exit
-        local host_uid
-        host_uid=$(get_host_uid)
+        # Phase 5 (clean): Write merge-into-branch marker - 1 docker run
         docker run --rm \
             --user "$host_uid:$host_uid" \
+            -e HOME=/tmp \
             -v "$volume:/session" \
             "$git_image" \
             sh -c "echo '$target_branch' > /session/.merge-into-branch" 2>/dev/null || true
@@ -1854,30 +1953,76 @@ session_merge_into() {
     merge_summary+=$'\n'"  fin \"<brief description of what was resolved>\""
     merge_summary+=$'\n'"This will signal completion and terminate the session."
 
-    # Store merge-into state and summary for container startup
-    local host_uid
-    host_uid=$(get_host_uid)
-    docker run --rm \
+    # Phase 5 (conflicts): Write all markers in 1 docker run
+    # Stream branch, mounts, and summary via delimited protocol on stdin
+    {
+        echo "BRANCH:$target_branch"
+        echo "MOUNTS_START"
+        if [[ ${#mount_repos[@]} -gt 0 ]]; then
+            printf '%s\n' "${mount_repos[@]}"
+        fi
+        echo "MOUNTS_END"
+        echo "SUMMARY_START"
+        printf '%s' "$merge_summary"
+        echo ""
+        echo "SUMMARY_END"
+    } | docker run --rm -i \
         --user "$host_uid:$host_uid" \
+        -e HOME=/tmp \
         -v "$volume:/session" \
         "$git_image" \
-        sh -c "echo '$target_branch' > /session/.merge-into-branch" 2>/dev/null || true
-
-    # Write summary to volume (use printf to handle newlines correctly)
-    printf '%s' "$merge_summary" | docker run --rm -i \
-        --user "$host_uid:$host_uid" \
-        -v "$volume:/session" \
-        "$git_image" \
-        sh -c 'cat > /session/.merge-into-summary' 2>/dev/null || true
-
-    # Write dirty mount info so exec-back can reconstruct EXTRA_DOCKER_ARGS
-    if [[ ${#dirty_mounts[@]} -gt 0 ]]; then
-        printf '%s\n' "${dirty_mounts[@]}" | docker run --rm -i \
-            --user "$host_uid:$host_uid" \
-            -v "$volume:/session" \
-            "$git_image" \
-            sh -c 'cat > /session/.merge-into-mounts' 2>/dev/null || true
-    fi
+        sh -c '
+            branch=""
+            mounts=""
+            summary=""
+            mode="init"
+            while IFS= read -r line; do
+                case "$mode" in
+                    init)
+                        case "$line" in
+                            BRANCH:*) branch="${line#BRANCH:}" ;;
+                            MOUNTS_START) mode="mounts" ;;
+                        esac
+                        ;;
+                    mounts)
+                        if [ "$line" = "MOUNTS_END" ]; then
+                            mode="pre_summary"
+                        else
+                            if [ -n "$mounts" ]; then
+                                mounts="$mounts
+$line"
+                            else
+                                mounts="$line"
+                            fi
+                        fi
+                        ;;
+                    pre_summary)
+                        if [ "$line" = "SUMMARY_START" ]; then
+                            mode="summary"
+                        fi
+                        ;;
+                    summary)
+                        if [ "$line" = "SUMMARY_END" ]; then
+                            mode="done"
+                        else
+                            if [ -n "$summary" ]; then
+                                summary="$summary
+$line"
+                            else
+                                summary="$line"
+                            fi
+                        fi
+                        ;;
+                esac
+            done
+            echo "$branch" > /session/.merge-into-branch
+            if [ -n "$mounts" ]; then
+                echo "$mounts" > /session/.merge-into-mounts
+            fi
+            if [ -n "$summary" ]; then
+                printf "%s" "$summary" > /session/.merge-into-summary
+            fi
+        ' 2>/dev/null || true
 
     echo ""
     info "Starting container for review..."

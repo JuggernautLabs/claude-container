@@ -1005,9 +1005,18 @@ docker run "${DOCKER_ARGS[@]}" "$IMAGE_NAME" /bin/bash -c '
     mkdir -p /home/developer/.claude /home/developer/.cargo /home/developer/.npm /home/developer/.cache/pip
 
     # Create .claude.json with settings
-    cat > /home/developer/.claude.json << EOF
-{"theme":"dark-ansi","hasCompletedOnboarding":true,"bypassPermissionsModeAccepted":true}
-EOF
+    # Pre-accept trust dialog for /workspace and all subdirectories
+    # to avoid the "Is this a project you trust?" prompt
+    _trust_entry='{"hasTrustDialogAccepted":true}'
+    _projects='"/workspace":'"$_trust_entry"
+    for _wdir in /workspace/*/ /workspace/*/*/; do
+        [ -d "$_wdir/.git" ] || continue
+        _wdir="${_wdir%/}"
+        _projects="$_projects,\"$_wdir\":$_trust_entry"
+    done
+    cat > /home/developer/.claude.json << CLAUDEJSONEOF
+{"theme":"dark-ansi","hasCompletedOnboarding":true,"bypassPermissionsModeAccepted":true,"projects":{$_projects}}
+CLAUDEJSONEOF
 
     # Create settings.json with statusline showing session name
     # Base64-encoded to avoid quoting issues (runs inside single-quoted bash -c)
