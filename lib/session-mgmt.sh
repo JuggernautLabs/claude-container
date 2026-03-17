@@ -2033,58 +2033,41 @@ session_merge_into() {
     fi
 
     # Phase 5: Reverse-merge check (session → main on host)
-    # After resolving main→session, test if session→main would also be clean.
-    # If not, Claude needs to fix the session so it merges back cleanly.
+    # Uses the same session_auto_merge dry-run as pull --verify and reconcile --dry-run.
+    # One function, one detection path, consistent results everywhere.
     local reverse_conflict_count=0
     local -a reverse_conflict_repos=()
     local -a reverse_conflict_files=()
 
     info "Checking reverse merge (session → $target_branch)..."
+
+    local _rev_result_dir
+    _rev_result_dir=$(mktemp -d)
+    session_auto_merge "$session_name" "$target_branch" true "" true "$_rev_result_dir" 2>/dev/null || true
+
+    # Parse results: find conflicts and mount those repos for Claude
     while IFS='|' read -r proj_name proj_path; do
         [[ -z "$proj_name" ]] && continue
         [[ ! -d "$proj_path" ]] && continue
 
-        # Skip repos without a session branch on host
-        git -C "$proj_path" show-ref --verify --quiet "refs/heads/$session_name" 2>/dev/null || continue
-        git -C "$proj_path" show-ref --verify --quiet "refs/heads/$target_branch" 2>/dev/null || continue
+        local _rev_status
+        _rev_status=$(_pull_result_get "$_rev_result_dir" "$proj_name" "merge_status")
+        [[ -z "$_rev_status" ]] && continue
 
-        # Skip if session is ancestor of target (already merged)
-        git -C "$proj_path" merge-base --is-ancestor "$session_name" "$target_branch" 2>/dev/null && continue
-
-        # Skip if target is ancestor of session (fast-forward, clean)
-        git -C "$proj_path" merge-base --is-ancestor "$target_branch" "$session_name" 2>/dev/null && continue
-
-        # Trees identical = nothing to merge
-        git -C "$proj_path" diff --quiet "$session_name" "$target_branch" -- 2>/dev/null && continue
-
-        # Dry-run merge: session into target
-        local _current
-        _current=$(git -C "$proj_path" symbolic-ref --short HEAD 2>/dev/null || echo "")
-        if [[ "$_current" != "$target_branch" ]]; then
-            git -C "$proj_path" checkout "$target_branch" 2>/dev/null || continue
-        fi
-
-        if ! git -C "$proj_path" merge --no-commit --no-ff "$session_name" >/dev/null 2>&1; then
-            # Conflict — capture files
-            local _rfiles
-            _rfiles=$(git -C "$proj_path" diff --name-only --diff-filter=U 2>/dev/null | head -10 | tr '\n' ', ')
-            _rfiles="${_rfiles%,}"
-            git -C "$proj_path" merge --abort 2>/dev/null || true
+        if [[ "$_rev_status" == "CONFLICT" ]]; then
+            local _rev_files
+            _rev_files=$(_pull_result_get "$_rev_result_dir" "$proj_name" "conflict_files")
             reverse_conflict_repos+=("$proj_name")
-            reverse_conflict_files+=("$_rfiles")
+            reverse_conflict_files+=("$_rev_files")
             reverse_conflict_count=$((reverse_conflict_count + 1))
-            warn "  $proj_name would conflict merging back into $target_branch${_rfiles:+ ($_rfiles)}"
+            warn "  $proj_name would conflict merging back into $target_branch${_rev_files:+ ($_rev_files)}"
             # Mount host repo so Claude can examine target branch
             EXTRA_DOCKER_ARGS+=("-v" "$proj_path:/host/$proj_name:ro")
             mount_repos+=("$proj_name|$proj_path")
-        else
-            git -C "$proj_path" merge --abort 2>/dev/null || true
-        fi
-
-        if [[ "$_current" != "$target_branch" ]]; then
-            git -C "$proj_path" checkout "$_current" 2>/dev/null || true
         fi
     done <<< "$projects"
+
+    rm -rf "$_rev_result_dir"
 
     if [[ $reverse_conflict_count -gt 0 ]]; then
         warn "$reverse_conflict_count project(s) would conflict merging back into $target_branch"
