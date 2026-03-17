@@ -606,7 +606,7 @@ _verify_diffstat() {
     return $(( _total_files > 0 ? 0 : 1 ))
 }
 
-# Preview what reconcile would do — shows Claude's prompt without changing anything
+# Preview what reconcile would do — compact, only shows repos needing attention
 _pull_reconcile_preview() {
     local session_name="$1"
     local target_branch="$2"
@@ -618,7 +618,7 @@ _pull_reconcile_preview() {
         return 1
     fi
 
-    info "Reconcile preview for '$session_name' → '$target_branch' (read-only)"
+    info "Reconcile preview: '$session_name' ↔ '$target_branch'"
     echo ""
 
     # Read config
@@ -631,7 +631,7 @@ _pull_reconcile_preview() {
     local projects
     projects=$(parse_session_projects "$config_content")
 
-    # Get session scan (dirty/merge status) - same as session_merge_into Phase 1
+    # Get session scan (dirty/merge status)
     local _util_image="${GIT_UTIL_IMAGE:-alpine/git}"
     local _merge_scan
     _merge_scan=$(docker run --rm --entrypoint sh \
@@ -656,70 +656,117 @@ _pull_reconcile_preview() {
         _dirty_count[$_sname]="$_sdirty"
     done <<< "$_merge_scan"
 
-    # Classify repos
-    info "=== Main → Session (what Claude resolves in container) ==="
-    echo ""
+    # Dry-run session→main merge (same detection as pull --verify)
+    local _preview_dir
+    _preview_dir=$(mktemp -d)
+    session_auto_merge "$session_name" "$target_branch" true "$repo_filter" true "$_preview_dir" 2>/dev/null || true
 
-    local _conflict=0 _dirty=0 _clean=0 _skip=0
+    # Unified per-repo view: combine both directions
+    local _needs_claude=0 _would_merge=0 _would_conflict=0 _up_to_date=0
+
     while IFS='|' read -r proj_name proj_path; do
         [[ -z "$proj_name" ]] && continue
         [[ -n "$repo_filter" && "$proj_name" != *"$repo_filter"* ]] && continue
 
+        # Gather inbound status (main→session)
+        local _in_status=""
         if [[ ! -d "$proj_path" ]]; then
-            echo -e "  ${YELLOW}⚠${NC} $proj_name — host repo not found"
-            _skip=$((_skip + 1))
-            continue
+            _in_status="skip:host not found"
+        elif ! git -C "$proj_path" show-ref --verify --quiet "refs/heads/$target_branch" 2>/dev/null; then
+            _in_status="skip:no $target_branch"
+        elif [[ "${_merge_status[$proj_name]:-no}" == "yes" ]]; then
+            _in_status="conflict:merge in progress"
+        elif [[ "${_dirty_count[$proj_name]:-0}" -gt 0 ]]; then
+            _in_status="dirty:${_dirty_count[$proj_name]} uncommitted file(s)"
+        else
+            _in_status="clean"
         fi
 
-        if ! git -C "$proj_path" show-ref --verify --quiet "refs/heads/$target_branch" 2>/dev/null; then
-            echo -e "  ${YELLOW}⚠${NC} $proj_name — no '$target_branch' branch"
-            _skip=$((_skip + 1))
-            continue
+        # Gather outbound status (session→main)
+        local _out_status _out_detail _out_files
+        _out_status=$(_pull_result_get "$_preview_dir" "$proj_name" "merge_status")
+        _out_detail=$(_pull_result_get "$_preview_dir" "$proj_name" "merge_detail")
+        _out_files=$(_pull_result_get "$_preview_dir" "$proj_name" "conflict_files")
+
+        # Skip repos that are clean in both directions
+        if [[ "$_in_status" == "clean" ]]; then
+            case "$_out_status" in
+                ""|OK)
+                    case "$_out_detail" in
+                        "already up to date"|"squash-merged (no new"*|"content identical"*)
+                            _up_to_date=$((_up_to_date + 1))
+                            continue
+                            ;;
+                    esac
+                    ;;
+            esac
         fi
 
-        if [[ "${_merge_status[$proj_name]:-no}" == "yes" ]]; then
-            echo -e "  ${YELLOW}⚠${NC} $proj_name — merge in progress in session"
-            _conflict=$((_conflict + 1))
-            continue
-        fi
+        # Show this repo — it needs attention
+        local _short_session _short_main
+        _short_session=$(git -C "$proj_path" rev-parse --short "$session_name" 2>/dev/null || echo "?")
+        _short_main=$(git -C "$proj_path" rev-parse --short "$target_branch" 2>/dev/null || echo "?")
+        echo -e "  ${BLUE}$proj_name${NC}  session:${_short_session}  ${target_branch}:${_short_main}"
 
-        local _dc="${_dirty_count[$proj_name]:-0}"
-        if [[ "$_dc" -gt 0 ]]; then
-            echo -e "  ${YELLOW}⚠${NC} $proj_name — $_dc uncommitted file(s) in session"
-            _dirty=$((_dirty + 1))
-            continue
-        fi
+        # Inbound line
+        case "$_in_status" in
+            clean)
+                echo -e "    ${target_branch} → session:  ${GREEN}✓${NC} clean"
+                ;;
+            dirty:*)
+                echo -e "    ${target_branch} → session:  ${YELLOW}⚠${NC} ${_in_status#dirty:} (Claude commits first)"
+                _needs_claude=$((_needs_claude + 1))
+                ;;
+            conflict:*)
+                echo -e "    ${target_branch} → session:  ${YELLOW}⚠${NC} ${_in_status#conflict:}"
+                _needs_claude=$((_needs_claude + 1))
+                ;;
+            skip:*)
+                echo -e "    ${target_branch} → session:  ${YELLOW}⚠${NC} skipped (${_in_status#skip:})"
+                ;;
+        esac
 
-        echo -e "  ${GREEN}✓${NC} $proj_name — clean (would auto-merge $target_branch)"
-        _clean=$((_clean + 1))
+        # Outbound line
+        case "$_out_status" in
+            OK)
+                case "$_out_detail" in
+                    "would squash-merge"*|"would merge"*|"would fast-forward"*)
+                        echo -e "    session → ${target_branch}:  ${GREEN}✓${NC} $_out_detail"
+                        _would_merge=$((_would_merge + 1))
+                        ;;
+                    *)
+                        echo -e "    session → ${target_branch}:  ${BLUE}—${NC} $_out_detail"
+                        ;;
+                esac
+                ;;
+            CONFLICT)
+                echo -e "    session → ${target_branch}:  ${RED}✗${NC} would conflict${_out_files:+ ($_out_files)}"
+                _would_conflict=$((_would_conflict + 1))
+                # Diffstat
+                local _stat
+                _stat=$(git -C "$proj_path" diff --stat "$target_branch".."$session_name" 2>/dev/null)
+                if [[ -n "$_stat" ]]; then
+                    echo "$_stat" | sed '$d' | sed 's/^/      /'
+                    echo "      $(echo "$_stat" | tail -1)"
+                fi
+                ;;
+            SKIP)
+                echo -e "    session → ${target_branch}:  ${YELLOW}⚠${NC} skipped${_out_detail:+ ($_out_detail)}"
+                ;;
+            "")
+                # No merge result — repo not in session or filtered out
+                ;;
+        esac
+        echo ""
     done <<< "$projects"
 
-    echo ""
-    [[ $_clean -gt 0 ]] && success "$_clean would merge cleanly"
-    [[ $_conflict -gt 0 ]] && warn "$_conflict have conflicts (Claude resolves)"
-    [[ $_dirty -gt 0 ]] && warn "$_dirty have uncommitted changes (Claude commits first)"
-    [[ $_skip -gt 0 ]] && warn "$_skip skipped"
-
-    # Reverse merge check (session → main on host)
-    # Uses the same session_auto_merge dry-run as pull --verify
-    echo ""
-    info "=== Session → Main (what lands on host after reconcile) ==="
-    echo ""
-
-    local _preview_dir
-    _preview_dir=$(mktemp -d)
-
-    # Dry-run merge using the same code path as pull
-    session_auto_merge "$session_name" "$target_branch" true "$repo_filter" true "$_preview_dir" 2>/dev/null || true
-
-    # Show unified report
-    _pull_report "$session_name" "$target_branch" "$_preview_dir" "$repo_filter"
-
-    # Show diffstat
-    echo ""
-    _verify_diffstat "$session_name" "$target_branch" "$_preview_dir" "$repo_filter" || true
-
     rm -rf "$_preview_dir"
+
+    # Summary
+    [[ $_up_to_date -gt 0 ]] && info "$_up_to_date repo(s) up to date (hidden)"
+    [[ $_would_merge -gt 0 ]] && success "$_would_merge would merge into $target_branch"
+    [[ $_would_conflict -gt 0 ]] && warn "$_would_conflict would CONFLICT merging into $target_branch — Claude will be instructed to fix"
+    [[ $_needs_claude -gt 0 ]] && warn "$_needs_claude need Claude's attention in container"
 }
 
 _pull_reconcile() {
