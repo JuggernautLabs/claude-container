@@ -3436,11 +3436,6 @@ session_auto_merge() {
                         exit 0
                     fi
 
-                    if [[ "$dry_run" == "true" ]]; then
-                        _write_merge_result "OK" "$proj_name" "would squash-merge into $target_branch ($_new_count new)"
-                        exit 0
-                    fi
-
                     # Cherry-pick only new commits since last squash
                     local current_branch
                     current_branch=$(git -C "$proj_path" symbolic-ref --short HEAD 2>/dev/null || echo "")
@@ -3454,6 +3449,14 @@ session_auto_merge() {
                     fi
 
                     if git -C "$proj_path" cherry-pick --no-commit "${_squash_base}..${session_name}" >/dev/null 2>&1; then
+                        if [[ "$dry_run" == "true" ]]; then
+                            git -C "$proj_path" reset --hard HEAD 2>/dev/null || true
+                            if $_need_checkout_back; then
+                                git -C "$proj_path" checkout "$current_branch" 2>/dev/null || true
+                            fi
+                            _write_merge_result "OK" "$proj_name" "would squash-merge into $target_branch ($_new_count new)"
+                            exit 0
+                        fi
                         # Build commit message from original session commits
                         local _squash_msg
                         _squash_msg=$(git -C "$proj_path" log --format="%s" "${_squash_base}..${session_name}" 2>/dev/null | head -20)
