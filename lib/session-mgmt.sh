@@ -3330,16 +3330,21 @@ session_auto_merge() {
             # --- Detection: uses shared detect_repo_merge_status ---
             detect_repo_merge_status "$proj_path" "$session_name" "$target_branch" "$squash" "$_detect_file"
 
-            local _d_status _d_detail _d_files _d_target
+            local _d_status _d_detail _d_files _d_target _d_target_ahead
             _d_status=$(detect_result_get "$_detect_file" "merge_status")
             _d_detail=$(detect_result_get "$_detect_file" "merge_detail")
             _d_files=$(detect_result_get "$_detect_file" "conflict_files")
             _d_target=$(detect_result_get "$_detect_file" "target_head")
+            _d_target_ahead=$(detect_result_get "$_detect_file" "target_ahead")
             rm -f "$_detect_file"
 
             # Write conflict files to unified result dir
             if [[ -n "$_unified_result_dir" && -n "$_d_files" ]]; then
                 _pull_result_set "$_unified_result_dir" "$proj_name" "conflict_files" "$_d_files"
+            fi
+            # Propagate target-ahead count for reporting
+            if [[ -n "$_unified_result_dir" && -n "$_d_target_ahead" && "$_d_target_ahead" != "0" ]]; then
+                _pull_result_set "$_unified_result_dir" "$proj_name" "target_ahead" "$_d_target_ahead"
             fi
 
             # If dry-run or detection says conflict/skip, just report
@@ -3350,7 +3355,7 @@ session_auto_merge() {
 
             # Detection says OK — check for special cases
             case "$_d_detail" in
-                "already up to date"|"no new commits since last squash"|"content identical to"*)
+                "already up to date"|"up to date"*)
                     _write_merge_result "OK" "$proj_name" "$_d_detail"
                     exit 0
                     ;;
@@ -3383,7 +3388,22 @@ session_auto_merge() {
                 _squash_base=""
             fi
 
-            if [[ "$squash" == "true" && -n "$_squash_base" ]]; then
+            if [[ "$squash" == "true" && -n "$_squash_base" ]] && \
+               git -C "$proj_path" merge-base --is-ancestor "$target_branch" "$session_name" 2>/dev/null; then
+                # Target is ancestor of session (e.g. after reconcile merged target into session).
+                # Use merge --squash instead of cherry-pick to avoid decomposing merge commits.
+                local _ahead
+                _ahead=$(git -C "$proj_path" rev-list --count "$target_branch".."$session_name" 2>/dev/null || echo "?")
+                git -C "$proj_path" merge --squash "$session_name" >/dev/null 2>&1
+                local _squash_msg
+                _squash_msg=$(git -C "$proj_path" log --format="%s" "${target_branch}..${session_name}" --no-merges 2>/dev/null | head -20)
+                local _commit_out
+                _commit_out=$(git -C "$proj_path" commit -m "$(printf '%s\n\n%s' \
+                    "$session_name → $target_branch ($_ahead commits)" \
+                    "$_squash_msg")" 2>&1) || true
+                git -C "$proj_path" update-ref "$_squash_ref" "$(git -C "$proj_path" rev-parse "$session_name")" 2>/dev/null || true
+                _write_merge_result "OK" "$proj_name" "squash-merged into $target_branch ($_ahead commits)"
+            elif [[ "$squash" == "true" && -n "$_squash_base" ]]; then
                 # Incremental squash: cherry-pick new commits
                 local _new_count
                 _new_count=$(git -C "$proj_path" rev-list --count "${_squash_base}..${session_name}" 2>/dev/null || echo "0")

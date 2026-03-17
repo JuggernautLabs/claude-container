@@ -14,6 +14,8 @@ cmd_push() {
     local target_as=""
     local strategy="ff"  # ff, merge, rebase, serve
     local force=false
+    local verify=false
+    local dry_run=false
     local repo_filter=""
     local repo_branch=""
 
@@ -54,6 +56,14 @@ cmd_push() {
                 force=true
                 shift
                 ;;
+            --verify)
+                verify=true
+                shift
+                ;;
+            --dry-run)
+                dry_run=true
+                shift
+                ;;
             --help|-h)
                 _push_help
                 return 0
@@ -92,14 +102,42 @@ cmd_push() {
             ;;
         ff)
             # Fast-forward: fetch + ff from host branch (default)
-            # repo_branch (from --repo name,branch) overrides positional branch
-            local refresh_branch="${repo_branch:-${branch:-main}}"
-            session_refresh "$session_name" "$refresh_branch" "$repo_filter" "$force"
-            return $?
-            ;;
+            if $dry_run || $verify; then
+                # Preview needs merge path — redirect there
+                strategy="merge"
+            else
+                local refresh_branch="${repo_branch:-${branch:-main}}"
+                session_refresh "$session_name" "$refresh_branch" "$repo_filter" "$force"
+                return $?
+            fi
+            ;&  # fall through to merge
         merge)
             # Merge host branch into session
             local merge_branch="${branch:-main}"
+
+            if $dry_run || $verify; then
+                # Source pull.sh for preview functions
+                source "$(dirname "${BASH_SOURCE[0]}")/pull.sh"
+                # Show preview of what merge would do
+                _pull_reconcile_preview "$session_name" "$merge_branch" "$repo_filter"
+                if $dry_run; then
+                    return 0
+                fi
+                echo ""
+                printf "Merge '%s' into session '%s'? [y/N] " "$merge_branch" "$session_name"
+                local _answer
+                read -r _answer
+                case "$_answer" in
+                    [yY]|[yY][eE][sS])
+                        info "Merging..."
+                        ;;
+                    *)
+                        info "Aborted."
+                        return 0
+                        ;;
+                esac
+            fi
+
             if ! session_merge_into "$session_name" "$merge_branch"; then
                 # Clean merge — extract resolved state
                 session_extract "$session_name" --force
@@ -137,6 +175,8 @@ Options:
   --ff                     Fast-forward from host branch (default)
   --merge                  Merge host branch into session
   --rebase                 Rebase session onto host branch
+  --verify                 Preview what merge would do and confirm before proceeding
+  --dry-run                Preview only, don't execute
   --force, -f              Force operation
   --help, -h               Show this help
 

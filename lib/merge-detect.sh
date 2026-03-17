@@ -29,6 +29,8 @@ detect_repo_merge_status() {
         local _th
         _th=$(git -C "$proj_path" rev-parse "refs/heads/$target_branch" 2>/dev/null || echo "")
         [[ -n "$_th" ]] && echo "target_head=$_th" >> "$result_file"
+        # How many commits on target that session doesn't have
+        echo "target_ahead=${_target_ahead:-0}" >> "$result_file"
     }
 
     # --- Pre-merge validations ---
@@ -42,6 +44,11 @@ detect_repo_merge_status() {
         _detect_write "SKIP" "no session branch"
         return 0
     fi
+
+    # Compute target-ahead count: commits on target not in session.
+    # If >0, a squash-merge risks overwriting these unless the 3-way merge preserves them.
+    local _target_ahead=0
+    _target_ahead=$(git -C "$proj_path" rev-list --count "$session_name".."$target_branch" 2>/dev/null || echo "0")
 
     local orig_dirty
     orig_dirty=$(git -C "$proj_path" status --porcelain 2>/dev/null)
@@ -70,11 +77,26 @@ detect_repo_merge_status() {
         fi
 
         if [[ -n "$_squash_base" ]]; then
+            # Fast-forward check: if target is already an ancestor of session,
+            # the histories are tied (e.g. after reconcile merged target into session).
+            # FF always wins over cherry-pick — no need to decompose commits.
+            if git -C "$proj_path" merge-base --is-ancestor "$target_branch" "$session_name" 2>/dev/null; then
+                # Content already identical? Prior squash applied everything.
+                if git -C "$proj_path" diff --quiet "$target_branch" "$session_name" -- 2>/dev/null; then
+                    _detect_write "OK" "up to date (content identical)"
+                    return 0
+                fi
+                local _ahead
+                _ahead=$(git -C "$proj_path" rev-list --count "$target_branch".."$session_name" 2>/dev/null || echo "?")
+                _detect_write "OK" "squash-merge $_ahead commit(s) into $target_branch"
+                return 0
+            fi
+
             local _new_count
             _new_count=$(git -C "$proj_path" rev-list --count "${_squash_base}..${session_name}" 2>/dev/null || echo "0")
 
             if [[ "$_new_count" == "0" ]]; then
-                _detect_write "OK" "no new commits since last squash"
+                _detect_write "OK" "up to date (already squashed)"
                 return 0
             fi
 
@@ -97,7 +119,7 @@ detect_repo_merge_status() {
             if [[ $_cp_rc -eq 0 ]]; then
                 git -C "$proj_path" reset --hard HEAD 2>/dev/null || true
                 $_need_checkout && git -C "$proj_path" checkout "$current_branch" 2>/dev/null || true
-                _detect_write "OK" "would squash-merge into $target_branch ($_new_count new)"
+                _detect_write "OK" "squash-merge $_new_count new commit(s) into $target_branch"
                 return 0
             elif echo "$_cp_err" | grep -q "is a merge but no -m option"; then
                 # Range contains merge commits — cherry-pick can't handle them.
@@ -128,7 +150,7 @@ detect_repo_merge_status() {
 
     # Trees identical (prior manual squash)
     if git -C "$proj_path" diff --quiet "$session_name" "$target_branch" -- 2>/dev/null; then
-        _detect_write "OK" "content identical to $target_branch"
+        _detect_write "OK" "up to date (content identical)"
         return 0
     fi
 
@@ -137,9 +159,9 @@ detect_repo_merge_status() {
         local _ahead
         _ahead=$(git -C "$proj_path" rev-list --count "$target_branch".."$session_name" 2>/dev/null || echo "?")
         if [[ "$squash" == "true" ]]; then
-            _detect_write "OK" "would squash-merge into $target_branch ($_ahead commits)"
+            _detect_write "OK" "squash-merge $_ahead commit(s) into $target_branch"
         else
-            _detect_write "OK" "would fast-forward into $target_branch ($_ahead commits)"
+            _detect_write "OK" "fast-forward $_ahead commit(s) into $target_branch"
         fi
         return 0
     fi
@@ -174,9 +196,9 @@ detect_repo_merge_status() {
     [[ "$current_branch" != "$target_branch" ]] && git -C "$proj_path" checkout "$current_branch" 2>/dev/null || true
 
     if [[ "$squash" == "true" ]]; then
-        _detect_write "OK" "would squash-merge into $target_branch"
+        _detect_write "OK" "squash-merge into $target_branch"
     else
-        _detect_write "OK" "would merge cleanly into $target_branch"
+        _detect_write "OK" "merge cleanly into $target_branch"
     fi
 }
 
