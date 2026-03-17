@@ -19,6 +19,7 @@ cmd_pull() {
     local squash=true
     local status_only=false
     local verify=false
+    local show_prompt=false
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -56,6 +57,10 @@ cmd_pull() {
                 ;;
             --verify)
                 verify=true
+                shift
+                ;;
+            --show-prompt)
+                show_prompt=true
                 shift
                 ;;
             --help|-h)
@@ -123,8 +128,7 @@ cmd_pull() {
             return 1
         fi
         if $dry_run; then
-            # Preview what reconcile would do — show Claude's prompt without launching
-            _pull_reconcile_preview "$session_name" "$branch" "$repo_filter"
+            _pull_reconcile_preview "$session_name" "$branch" "$repo_filter" "$show_prompt"
             return $?
         fi
         # Reconcile uses legacy (non-unified) output
@@ -611,6 +615,7 @@ _pull_reconcile_preview() {
     local session_name="$1"
     local target_branch="$2"
     local repo_filter="${3:-}"
+    local show_prompt="${4:-false}"
     local volume="claude-session-${session_name}"
 
     if ! docker volume inspect "$volume" &>/dev/null; then
@@ -771,8 +776,8 @@ _pull_reconcile_preview() {
     [[ $_would_conflict -gt 0 ]] && warn "$_would_conflict would CONFLICT merging into $target_branch — Claude will be instructed to fix"
     [[ $_needs_claude -gt 0 ]] && warn "$_needs_claude need Claude's attention in container"
 
-    # Build and show Claude's prompt
-    if [[ $((_needs_claude + _would_conflict)) -gt 0 ]]; then
+    # Build and show Claude's prompt (only with --show-prompt)
+    if [[ "$show_prompt" == "true" ]] && [[ $((_needs_claude + _would_conflict)) -gt 0 ]]; then
         echo ""
         info "=== Claude's prompt ==="
         echo ""
