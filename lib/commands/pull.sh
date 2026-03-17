@@ -663,6 +663,7 @@ _pull_reconcile_preview() {
 
     # Unified per-repo view: combine both directions
     local _needs_claude=0 _would_merge=0 _would_conflict=0 _up_to_date=0
+    local -a _rev_conflict_repos=() _rev_conflict_files=()
 
     while IFS='|' read -r proj_name proj_path; do
         [[ -z "$proj_name" ]] && continue
@@ -742,6 +743,8 @@ _pull_reconcile_preview() {
             CONFLICT)
                 echo -e "    session → ${target_branch}:  ${RED}✗${NC} would conflict${_out_files:+ ($_out_files)}"
                 _would_conflict=$((_would_conflict + 1))
+                _rev_conflict_repos+=("$proj_name")
+                _rev_conflict_files+=("${_out_files:-?}")
                 # Diffstat
                 local _stat
                 _stat=$(git -C "$proj_path" diff --stat "$target_branch".."$session_name" 2>/dev/null)
@@ -767,6 +770,50 @@ _pull_reconcile_preview() {
     [[ $_would_merge -gt 0 ]] && success "$_would_merge would merge into $target_branch"
     [[ $_would_conflict -gt 0 ]] && warn "$_would_conflict would CONFLICT merging into $target_branch — Claude will be instructed to fix"
     [[ $_needs_claude -gt 0 ]] && warn "$_needs_claude need Claude's attention in container"
+
+    # Build and show Claude's prompt
+    if [[ $((_needs_claude + _would_conflict)) -gt 0 ]]; then
+        echo ""
+        info "=== Claude's prompt ==="
+        echo ""
+
+        local _prompt="Branch '$target_branch' was merged into this session. Here is what happened:"
+        _prompt+=$'\n'
+
+        # Inbound status per repo
+        while IFS='|' read -r proj_name proj_path; do
+            [[ -z "$proj_name" ]] && continue
+            [[ -n "$repo_filter" && "$proj_name" != *"$repo_filter"* ]] && continue
+            local _dc="${_dirty_count[$proj_name]:-0}"
+            if [[ "${_merge_status[$proj_name]:-no}" == "yes" ]]; then
+                _prompt+=$'\n'"  CONFLICT: $proj_name (merge in progress)"
+            elif [[ "$_dc" -gt 0 ]]; then
+                _prompt+=$'\n'"  DIRTY: $proj_name ($_dc uncommitted changes)"
+            fi
+        done <<< "$projects"
+
+        # Reverse conflicts
+        if [[ ${#_rev_conflict_repos[@]} -gt 0 ]]; then
+            _prompt+=$'\n\n'"=== REVERSE MERGE CONFLICTS ==="
+            _prompt+=$'\n'"${#_rev_conflict_repos[@]} project(s) will conflict when merging session back into '$target_branch'."
+            _prompt+=$'\n'"The host '$target_branch' branch is mounted read-only at /host/{project_name}."
+            for _i in "${!_rev_conflict_repos[@]}"; do
+                _prompt+=$'\n'"  ${_rev_conflict_repos[$_i]}: ${_rev_conflict_files[$_i]}"
+            done
+            _prompt+=$'\n\n'"For each reverse-conflict project:"
+            _prompt+=$'\n'"1. cd /workspace/{project_name}"
+            _prompt+=$'\n'"2. git remote add host /host/{project_name} && git fetch host $target_branch"
+            _prompt+=$'\n'"3. git merge host/$target_branch --no-edit"
+            _prompt+=$'\n'"4. Resolve conflicts — goal is session contains everything from $target_branch"
+            _prompt+=$'\n'"5. git add && git commit"
+            _prompt+=$'\n'"6. git remote remove host"
+            _prompt+=$'\n\n'"After this, host can fast-forward $target_branch to session — no more squash conflicts."
+        fi
+
+        _prompt+=$'\n\n'"When finished: fin \"<brief description>\""
+
+        echo "$_prompt"
+    fi
 }
 
 _pull_reconcile() {
