@@ -266,6 +266,21 @@ _pull_report() {
         _merge_detail=$(_pull_result_get "$result_dir" "$_repo" "merge_detail")
         _conflict_files=$(_pull_result_get "$result_dir" "$_repo" "conflict_files")
 
+        # Hide repos that are unchanged on both extract and merge
+        local _is_quiet=false
+        if [[ "$_ext_status" == "unchanged" || -z "$_ext_status" ]]; then
+            case "$_merge_detail" in
+                "already up to date"|"no new commits since last squash"|"content identical"*)
+                    _is_quiet=true
+                    _unchanged=$((_unchanged + 1))
+                    ;;
+                "") [[ -z "$_merge_status" ]] && _is_quiet=true && _unchanged=$((_unchanged + 1)) ;;
+            esac
+        fi
+        if $_is_quiet; then
+            continue
+        fi
+
         local _c_ahead _h_ahead
         _c_ahead=$(_pull_result_get "$result_dir" "$_repo" "diverge_container_ahead")
         _h_ahead=$(_pull_result_get "$result_dir" "$_repo" "diverge_host_ahead")
@@ -833,17 +848,17 @@ _pull_reconcile() {
         return 1
     fi
 
-    # Phase 1: Extract session branches to host repos
-    info "Phase 1: Extracting session branches..."
+    # Phase 1: Extract session branches to host repos (quiet — result-dir suppresses legacy output)
+    local _reconcile_result_dir
+    _reconcile_result_dir=$(mktemp -d)
+    info "Extracting session branches..."
     if [[ "$force" == "true" ]]; then
-        session_extract "$session_name" --force
+        session_extract "$session_name" --force --result-dir "$_reconcile_result_dir"
     else
-        session_extract "$session_name"
+        session_extract "$session_name" --result-dir "$_reconcile_result_dir"
     fi
-    echo ""
 
     # Phase 2: Stash dirty worktrees on host
-    info "Phase 2: Checking host repos for uncommitted work..."
     _pull_stash_dirty "$session_name" "$target_branch"
     echo ""
 
@@ -937,13 +952,13 @@ _pull_stash_dirty() {
         local current_branch
         current_branch=$(git -C "$proj_path" symbolic-ref --short HEAD 2>/dev/null || echo "")
 
-        info "  $proj_name: stashing to branch '$stash_branch'"
+        info "  $proj_name: stashing uncommitted work"
 
-        git -C "$proj_path" checkout -b "$stash_branch" 2>/dev/null
-        git -C "$proj_path" add -A 2>/dev/null
-        git -C "$proj_path" commit -m "WIP: stashed by reconcile (session: $session_name)" --no-verify 2>/dev/null
+        git -C "$proj_path" checkout -b "$stash_branch" >/dev/null 2>&1
+        git -C "$proj_path" add -A >/dev/null 2>&1
+        git -C "$proj_path" commit -m "WIP: stashed by reconcile (session: $session_name)" --no-verify >/dev/null 2>&1
         if [[ -n "$current_branch" ]]; then
-            git -C "$proj_path" checkout "$current_branch" 2>/dev/null
+            git -C "$proj_path" checkout "$current_branch" >/dev/null 2>&1
         fi
 
         stash_count=$((stash_count + 1))

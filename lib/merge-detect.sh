@@ -205,10 +205,24 @@ build_reconcile_prompt() {
     local prompt="Branch '$target_branch' was merged into this session. Here is what happened:"
     prompt+=$'\n'
 
+    local _ok_count=0
     while IFS= read -r line; do
         [[ -z "$line" ]] && continue
-        prompt+=$'\n'"  $line"
+        # Only include lines that need attention — skip "OK: ... (up to date/merged)"
+        case "$line" in
+            "OK: "*)
+                _ok_count=$((_ok_count + 1))
+                # Only show OK lines for repos that were actually merged (not "up to date")
+                case "$line" in
+                    *"(merged)"*) prompt+=$'\n'"  $line" ;;
+                esac
+                ;;
+            *)
+                prompt+=$'\n'"  $line"
+                ;;
+        esac
     done <<< "${_PROMPT_SUMMARY_LINES:-}"
+    [[ $_ok_count -gt 0 ]] && prompt+=$'\n'"  ($_ok_count repo(s) already up to date)"
 
     local conflict_count="${_PROMPT_CONFLICT_COUNT:-0}"
     local dirty_count="${_PROMPT_DIRTY_COUNT:-0}"
