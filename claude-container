@@ -1007,16 +1007,22 @@ docker run "${DOCKER_ARGS[@]}" "$IMAGE_NAME" /bin/bash -c '
     # Create .claude.json with settings
     # Pre-accept trust dialog for /workspace and all subdirectories
     # to avoid the "Is this a project you trust?" prompt
-    _trust_entry='{"hasTrustDialogAccepted":true}'
-    _projects='"/workspace":'"$_trust_entry"
-    for _wdir in /workspace/*/ /workspace/*/*/; do
-        [ -d "$_wdir/.git" ] || continue
-        _wdir="${_wdir%/}"
-        _projects="$_projects,\"$_wdir\":$_trust_entry"
-    done
-    cat > /home/developer/.claude.json << CLAUDEJSONEOF
-{"theme":"dark-ansi","hasCompletedOnboarding":true,"bypassPermissionsModeAccepted":true,"projects":{$_projects}}
-CLAUDEJSONEOF
+    python3 << 'TRUSTPY' 2>/dev/null || echo '{"theme":"dark-ansi","hasCompletedOnboarding":true,"bypassPermissionsModeAccepted":true}' > /home/developer/.claude.json
+import json, glob, os
+projects = {"/workspace": {"hasTrustDialogAccepted": True}}
+for pattern in ["/workspace/*/", "/workspace/*/*/"]:
+    for d in glob.glob(pattern):
+        if os.path.isdir(os.path.join(d, ".git")):
+            projects[d.rstrip("/")] = {"hasTrustDialogAccepted": True}
+config = {
+    "theme": "dark-ansi",
+    "hasCompletedOnboarding": True,
+    "bypassPermissionsModeAccepted": True,
+    "projects": projects
+}
+with open("/home/developer/.claude.json", "w") as f:
+    json.dump(config, f)
+TRUSTPY
 
     # Create settings.json with statusline showing session name
     # Base64-encoded to avoid quoting issues (runs inside single-quoted bash -c)

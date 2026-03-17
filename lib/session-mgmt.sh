@@ -2636,6 +2636,8 @@ _extract_multi_project_direct() {
         while IFS='|' read -r _hash _name; do
             [[ -z "$_name" ]] && continue
             if [[ -z "${_config_names[$_name]:-}" ]]; then
+                # Respect --repo filter for non-config repos too
+                [[ -n "$repo_filter" && "$_name" != "$repo_filter" && "$_name" != *"$repo_filter"* ]] && continue
                 _new_repos+=("$_name")
             fi
         done <<< "$_new_manifest"
@@ -2690,6 +2692,8 @@ _extract_multi_project_direct() {
                     if [[ -n "$result_dir" ]]; then
                         _pull_result_set "$result_dir" "$_new_name" "repo_name" "$_new_name"
                         _pull_result_set "$result_dir" "$_new_name" "extract_status" "unchanged"
+                        _pull_result_set "$result_dir" "$_new_name" "container_head" "$_fetched_head"
+                        _pull_result_set "$result_dir" "$_new_name" "session_head" "$_compare_base"
                     else
                         echo "  $_new_name (no changes)"
                     fi
@@ -2698,12 +2702,17 @@ _extract_multi_project_direct() {
                 git -C "$_target_dir" branch -f "$session_name" FETCH_HEAD 2>/dev/null
                 if [[ -n "$result_dir" ]]; then
                     local _n_commits="?"
+                    local _n_files="?"
                     if $_branch_exists; then
                         _n_commits=$(git -C "$_target_dir" rev-list --count "$_compare_base".."$session_name" 2>/dev/null || echo "?")
+                        _n_files=$(git -C "$_target_dir" diff --name-only "$_compare_base".."$session_name" 2>/dev/null | wc -l | tr -d ' ')
                     fi
                     _pull_result_set "$result_dir" "$_new_name" "repo_name" "$_new_name"
                     _pull_result_set "$result_dir" "$_new_name" "extract_status" "updated"
                     _pull_result_set "$result_dir" "$_new_name" "extract_commits" "$_n_commits"
+                    _pull_result_set "$result_dir" "$_new_name" "extract_files" "$_n_files"
+                    _pull_result_set "$result_dir" "$_new_name" "container_head" "$_fetched_head"
+                    _pull_result_set "$result_dir" "$_new_name" "session_head" "$(git -C "$_target_dir" rev-parse "$session_name" 2>/dev/null)"
                 else
                     if $_branch_exists; then
                         local _n_commits
@@ -2758,9 +2767,16 @@ _extract_multi_project_direct() {
                     local _commit_count
                     _commit_count=$(git -C "$_target_dir" rev-list --count HEAD 2>/dev/null || echo "?")
                     if [[ -n "$result_dir" ]]; then
+                        local _clone_head
+                        _clone_head=$(git -C "$_target_dir" rev-parse HEAD 2>/dev/null || echo "")
+                        local _clone_files
+                        _clone_files=$(git -C "$_target_dir" ls-files 2>/dev/null | wc -l | tr -d ' ')
                         _pull_result_set "$result_dir" "$_new_name" "repo_name" "$_new_name"
                         _pull_result_set "$result_dir" "$_new_name" "extract_status" "cloned"
                         _pull_result_set "$result_dir" "$_new_name" "extract_commits" "$_commit_count"
+                        _pull_result_set "$result_dir" "$_new_name" "extract_files" "$_clone_files"
+                        _pull_result_set "$result_dir" "$_new_name" "container_head" "$_clone_head"
+                        _pull_result_set "$result_dir" "$_new_name" "session_head" "$_clone_head"
                     else
                         success "  $_new_name → cloned to $_target_dir ($_commit_count commit(s))"
                     fi

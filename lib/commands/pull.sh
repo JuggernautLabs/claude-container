@@ -256,7 +256,8 @@ _pull_report() {
                 ;;
             cloned)
                 local _ext_info=""
-                [[ -n "$_ext_commits" ]] && _ext_info="${_ext_commits} commits"
+                [[ -n "$_ext_commits" && "$_ext_commits" != "0" ]] && _ext_info="${_ext_commits} commits"
+                [[ -n "$_ext_files" && "$_ext_files" != "0" ]] && _ext_info="${_ext_info:+$_ext_info, }${_ext_files} files"
                 echo -e "    extract:  ${GREEN}✓${NC} cloned${_ext_info:+ ($_ext_info)}"
                 _pulled=$((_pulled + 1))
                 ;;
