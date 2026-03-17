@@ -90,18 +90,29 @@ detect_repo_merge_status() {
                 _need_checkout=true
             fi
 
-            if git -C "$proj_path" cherry-pick --no-commit "${_squash_base}..${session_name}" >/dev/null 2>&1; then
+            local _cp_err
+            _cp_err=$(git -C "$proj_path" cherry-pick --no-commit "${_squash_base}..${session_name}" 2>&1)
+            local _cp_rc=$?
+
+            if [[ $_cp_rc -eq 0 ]]; then
                 git -C "$proj_path" reset --hard HEAD 2>/dev/null || true
                 $_need_checkout && git -C "$proj_path" checkout "$current_branch" 2>/dev/null || true
                 _detect_write "OK" "would squash-merge into $target_branch ($_new_count new)"
                 return 0
+            elif echo "$_cp_err" | grep -q "is a merge but no -m option"; then
+                # Range contains merge commits — cherry-pick can't handle them.
+                # Clean up and fall through to regular merge test.
+                git -C "$proj_path" cherry-pick --abort 2>/dev/null || git -C "$proj_path" reset --hard HEAD 2>/dev/null || true
+                $_need_checkout && git -C "$proj_path" checkout "$current_branch" 2>/dev/null || true
+                # Don't return — fall through to generic checks below
             else
+                # Real conflict
                 local _cfiles
                 _cfiles=$(git -C "$proj_path" diff --name-only --diff-filter=U 2>/dev/null | head -5 | tr '\n' ', ')
                 _cfiles="${_cfiles%,}"
                 git -C "$proj_path" cherry-pick --abort 2>/dev/null || git -C "$proj_path" reset --hard HEAD 2>/dev/null || true
                 $_need_checkout && git -C "$proj_path" checkout "$current_branch" 2>/dev/null || true
-                _detect_write "CONFLICT" "would conflict (squash cherry-pick)" "$_cfiles"
+                _detect_write "CONFLICT" "would conflict${_cfiles:+ ($_cfiles)}" "$_cfiles"
                 return 0
             fi
         fi
