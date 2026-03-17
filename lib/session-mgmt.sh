@@ -2032,8 +2032,68 @@ session_merge_into() {
         warn "$dirty_count project(s) have uncommitted changes (commit or stash in session)"
     fi
 
+    # Phase 5: Reverse-merge check (session → main on host)
+    # After resolving main→session, test if session→main would also be clean.
+    # If not, Claude needs to fix the session so it merges back cleanly.
+    local reverse_conflict_count=0
+    local -a reverse_conflict_repos=()
+    local -a reverse_conflict_files=()
+
+    info "Checking reverse merge (session → $target_branch)..."
+    while IFS='|' read -r proj_name proj_path; do
+        [[ -z "$proj_name" ]] && continue
+        [[ ! -d "$proj_path" ]] && continue
+
+        # Skip repos without a session branch on host
+        git -C "$proj_path" show-ref --verify --quiet "refs/heads/$session_name" 2>/dev/null || continue
+        git -C "$proj_path" show-ref --verify --quiet "refs/heads/$target_branch" 2>/dev/null || continue
+
+        # Skip if session is ancestor of target (already merged)
+        git -C "$proj_path" merge-base --is-ancestor "$session_name" "$target_branch" 2>/dev/null && continue
+
+        # Skip if target is ancestor of session (fast-forward, clean)
+        git -C "$proj_path" merge-base --is-ancestor "$target_branch" "$session_name" 2>/dev/null && continue
+
+        # Trees identical = nothing to merge
+        git -C "$proj_path" diff --quiet "$session_name" "$target_branch" -- 2>/dev/null && continue
+
+        # Dry-run merge: session into target
+        local _current
+        _current=$(git -C "$proj_path" symbolic-ref --short HEAD 2>/dev/null || echo "")
+        if [[ "$_current" != "$target_branch" ]]; then
+            git -C "$proj_path" checkout "$target_branch" 2>/dev/null || continue
+        fi
+
+        if ! git -C "$proj_path" merge --no-commit --no-ff "$session_name" >/dev/null 2>&1; then
+            # Conflict — capture files
+            local _rfiles
+            _rfiles=$(git -C "$proj_path" diff --name-only --diff-filter=U 2>/dev/null | head -10 | tr '\n' ', ')
+            _rfiles="${_rfiles%,}"
+            git -C "$proj_path" merge --abort 2>/dev/null || true
+            reverse_conflict_repos+=("$proj_name")
+            reverse_conflict_files+=("$_rfiles")
+            reverse_conflict_count=$((reverse_conflict_count + 1))
+            warn "  $proj_name would conflict merging back into $target_branch${_rfiles:+ ($_rfiles)}"
+            # Mount host repo so Claude can examine target branch
+            EXTRA_DOCKER_ARGS+=("-v" "$proj_path:/host/$proj_name:ro")
+            mount_repos+=("$proj_name|$proj_path")
+        else
+            git -C "$proj_path" merge --abort 2>/dev/null || true
+        fi
+
+        if [[ "$_current" != "$target_branch" ]]; then
+            git -C "$proj_path" checkout "$_current" 2>/dev/null || true
+        fi
+    done <<< "$projects"
+
+    if [[ $reverse_conflict_count -gt 0 ]]; then
+        warn "$reverse_conflict_count project(s) would conflict merging back into $target_branch"
+    else
+        success "Reverse merge check passed"
+    fi
+
     # If nothing needs Claude's attention, signal early exit
-    if [[ $conflict_count -eq 0 ]] && [[ $dirty_count -eq 0 ]]; then
+    if [[ $conflict_count -eq 0 ]] && [[ $dirty_count -eq 0 ]] && [[ $reverse_conflict_count -eq 0 ]]; then
         echo ""
         success "Merge complete — nothing for Claude to resolve."
         # Phase 5 (clean): Write merge-into-branch marker - 1 docker run
@@ -2078,6 +2138,25 @@ session_merge_into() {
         merge_summary+=$'\n'"5. Resolve any conflicts (prefer session/HEAD side), then git add and git commit"
         merge_summary+=$'\n'"6. Clean up: git remote remove upstream"
     fi
+    if [[ $reverse_conflict_count -gt 0 ]]; then
+        merge_summary+=$'\n\n'"=== REVERSE MERGE CONFLICTS ==="
+        merge_summary+=$'\n'"$reverse_conflict_count project(s) will conflict when merging your session back into '$target_branch' on the host."
+        merge_summary+=$'\n'"This is typically caused by prior squash-merges creating divergent git history."
+        merge_summary+=$'\n'"The host '$target_branch' branch is mounted read-only at /host/{project_name} for reference."
+        merge_summary+=$'\n'
+        for _i in "${!reverse_conflict_repos[@]}"; do
+            merge_summary+=$'\n'"  ${reverse_conflict_repos[$_i]}: ${reverse_conflict_files[$_i]}"
+        done
+        merge_summary+=$'\n\n'"For each reverse-conflict project:"
+        merge_summary+=$'\n'"1. cd /workspace/{project_name}"
+        merge_summary+=$'\n'"2. Fetch the host's $target_branch: git remote add host /host/{project_name} && git fetch host $target_branch"
+        merge_summary+=$'\n'"3. Merge host/$target_branch into your session: git merge host/$target_branch --no-edit"
+        merge_summary+=$'\n'"4. If conflicts, resolve them — the goal is that your session now contains everything from $target_branch"
+        merge_summary+=$'\n'"5. git add the resolved files && git commit"
+        merge_summary+=$'\n'"6. git remote remove host"
+        merge_summary+=$'\n\n'"After this, the host will be able to fast-forward $target_branch to your session — no more squash conflicts."
+    fi
+
     merge_summary+=$'\n\n'"After resolving all conflicts, review the result:"
     merge_summary+=$'\n'"- Do the merged changes preserve the functionality of the committed session work? Are there any regressions?"
     merge_summary+=$'\n'"- Are there augmentations — new features or behavior introduced by '$target_branch' that extend or change what the session was doing?"

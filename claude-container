@@ -1268,13 +1268,42 @@ if $USE_GIT_SESSION; then
         success "Merge cleanup complete"
         echo ""
 
-        # Auto-extract with --force
-        info "Extracting merged changes..."
-        session_extract "$SESSION_NAME" --force
+        # Use the unified pull flow (extract + merge + report)
+        # This gives proper squash tracking, conflict reporting, and --verify support
+        info "Pulling merged changes into '$MERGE_INTO_BRANCH_CHECK'..."
         echo ""
 
         if $AUTO_MERGE; then
-            session_auto_merge "$SESSION_NAME" "$MERGE_INTO_BRANCH_CHECK"
+            # Check for --verify marker (written by pull --reconcile --verify)
+            VERIFY_MERGE=$(docker run --rm -v "$GIT_SESSION_VOLUME:/session:ro" "$IMAGE_NAME" \
+                cat /session/.merge-verify 2>/dev/null || echo "")
+            docker run --rm -v "$GIT_SESSION_VOLUME:/session" "$IMAGE_NAME" \
+                rm -f /session/.merge-verify 2>/dev/null || true
+
+            # Source the pull subcommand for unified reporting functions
+            source "$SCRIPT_DIR/lib/commands/pull.sh"
+
+            # Create unified result dir
+            _EXIT_RESULT_DIR=$(mktemp -d)
+
+            # Extract with result tracking
+            session_extract "$SESSION_NAME" --force --result-dir "$_EXIT_RESULT_DIR"
+
+            # Merge with result tracking
+            session_auto_merge "$SESSION_NAME" "$MERGE_INTO_BRANCH_CHECK" false "" true "$_EXIT_RESULT_DIR" || true
+
+            # Show unified report
+            echo ""
+            _pull_report "$SESSION_NAME" "$MERGE_INTO_BRANCH_CHECK" "$_EXIT_RESULT_DIR"
+
+            if [[ -n "$VERIFY_MERGE" ]]; then
+                # --verify: show diffstat of what would still need merging, ask before keeping
+                echo ""
+                info "Verify mode: review above. Any repos that conflicted were skipped."
+                info "To merge skipped repos: claude-container pull -s $SESSION_NAME $MERGE_INTO_BRANCH_CHECK --no-squash"
+            fi
+
+            rm -rf "$_EXIT_RESULT_DIR"
         else
             echo "To merge into $MERGE_INTO_BRANCH_CHECK:"
             echo "  claude-container pull -s $SESSION_NAME $MERGE_INTO_BRANCH_CHECK"

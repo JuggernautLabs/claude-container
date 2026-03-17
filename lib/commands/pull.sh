@@ -150,14 +150,17 @@ cmd_pull() {
     session_extract "${extract_args[@]}"
 
     if $verify && [[ -n "$branch" ]]; then
-        # --verify: show extract results, ask before merging
+        # --verify: show extract results + diffstat per repo, ask before merging
         echo ""
         _pull_report "$session_name" "" "$_pull_result_dir" "$repo_filter"
 
         echo ""
-        # Show what WOULD be merged (dry-run)
-        info "Dry-run merge into '$branch':"
-        session_auto_merge "$session_name" "$branch" true "$repo_filter" "$squash" "$_pull_result_dir" 2>/dev/null || true
+        info "Changes that would land on '$branch':"
+        echo ""
+        if ! _verify_diffstat "$session_name" "$branch" "$_pull_result_dir" "$repo_filter"; then
+            info "Nothing to merge."
+            return 0
+        fi
 
         echo ""
         printf "Merge into '%s'? [y/N] " "$branch"
@@ -346,7 +349,8 @@ _pull_report() {
             echo -e "    action:   claude-container pull -s ${session_name} --force"
             echo -e "         or:  claude-container push -s ${session_name} ${target_branch:-main} --merge"
         elif [[ "$_merge_status" == "CONFLICT" ]]; then
-            echo -e "    action:   claude-container pull -s ${session_name} ${target_branch} --reconcile"
+            echo -e "    action:   claude-container pull -s ${session_name} ${target_branch} --no-squash"
+            echo -e "         or:  claude-container pull -s ${session_name} ${target_branch} --reconcile"
         fi
     done
 
@@ -532,6 +536,66 @@ _pull_status() {
     fi
 }
 
+# Show per-repo diffstat of session vs target branch for --verify
+_verify_diffstat() {
+    local session_name="$1"
+    local target_branch="$2"
+    local result_dir="$3"
+    local repo_filter="${4:-}"
+    local volume="claude-session-${session_name}"
+
+    local config_content
+    config_content=$(read_session_config "$volume")
+    local projects=""
+    if [[ -n "$config_content" ]]; then
+        projects=$(parse_session_projects "$config_content")
+    fi
+
+    local _total_files=0 _total_adds=0 _total_dels=0
+
+    while IFS='|' read -r _pname _ppath; do
+        [[ -z "$_pname" ]] && continue
+        [[ -n "$repo_filter" && "$_pname" != *"$repo_filter"* ]] && continue
+        [[ ! -d "$_ppath" ]] && continue
+
+        # Check session branch exists and target branch exists
+        git -C "$_ppath" show-ref --verify --quiet "refs/heads/$session_name" 2>/dev/null || continue
+        git -C "$_ppath" show-ref --verify --quiet "refs/heads/$target_branch" 2>/dev/null || continue
+
+        # Get diffstat between target and session
+        local _stat
+        _stat=$(git -C "$_ppath" diff --stat "$target_branch".."$session_name" 2>/dev/null)
+        [[ -z "$_stat" ]] && continue
+
+        # Parse summary line for totals
+        local _summary
+        _summary=$(echo "$_stat" | tail -1)
+
+        echo -e "  ${BLUE}$_pname${NC}"
+        # Show file list (indented), skip summary line
+        echo "$_stat" | sed '$d' | sed 's/^/    /'
+        echo "    $_summary"
+        echo ""
+
+        # Accumulate totals
+        local _f _a _d
+        _f=$(echo "$_summary" | grep -oE '[0-9]+ file' | grep -oE '[0-9]+' || echo 0)
+        _a=$(echo "$_summary" | grep -oE '[0-9]+ insertion' | grep -oE '[0-9]+' || echo 0)
+        _d=$(echo "$_summary" | grep -oE '[0-9]+ deletion' | grep -oE '[0-9]+' || echo 0)
+        _total_files=$((_total_files + ${_f:-0}))
+        _total_adds=$((_total_adds + ${_a:-0}))
+        _total_dels=$((_total_dels + ${_d:-0}))
+    done <<< "$projects"
+
+    if [[ $_total_files -gt 0 ]]; then
+        info "Total: $_total_files file(s), +$_total_adds -$_total_dels"
+    else
+        info "No changes to merge"
+    fi
+    # Return total files so caller can skip prompt if 0
+    return $(( _total_files > 0 ? 0 : 1 ))
+}
+
 _pull_reconcile() {
     local session_name="$1"
     local target_branch="$2"
@@ -606,6 +670,14 @@ _pull_reconcile() {
     #   .merge-into-branch  (target branch name)
     #   .merge-into-summary (Claude's initial prompt with fin instructions)
     #   .merge-into-mounts  (dirty projects needing host mounts)
+
+    # If --verify, write marker so the exit handler knows to prompt
+    if [[ "$verify" == "true" ]]; then
+        local git_image="${IMAGE_NAME:-$DEFAULT_IMAGE}"
+        docker run --rm -v "$volume:/session" "$git_image" \
+            sh -c "echo 1 > /session/.merge-verify" 2>/dev/null || true
+    fi
+
     # Exec back into claude-container to launch container for resolution
     info "Launching container for conflict resolution..."
     echo ""
