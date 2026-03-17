@@ -149,44 +149,49 @@ cmd_pull() {
     extract_args+=(--result-dir "$_pull_result_dir")
     session_extract "${extract_args[@]}"
 
-    if $verify && [[ -n "$branch" ]]; then
-        # --verify: show extract results + diffstat per repo, ask before merging
-        echo ""
-        _pull_report "$session_name" "" "$_pull_result_dir" "$repo_filter"
-
-        echo ""
-        info "Changes that would land on '$branch':"
-        echo ""
-        if ! _verify_diffstat "$session_name" "$branch" "$_pull_result_dir" "$repo_filter"; then
-            info "Nothing to merge."
-            return 0
-        fi
-
-        echo ""
-        printf "Merge into '%s'? [y/N] " "$branch"
-        local _answer
-        read -r _answer
-        case "$_answer" in
-            [yY]|[yY][eE][sS])
-                info "Merging..."
-                ;;
-            *)
-                info "Aborted. Session branches are extracted but not merged."
-                info "To merge later: claude-container pull -s $session_name $branch"
-                return 0
-                ;;
-        esac
-    fi
-
-    # If branch specified, merge into target with result tracking
+    # If branch specified, dry-run merge first to populate results + show preview
     local _merge_rc=0
     if [[ -n "$branch" ]]; then
+        # Dry-run: populate merge results without changing anything
+        session_auto_merge "$session_name" "$branch" true "$repo_filter" "$squash" "$_pull_result_dir" 2>/dev/null || true
+
+        # Show full report (extract + merge preview)
+        echo ""
+        _pull_report "$session_name" "$branch" "$_pull_result_dir" "$repo_filter"
+
+        # Show diffstat of what would change on target
+        echo ""
+        _verify_diffstat "$session_name" "$branch" "$_pull_result_dir" "$repo_filter" || true
+
+        if $verify; then
+            echo ""
+            printf "Merge into '%s'? [y/N] " "$branch"
+            local _answer
+            read -r _answer
+            case "$_answer" in
+                [yY]|[yY][eE][sS])
+                    info "Merging..."
+                    ;;
+                *)
+                    info "Aborted. Session branches extracted but not merged."
+                    info "To merge later: claude-container pull -s $session_name $branch"
+                    return 0
+                    ;;
+            esac
+        fi
+
+        # Real merge
         session_auto_merge "$session_name" "$branch" false "$repo_filter" "$squash" "$_pull_result_dir" || _merge_rc=$?
+
+        # Final report (with actual merge results)
+        echo ""
+        _pull_report "$session_name" "$branch" "$_pull_result_dir" "$repo_filter"
+    else
+        # Extract-only: just show extraction report
+        echo ""
+        _pull_report "$session_name" "" "$_pull_result_dir" "$repo_filter"
     fi
 
-    # Render unified report
-    echo ""
-    _pull_report "$session_name" "$branch" "$_pull_result_dir" "$repo_filter"
     return $_merge_rc
 }
 
