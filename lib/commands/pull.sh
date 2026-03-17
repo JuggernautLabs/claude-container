@@ -18,6 +18,7 @@ cmd_pull() {
     local dry_run=false
     local squash=true
     local status_only=false
+    local verify=false
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -51,6 +52,10 @@ cmd_pull() {
                 ;;
             --status)
                 status_only=true
+                shift
+                ;;
+            --verify)
+                verify=true
                 shift
                 ;;
             --help|-h)
@@ -118,7 +123,7 @@ cmd_pull() {
             return 1
         fi
         # Reconcile uses legacy (non-unified) output
-        _pull_reconcile "$session_name" "$branch" "$force"
+        _pull_reconcile "$session_name" "$branch" "$force" "$verify"
         return $?
     fi
 
@@ -144,7 +149,33 @@ cmd_pull() {
     extract_args+=(--result-dir "$_pull_result_dir")
     session_extract "${extract_args[@]}"
 
-    # If branch specified, also merge into target with result tracking
+    if $verify && [[ -n "$branch" ]]; then
+        # --verify: show extract results, ask before merging
+        echo ""
+        _pull_report "$session_name" "" "$_pull_result_dir" "$repo_filter"
+
+        echo ""
+        # Show what WOULD be merged (dry-run)
+        info "Dry-run merge into '$branch':"
+        session_auto_merge "$session_name" "$branch" true "$repo_filter" "$squash" "$_pull_result_dir" 2>/dev/null || true
+
+        echo ""
+        printf "Merge into '%s'? [y/N] " "$branch"
+        local _answer
+        read -r _answer
+        case "$_answer" in
+            [yY]|[yY][eE][sS])
+                info "Merging..."
+                ;;
+            *)
+                info "Aborted. Session branches are extracted but not merged."
+                info "To merge later: claude-container pull -s $session_name $branch"
+                return 0
+                ;;
+        esac
+    fi
+
+    # If branch specified, merge into target with result tracking
     local _merge_rc=0
     if [[ -n "$branch" ]]; then
         session_auto_merge "$session_name" "$branch" false "$repo_filter" "$squash" "$_pull_result_dir" || _merge_rc=$?
@@ -505,6 +536,7 @@ _pull_reconcile() {
     local session_name="$1"
     local target_branch="$2"
     local force="$3"
+    local verify="${4:-false}"
     local volume="claude-session-${session_name}"
 
     # Verify session exists
@@ -537,6 +569,30 @@ _pull_reconcile() {
         info "Clean merge — extracting and merging into '$target_branch'..."
         session_extract "$session_name" --force
         echo ""
+
+        if [[ "$verify" == "true" ]]; then
+            # Show dry-run before merging
+            info "Dry-run merge into '$target_branch':"
+            session_auto_merge "$session_name" "$target_branch" true
+            echo ""
+            printf "Merge into '%s'? [y/N] " "$target_branch"
+            local _answer
+            read -r _answer
+            case "$_answer" in
+                [yY]|[yY][eE][sS])
+                    info "Merging..."
+                    ;;
+                *)
+                    info "Aborted. Session branches extracted but not merged into $target_branch."
+                    # Clean up marker
+                    local git_image="${IMAGE_NAME:-$DEFAULT_IMAGE}"
+                    docker run --rm -v "$volume:/session" "$git_image" \
+                        rm -f /session/.merge-into-branch 2>/dev/null || true
+                    return 0
+                    ;;
+            esac
+        fi
+
         session_auto_merge "$session_name" "$target_branch"
 
         # Clean up the .merge-into-branch marker (session_merge_into wrote it)
@@ -622,6 +678,7 @@ Options:
   --squash                 Squash-merge (default). Tracks prior squashes so repeat pulls
                            only merge new commits — no conflicts from squash history.
   --no-squash              Regular merge. Preserves full session commit history on target.
+  --verify                 Extract and show results, then ask before merging
   --dry-run                Show what would happen without extracting or merging
   --force, -f              Force extraction even if branches diverged (container wins)
   --help, -h               Show this help

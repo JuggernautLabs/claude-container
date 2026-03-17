@@ -31,92 +31,38 @@ You are helping the user set up a claude-container session. This is an interacti
 Use `AskUserQuestion` to collect the following. If the user provided a session name as an argument, skip that question.
 
 ### Required: Session Name
-Ask for a session name if not provided.
 - Should be lowercase, alphanumeric with hyphens
-- Examples: `my-feature`, `bugfix-123`, `refactor-auth`
-- **Branch matching**: If the session name matches an existing git branch, that branch will be cloned
+- If name matches an existing git branch, that branch will be cloned
 
 ### Optional: Starting Branch
-Ask if they want to start from a specific branch (adds `--from <branch>` flag).
-- Use when the session name doesn't match the branch they want to clone
-- Example: `--from feature-xyz` creates session from `feature-xyz` branch
+- `--from <branch>` creates session from specific branch
 
 ### Required: Repository Source
-Ask how they want to specify repositories:
-
-1. **Current directory** (default) - Clone the repo in the current working directory
-2. **Discover repos** - Auto-discover all git repos in a parent directory
-3. **Specific repos** - Add specific repos with `-a` flag
-4. **Config file** - Use an existing `.claude-projects.yml`
+1. **Current directory** (default)
+2. **Discover repos** — `--discover-repos <dir>` finds all git repos
+3. **Specific repos** — `-a <path>` (repeatable)
+4. **Config file** — `--config .claude-projects.yml`
 
 ### Optional: Runtime Mode
-1. **Rootish** (default) - Run with passwordless sudo for package installs
-2. **User mode** - Run as non-root developer user
-3. **Root** - Run as actual root
+1. **Rootish** (default) — passwordless sudo
+2. **User mode** — `--as-user`, non-root
+3. **Root** — `--as-root`
 
-### Optional: Continue Conversation
-Ask if they want to continue an existing conversation (adds `--continue` flag).
+### Optional: Features
+- `--continue` — Continue existing conversation
+- `--dirty` — Capture uncommitted host changes as WIP commit
+- `--docker` — Mount Docker socket
+- `--port <port>` — Expose ports (repeatable, persisted). Formats: `3000` or `8080:80`
+- `--dockerfile [path]` — Custom Dockerfile
+- `--clone-from <session>` — Clone volumes from existing session
 
-### Optional: Dirty Changes
-Ask if they want to capture uncommitted host changes into the session as a WIP commit (adds `--dirty` flag).
-
-### Optional: Docker Access
-Ask if they need Docker commands inside the container (adds `--docker` flag).
-
-### Optional: Port Exposure
-Ask if they need to expose any ports (e.g., web servers, APIs). Each port adds `--port <port>`.
-- `--port 3000` maps port 3000 on both host and container
-- `--port 8080:80` maps host 8080 to container 80
-- Ports are persisted in session metadata — they stick across re-entries
-- Multiple `--port` flags can be stacked
-
-### Optional: Custom Dockerfile
-Ask if they want a custom Dockerfile instead of the default image.
-
-## Step 2: Build the Command
-
-Construct the command based on answers:
-
-```bash
-claude-container -s <session-name> [options]
-```
-
-Options:
-- `--from <branch>` - start from specific branch
-- `--discover-repos <path>` - repo discovery
-- `-a <path>` - add specific repos (repeatable)
-- `--config <path>` - config file
-- `--as-user` - user mode
-- `--continue` - continue conversation
-- `--docker` - Docker access
-- `--port <port>` - expose port (repeatable)
-- `--dirty` - capture uncommitted host changes as a WIP commit
-- `--config-only` - generate config file only, don't create session
-- `--no-interactive` - exit with error if no token found
-- `--no-config` - skip auto-discovery of .claude-projects.yml
-- `--dockerfile [path]` - custom Dockerfile
-
-## Step 3: Validate with --no-run
-
-Run with `--no-run` to validate and prepare:
+## Step 2: Build and Validate
 
 ```bash
 claude-container -s <name> [options] --no-run
 ```
 
-This:
-- Verifies OAuth token
-- Checks Docker availability
-- Validates config (if multi-project)
-- Creates session volume
-- Clones repositories
-- Configures git
-
-If validation fails, show the error and help fix it.
-
-## Step 4: Output Session Info
-
-After successful `--no-run`:
+## Step 3: Output
 
 ```
 Session prepared: <session-name>
@@ -133,122 +79,86 @@ To start:
 ## Session Creation
 
 ```bash
-# Basic (current directory)
-claude-container -s my-feature
-
-# Start from specific branch
-claude-container -s post-feature --from feature-branch
-
-# Multi-project with discovery
-claude-container -s my-feature --discover-repos ~/dev/myproject
-
-# Specific repos
-claude-container -s my-feature -a ~/dev/app -a ~/dev/lib
-
-# Config file
-claude-container -s my-feature --config .claude-projects.yml
-
-# Capture uncommitted host changes
-claude-container -s my-feature --dirty
-
-# Prepare without starting
-claude-container -s my-feature --no-run
+claude-container -s my-feature                         # current dir
+claude-container -s my-feature --from feature-branch   # specific branch
+claude-container -s my-feature --discover-repos ~/dev  # auto-discover
+claude-container -s my-feature -a ~/dev/app -a ~/dev/lib  # specific repos
+claude-container -s my-feature --config .claude-projects.yml  # config file
+claude-container -s my-feature --dirty                 # capture uncommitted
+claude-container -s new --clone-from old               # clone session
 ```
 
 ## Running Sessions
 
 ```bash
-# Start/resume
-claude-container -s my-feature
-
-# Continue conversation
-claude-container -s my-feature --continue
-
-# With Docker access
-claude-container -s my-feature --docker
-
-# Expose ports (persisted across re-entries)
-claude-container -s my-feature --port 3000 --port 8080:80
-
-# Custom Dockerfile
-claude-container -s my-feature --dockerfile
-
-# Clone an existing session (e.g., to add ports to running work)
-claude-container -s new-session --clone-from old-session --port 3000
+claude-container -s my-feature                    # start/resume
+claude-container -s my-feature --continue         # continue conversation
+claude-container -s my-feature --docker           # with Docker access
+claude-container -s my-feature --port 3000        # expose port (persisted)
+claude-container -s my-feature --dockerfile       # custom Dockerfile
+claude-container -s my-feature --shell            # bash instead of claude
+claude-container -s my-feature --bash-exec "cmd"  # run command and exit
+claude-container -s my-feature -- -p "prompt"     # pass args to claude
 ```
 
-## Pulling Changes to Host
+## Pulling: Container → Host
 
 ```bash
-# Pull (extract) as branch
-claude-container pull -s my-feature
-
-# Force overwrite existing branch
-claude-container pull -s my-feature --force
-
-# Pull and merge into main
-claude-container pull -s my-feature main
+claude-container pull -s X                    # extract only
+claude-container pull -s X main               # extract + squash-merge
+claude-container pull -s X main --verify      # confirm before merge
+claude-container pull -s X main --no-squash   # regular merge (full history)
+claude-container pull -s X --status           # read-only check
+claude-container pull -s X main --dry-run     # preview
+claude-container pull -s X main --reconcile   # full conflict resolution cycle
+claude-container pull -s X main --reconcile --verify  # reconcile with confirm
+claude-container pull -s X --repo gamma       # single repo
 ```
 
-Output:
-```
-✓ myproject → branch 'my-feature' (3 commit(s), 7 file(s))
-
-To see changes:  git log main..my-feature
-Checkout:        git checkout my-feature
-Merge:           git merge my-feature
-```
-
-## Pushing Host Changes into Session
-
-For long-running sessions where upstream has changed:
+## Pushing: Host → Container
 
 ```bash
-# Fast-forward from host
-claude-container push -s my-feature
-
-# Rebase session onto main
-claude-container push -s my-feature main --rebase
-
-# Rebase onto develop
-claude-container push -s my-feature develop --rebase
+claude-container push -s X main               # fast-forward (default)
+claude-container push -s X main --merge       # merge into session (Claude resolves)
+claude-container push -s X main --rebase      # rebase session onto main
+claude-container push -s X main --as host/main  # serve branch, agent merges
+claude-container push -s X --repo api,main    # single repo from specific branch
+claude-container push -s X --repo api --force # force-reset diverged repo
 ```
 
-Rebase:
-- Fetches latest changes from original repos
-- Rebases session work onto updated branch
-- Claude resolves any conflicts interactively
-- After resolving, pull with `--force` to update branches
+## Watching: Live Sync
+
+```bash
+claude-container watch -s X -- claude-container pull -s X main           # auto-pull
+claude-container watch -s X --repo gamma -i 2 -- claude-container pull -s X  # fast poll
+claude-container watch -s X -- sh -c 'claude-container pull -s X && bun build'  # chain
+claude-container watch -s X -- claude-container push -s X main --as host/main   # serve
+```
 
 ## Session Management
 
 ```bash
-# List sessions (fast: names + last opened, sorted by most recent)
-claude-container list
+claude-container list                         # list sessions
+claude-container list --sizes                 # with disk usage
+claude-container list --name-only             # names only
+claude-container -s X --delete --yes          # delete
+claude-container -s 'test-.*' --delete --regex  # pattern delete
+claude-container remove -s X --include '*tui*'  # remove repos
+claude-container -s X --repair                # fix corrupted config
+claude-container -s X --restart               # restart (fix permissions)
+claude-container -s X --import ~/.claude      # import session data
+claude-container status -s X main             # hash comparison
+claude-container status -s X --dirty          # check uncommitted
+claude-container image -s X                   # show Docker image
+```
 
-# List with disk usage (slower — scans volumes)
-claude-container list --sizes
+## Multi-Session Reconcile
 
-# List names only
-claude-container list --name-only
-
-# Delete session
-claude-container -s my-feature --delete
-claude-container -s my-feature --delete --yes
-
-# Remove repos from session
-claude-container remove -s my-feature --include cllient          # remove matching
-claude-container remove -s my-feature --include juggernaut --exclude substrate  # combine
-claude-container remove -s my-feature --include '*tui*' --dry-run  # preview
-
-# Repair corrupted config
-claude-container -s my-feature --repair
-
-# Restart (fix permissions)
-claude-container -s my-feature --restart
-
-# Import session data
-claude-container -s my-feature --import ~/.claude
+```bash
+claude-container reconcile main s1 s2 s3      # merge sessions into main
+claude-container reconcile main               # auto-discover
+claude-container reconcile main --dry-run     # preview
+claude-container reconcile --continue         # resume interrupted
 ```
 
 ## Config File Format
@@ -256,29 +166,12 @@ claude-container -s my-feature --import ~/.claude
 ```yaml
 version: "1"
 main: my-app
-dockerfile: ./Dockerfile.dev    # Optional: auto-builds when changed
+dockerfile: ./Dockerfile.dev
 projects:
   my-app:
     path: ./my-app
   shared-lib:
     path: ../shared-lib
-  docs:
-    path: ../docs
-```
-
-## Workflow Summary
-
-```
-1. Create:  claude-container -s my-feature
-2. Work:    (inside container with Claude)
-3. Exit:    exit
-4. Pull:    claude-container pull -s my-feature main
-
-Long-running sessions:
-1. Push:    claude-container push -s my-feature main --rebase
-2. Work:    (Claude resolves conflicts if any)
-3. Exit:    exit
-4. Pull:    claude-container pull -s my-feature --force
 ```
 
 ## Command Quick Reference
@@ -286,25 +179,25 @@ Long-running sessions:
 | Task | Command |
 |------|---------|
 | Create session | `claude-container -s NAME` |
-| From specific branch | `claude-container -s NAME --from BRANCH` |
+| From branch | `claude-container -s NAME --from BRANCH` |
 | Resume + continue | `claude-container -s NAME --continue` |
 | Discover repos | `claude-container -s NAME --discover-repos DIR` |
-| Prepare only | `claude-container -s NAME --no-run` |
-| Pull to host | `claude-container pull -s NAME` |
-| Pull + merge into main | `claude-container pull -s NAME main` |
-| Pull (overwrite) | `claude-container pull -s NAME --force` |
-| Push from host (ff) | `claude-container push -s NAME` |
-| Push + rebase | `claude-container push -s NAME main --rebase` |
-| Check sync state | `claude-container status -s NAME main` |
-| Delete session | `claude-container -s NAME --delete -y` |
-| Remove repos | `claude-container remove -s NAME --include PATTERN` |
-| Repair session | `claude-container -s NAME --repair` |
-| List sessions | `claude-container list` |
-| List with sizes | `claude-container list --sizes` |
+| Pull + merge | `claude-container pull -s NAME main` |
+| Pull + verify | `claude-container pull -s NAME main --verify` |
+| Pull + reconcile | `claude-container pull -s NAME main --reconcile` |
+| Push (ff) | `claude-container push -s NAME main` |
+| Push (merge) | `claude-container push -s NAME main --merge` |
+| Push (serve) | `claude-container push -s NAME main --as host/main` |
+| Watch + pull | `claude-container watch -s NAME -- claude-container pull -s NAME main` |
+| Status | `claude-container status -s NAME main` |
+| Delete | `claude-container -s NAME --delete -y` |
+| List | `claude-container list` |
 | Clone session | `claude-container -s NEW --clone-from OLD` |
-| Expose ports | `claude-container -s NAME --port 3000` |
-| With Docker | `claude-container -s NAME --docker` |
-| Custom Dockerfile | `claude-container -s NAME --dockerfile` |
-| Start with dirty changes | `claude-container -s NAME --dirty` |
-| Show session image | `claude-container image -s NAME` |
+| Expose port | `claude-container -s NAME --port 3000` |
+| Docker access | `claude-container -s NAME --docker` |
+| Custom image | `claude-container -s NAME --dockerfile` |
 | Shell only | `claude-container -s NAME --shell` |
+| Dirty capture | `claude-container -s NAME --dirty` |
+| Remove repos | `claude-container remove -s NAME --include PATTERN` |
+| Repair | `claude-container -s NAME --repair` |
+| Image info | `claude-container image -s NAME` |

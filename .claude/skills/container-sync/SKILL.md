@@ -1,6 +1,6 @@
 ---
 name: container-sync
-description: Sync a claude-container session with upstream changes. Use when the user wants to rebase their session work onto an updated branch, pull in upstream changes, push a specific repo/branch, force-reset a repo, reconcile multiple sessions, or resolve merge conflicts. Handles long-running sessions where main/develop has been updated.
+description: Sync a claude-container session with upstream changes. Use when the user wants to pull session work to host, push host changes into a session, watch for live changes, serve branches to agents, reconcile multiple sessions, or resolve merge conflicts.
 argument-hint: <session-name> [branch]
 allowed-tools:
   - AskUserQuestion
@@ -11,302 +11,213 @@ allowed-tools:
 
 # Container Sync Skill
 
-You are helping the user sync their claude-container session with upstream changes. This is useful for long-running sessions where the original branch (main, develop, etc.) has been updated.
+You are helping the user sync their claude-container session. This covers all bidirectional data flow between host and container.
 
-## What `push --rebase` Does
+## Pull: Container → Host
 
-The `push <branch> --rebase` command:
-
-1. **Mounts original repos** read-only as `upstream` remote
-2. **Checks for uncommitted changes** (skips rebase if dirty, warns user)
-3. **Fetches** the target branch from upstream
-4. **Rebases** session work onto the updated branch
-5. **Reports** conflicts (if any) for Claude to resolve
-6. **Writes** a `.sync-summary` prompt for Claude with per-project status and conflict resolution instructions
-7. **Starts** the container for interactive conflict resolution
-
-After resolving conflicts and exiting, the user should pull with `--force`.
-
-## Step 1: Identify Session and Branch
-
-If not provided as arguments, ask the user:
-
-### Session Name
-- Which session to sync
-- Use `claude-container list` to list available sessions
-
-### Target Branch
-- Which branch to rebase onto (default: `main`)
-- Common choices: `main`, `master`, `develop`
-
-## Step 2: Check Prerequisites
-
-Before running sync, verify:
+Pull session changes to host, optionally merge into a target branch.
 
 ```bash
-# Check session exists
-docker volume inspect claude-session-<name> >/dev/null 2>&1
-
-# Check yq is available (required for multi-project)
-command -v yq >/dev/null 2>&1
+claude-container pull -s <session> [branch] [options]
 ```
 
-## Step 3: Run Push with Rebase
+| Flag | Description |
+|------|-------------|
+| `--repo <name>` | Only pull this repo (partial name OK: `gamma` matches `org/gamma`) |
+| `--squash` | Squash-merge into target (default). Tracks prior squashes for clean repeats. |
+| `--no-squash` | Regular merge. Preserves full session commit history on target. |
+| `--verify` | Extract and show results, ask before merging. Works with `--reconcile` too. |
+| `--status` | Read-only: compare container vs host without extracting |
+| `--dry-run` | Preview without extracting or merging |
+| `--reconcile, -R` | Full cycle: stash dirty → merge target into session → Claude resolves → merge back |
+| `--force, -f` | Force extraction if branches diverged (container wins) |
 
-Execute the push command:
+### Key behaviors
+- **No branch**: extract session branches to host only
+- **With branch**: extract + auto-merge. Auto-force-extracts (session branch is just transport; main is protected by conflict detection)
+- **Squash-merge tracking**: saves `refs/claude-container/squash-base/<session>` after squash. Repeat pulls only cherry-pick NEW commits since last squash.
+- **Stale squash-base detection**: if squash-base is on a different lineage (e.g. after force-extract), automatically clears it
+- **`--verify`**: extracts, shows report + dry-run merge, prompts `Merge into 'main'? [y/N]` before proceeding. Also works with `--reconcile`.
+
+### Output format
+```
+  org/repo  container:abc1234  session:abc1234  main:def5678
+    extract:  ✓ updated (3 commits, 5 files)
+    merge:    ✓ session → main: squash-merged into main (3 new)
+```
+
+### Commit messages on target
+- Single commit squashed: uses original session commit message
+- Multiple commits: `session → main (N commits)` header with listed messages
+
+## Push: Host → Container
+
+Push host changes into a container session.
 
 ```bash
-claude-container push -s <session-name> <branch> --rebase
+claude-container push -s <session> [branch] [options]
 ```
 
-This will output something like:
+| Flag | Description |
+|------|-------------|
+| `--repo <name>[,<branch>]` | Only push this repo, optionally from specific branch |
+| `--as <branch>` | Don't merge — place host branch as a named ref in container |
+| `--ff` | Fast-forward from host branch (default) |
+| `--merge` | Merge host branch into session (launches container if conflicts) |
+| `--rebase` | Rebase session onto host branch (launches container if conflicts) |
+| `--force, -f` | Force reset diverged repos to host HEAD |
 
-```
-→ Syncing session 'my-feature' with branch 'main'...
+### Strategies
+- **`--ff`** (default): Fetch + fast-forward. If diverged, shows options.
+- **`--merge`**: Merge target INTO session. Claude resolves conflicts in container.
+- **`--rebase`**: Rebase session onto target. Claude resolves conflicts.
+- **`--as <branch>`**: No merge — places host branch in container. Agent merges when ready:
+  ```bash
+  claude-container push -s myproj main --as host/main
+  # Agent inside container: git merge host/main
+  ```
 
-  → Syncing project-a...
-✓   project-a rebased successfully
-  → Syncing project-b...
-⚠   project-b has conflicts (Claude will resolve)
-  → Syncing project-c...
-⚠   project-c has uncommitted changes (will need manual commit/stash)
-      ?? newfile.txt
-      M  modified.txt
+## Watch: Trigger Commands on Session Changes
 
-1 project(s) have conflicts for Claude to resolve
-1 project(s) have uncommitted changes (commit or stash in session)
-
-→ Starting container for review...
-```
-
-## Step 4: Conflict Resolution (if needed)
-
-If there are conflicts, the user will need to resolve them inside the container. Provide guidance:
-
-### Finding Conflicts
-```bash
-# Find files with conflict markers
-grep -r "<<<<<<< HEAD" /workspace
-
-# Check git status
-cd /workspace/<project>
-git status
-```
-
-### Resolving Conflicts
-1. Edit conflicted files, removing `<<<<<<<`, `=======`, `>>>>>>>` markers
-2. Choose the correct code or merge manually
-3. Stage resolved files: `git add <files>`
-4. Continue rebase: `git rebase --continue`
-5. If stuck, abort: `git rebase --abort`
-
-### After Resolution
-```bash
-# Verify clean state
-git status
-git log --oneline -5
-```
-
-## Step 5: Post-Sync Instructions
-
-After the user exits the container, remind them to pull with `--force`:
-
-```
-To update branches with rebased changes:
-  claude-container pull -s <session-name> --force
-```
-
-The `--force` flag is needed because the branch already exists from previous extraction.
-
----
-
-# Quick Reference
-
-## Push Commands
+Poll session for new commits and run a command when detected.
 
 ```bash
-# Fast-forward from host (default, same as --ff)
-claude-container push -s my-feature
-
-# Fast-forward a single repo from a specific branch
-claude-container push -s my-feature --repo synapse,main
-
-# Force-reset a single repo to match host branch
-claude-container push -s my-feature --repo synapse,main --force
-
-# Rebase onto main
-claude-container push -s my-feature main --rebase
-
-# Rebase onto develop
-claude-container push -s my-feature develop --rebase
-
-# Merge main into session
-claude-container push -s my-feature main --merge
+claude-container watch -s <session> [options] -- <command...>
 ```
 
-### --repo flag
+| Flag | Description |
+|------|-------------|
+| `--repo <name>` | Only watch this repo |
+| `--interval, -i <secs>` | Poll interval (default: 5) |
 
-`--repo <name>[,<branch>]` targets a single repo:
-- Name can be partial: `synapse` matches `org/synapse`
-- Optional `,branch` overrides which host branch to push from
-- Ambiguous partial matches are rejected with a list of candidates
-- Works with `--force` to reset diverged or ahead repos to host HEAD
-
-## Pull Commands
+- Runs command once on startup
+- Coalesces rapid changes (re-runs once after command finishes, not per-change)
+- Polls `get_session_heads` (single docker run per check)
 
 ```bash
-# Pull updated work (force overwrite local branches)
-claude-container pull -s my-feature --force
+# Auto-pull on every container commit
+claude-container watch -s myproj -- claude-container pull -s myproj main
 
-# Preview what pull would do (no changes)
-claude-container pull -s my-feature main --dry-run
+# Watch one repo, fast polling
+claude-container watch -s myproj --repo gamma -i 2 -- claude-container pull -s myproj
 
-# Full reconcile cycle against main
-claude-container pull -s my-feature main --reconcile
+# Chain with build
+claude-container watch -s myproj --repo gamma -- sh -c \
+  'claude-container pull -s myproj && cd ~/dev/proj && bun run build'
+
+# Serve host branch to agent whenever local changes
+claude-container watch -s myproj -- claude-container push -s myproj main --as host/main
 ```
 
-## Status Commands
+## Reconcile: Full Conflict Resolution Cycle
 
 ```bash
-# Check sync state
-claude-container status -s my-feature main
-
-# Show dirty (uncommitted) files on host
-claude-container status -s my-feature --dirty
-
-# Check a single repo
-claude-container status -s my-feature main --repo synapse
+claude-container pull -s <session> <branch> --reconcile [--verify]
 ```
 
-## After Sync Workflow
+1. **Extract** session branches to host
+2. **Stash** dirty host worktrees
+3. **Merge** target INTO session (batched — 4 docker runs total regardless of repo count)
+4. If clean: extract + auto-merge back into target
+5. If conflicts: launch container with Claude for resolution, Claude uses `fin` when done
+6. With `--verify`: pauses before final merge into target, asks for confirmation
+
+### Batched merge (session_merge_into)
+- Phase 1: Single docker run scans all repos for dirty/merge status
+- Phase 2: Host-side classification (no docker)
+- Phase 3: Single docker run checks ancestry for all candidates
+- Phase 4: Single docker run merges all repos (mounts all host repos simultaneously)
+- Phase 5: Single docker run writes marker files
+- ALL repos with conflicts/dirty get host-mounted for Claude's resolution container
+
+## Multi-Session Reconcile
+
+Merge multiple sessions into a unified branch, sequentially.
 
 ```bash
-# 1. Push with rebase
-claude-container push -s my-feature main --rebase
-
-# 2. (In container) Resolve any conflicts
-#    Claude will help with this
-
-# 3. Exit container
-exit
-
-# 4. Pull updated work
-claude-container pull -s my-feature --force
+claude-container reconcile <branch> [session...] [options]
 ```
 
-## Conflict Resolution Inside Container
-
-```bash
-# Find conflicts
-grep -r "<<<<<<< HEAD" .
-
-# Check status
-git status
-
-# After editing, stage and continue
-git add .
-git rebase --continue
-
-# If something goes wrong
-git rebase --abort
-```
-
-## Common Scenarios
-
-### Clean Rebase (No Conflicts)
-```
-✓ project-a rebased successfully
-✓ All projects rebased cleanly
-```
-
-### With Conflicts
-```
-⚠ project-a has conflicts (Claude will resolve)
-1 project(s) have conflicts for Claude to resolve
-```
-
-### Uncommitted Changes
-```
-⚠ project-a has uncommitted changes (will need manual commit/stash)
-      ?? newfile.txt
-1 project(s) have uncommitted changes (commit or stash in session)
-```
-The session starts so you can commit or stash the changes inside the container.
-
-### Branch Not Found
-```
-⚠ Skipping project-a (branch 'nonexistent' not found)
-```
-
-### Original Repo Moved
-```
-⚠ Skipping project-a (original not found: /old/path)
-```
-
-## Troubleshooting
-
-### "Session not found"
-The session doesn't exist. Check available sessions:
-```bash
-claude-container list
-```
-
-### "No .claude-projects.yml found"
-Single-project sessions aren't yet supported for sync. This feature works with multi-project sessions.
-
-### "yq required"
-Install yq for YAML parsing:
-```bash
-brew install yq          # macOS
-sudo apt-get install yq  # Ubuntu/Debian
-```
-
-### Rebase stuck mid-way
-If a previous sync was interrupted:
-```bash
-# Inside container
-cd /workspace/<project>
-git rebase --abort
-```
-Then try push --rebase again.
-
-## Reconcile: Multi-Session Merge
-
-Merge multiple sessions into a single target branch, sequentially. Each session is extracted and auto-merged; if conflicts arise, a container launches for Claude to resolve them, then reconcile continues automatically.
-
-```bash
-# Merge named sessions into main
-claude-container reconcile main s1 s2 s3
-
-# Auto-discover all sessions with unmerged work
-claude-container reconcile main
-
-# Preview what would happen (non-destructive)
-claude-container reconcile main --dry-run
-
-# Filter sessions by regex
-claude-container reconcile main --include 'feature-.*' --exclude 'wip'
-
-# Resume after interruption or container exit
-claude-container reconcile --continue
-
-# Skip confirmation
-claude-container reconcile main --yes
-```
-
-### How it works
-1. For each session: extract → auto-merge into target
-2. If conflicts: merge target INTO session, launch container, Claude resolves with `fin`
-3. Exit handler detects plan file → `reconcile --continue` → next session
-4. State persisted in `~/.config/claude-container/.reconcile-plan`
-
-### Flags
 | Flag | Description |
 |------|-------------|
 | `--include <regex>` | Only process matching sessions (repeatable) |
 | `--exclude <regex>` | Skip matching sessions (repeatable, wins over include) |
 | `--dry-run` | Preview without merging |
 | `--yes, -y` | Skip confirmation |
-| `--force, -f` | Force extraction even if diverged |
 | `--continue` | Resume interrupted reconcile |
+| `--force, -f` | Force extraction |
 
+- State persisted to `~/.config/claude-container/.reconcile-plan`
+- Omit session names to auto-discover sessions with unmerged work
+
+## Status: Read-Only Check
+
+```bash
+claude-container status -s <session> [branch] [options]
+```
+
+| Flag | Description |
+|------|-------------|
+| `--repo <name>` | Filter to single repo |
+| `--dirty` | Check host repos for uncommitted changes |
+
+- No branch: sync classification (synced/unchanged/extracted-only/not-extracted)
+- With branch: hash comparison with ancestry info
+- Exit code: 0 = all match, 1 = mismatch
+
+## Common Workflows
+
+### Standard pull cycle
+```bash
+claude-container pull -s myproj main              # extract + squash-merge
+claude-container pull -s myproj main --verify      # same but confirm before merge
+```
+
+### Keep session up to date
+```bash
+claude-container push -s myproj main               # ff (default)
+claude-container push -s myproj main --merge        # merge (Claude resolves)
+claude-container push -s myproj main --as host/main # serve (agent merges)
+```
+
+### Live development
+```bash
+# Terminal 1: dev server
+cd ~/dev/gamma && bun dev
+
+# Terminal 2: watch + auto-pull
+claude-container watch -s myproj --repo gamma -i 2 -- \
+  claude-container pull -s myproj main
+```
+
+### Resolve conflicts
+```bash
+# Option A: reconcile (Claude resolves in container)
+claude-container pull -s myproj main --reconcile --verify
+
+# Option B: push main into session, then pull clean
+claude-container push -s myproj main --merge
+claude-container pull -s myproj main
+```
+
+## Troubleshooting
+
+### "already up to date" when changes exist
+- Check squash-base: `git rev-parse --verify refs/claude-container/squash-base/<session>`
+- If stale (different lineage), delete: `git update-ref -d refs/claude-container/squash-base/<session>`
+- The code auto-clears stale squash-bases, but manual clearing may be needed for edge cases
+
+### Extraction diverged
+- When pulling with a target branch, extraction auto-forces (container wins)
+- Without a target branch, use `--force` explicitly
+
+### Session not found
+```bash
+claude-container list   # check available sessions
+```
+
+### yq required
+```bash
+brew install yq          # macOS
+sudo apt-get install yq  # Ubuntu/Debian
+```
