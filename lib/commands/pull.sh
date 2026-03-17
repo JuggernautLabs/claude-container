@@ -701,73 +701,25 @@ _pull_reconcile_preview() {
     [[ $_skip -gt 0 ]] && warn "$_skip skipped"
 
     # Reverse merge check (session → main on host)
+    # Uses the same session_auto_merge dry-run as pull --verify
     echo ""
     info "=== Session → Main (what lands on host after reconcile) ==="
     echo ""
 
-    local _rev_ok=0 _rev_conflict=0
-    while IFS='|' read -r proj_name proj_path; do
-        [[ -z "$proj_name" ]] && continue
-        [[ -n "$repo_filter" && "$proj_name" != *"$repo_filter"* ]] && continue
-        [[ ! -d "$proj_path" ]] && continue
+    local _preview_dir
+    _preview_dir=$(mktemp -d)
 
-        git -C "$proj_path" show-ref --verify --quiet "refs/heads/$session_name" 2>/dev/null || continue
-        git -C "$proj_path" show-ref --verify --quiet "refs/heads/$target_branch" 2>/dev/null || continue
+    # Dry-run merge using the same code path as pull
+    session_auto_merge "$session_name" "$target_branch" true "$repo_filter" true "$_preview_dir" 2>/dev/null || true
 
-        # Already merged?
-        if git -C "$proj_path" merge-base --is-ancestor "$session_name" "$target_branch" 2>/dev/null; then
-            continue
-        fi
+    # Show unified report
+    _pull_report "$session_name" "$target_branch" "$_preview_dir" "$repo_filter"
 
-        # Fast-forward?
-        if git -C "$proj_path" merge-base --is-ancestor "$target_branch" "$session_name" 2>/dev/null; then
-            local _ahead
-            _ahead=$(git -C "$proj_path" rev-list --count "$target_branch".."$session_name" 2>/dev/null || echo "?")
-            echo -e "  ${GREEN}✓${NC} $proj_name — would fast-forward ($_ahead commits)"
-            _rev_ok=$((_rev_ok + 1))
-            continue
-        fi
-
-        # Trees identical?
-        if git -C "$proj_path" diff --quiet "$session_name" "$target_branch" -- 2>/dev/null; then
-            echo -e "  ${BLUE}—${NC} $proj_name — content identical"
-            continue
-        fi
-
-        # Dry-run merge
-        local _current
-        _current=$(git -C "$proj_path" symbolic-ref --short HEAD 2>/dev/null || echo "")
-        [[ "$_current" != "$target_branch" ]] && git -C "$proj_path" checkout "$target_branch" 2>/dev/null
-
-        if ! git -C "$proj_path" merge --no-commit --no-ff "$session_name" >/dev/null 2>&1; then
-            local _cfiles
-            _cfiles=$(git -C "$proj_path" diff --name-only --diff-filter=U 2>/dev/null | head -5 | tr '\n' ', ')
-            _cfiles="${_cfiles%,}"
-            git -C "$proj_path" merge --abort 2>/dev/null || true
-            echo -e "  ${RED}✗${NC} $proj_name — would CONFLICT${_cfiles:+ ($_cfiles)}"
-            _rev_conflict=$((_rev_conflict + 1))
-
-            # Show diffstat
-            local _stat
-            _stat=$(git -C "$proj_path" diff --stat "$target_branch".."$session_name" 2>/dev/null)
-            if [[ -n "$_stat" ]]; then
-                echo "$_stat" | sed '$d' | sed 's/^/      /'
-                echo "      $(echo "$_stat" | tail -1)"
-            fi
-        else
-            git -C "$proj_path" merge --abort 2>/dev/null || true
-            local _stat
-            _stat=$(git -C "$proj_path" diff --stat "$target_branch".."$session_name" 2>/dev/null | tail -1)
-            echo -e "  ${GREEN}✓${NC} $proj_name — would merge cleanly${_stat:+ ($_stat)}"
-            _rev_ok=$((_rev_ok + 1))
-        fi
-
-        [[ "$_current" != "$target_branch" ]] && git -C "$proj_path" checkout "$_current" 2>/dev/null || true
-    done <<< "$projects"
-
+    # Show diffstat
     echo ""
-    [[ $_rev_ok -gt 0 ]] && success "$_rev_ok would merge into $target_branch"
-    [[ $_rev_conflict -gt 0 ]] && warn "$_rev_conflict would CONFLICT merging into $target_branch (Claude will be instructed to fix)"
+    _verify_diffstat "$session_name" "$target_branch" "$_preview_dir" "$repo_filter" || true
+
+    rm -rf "$_preview_dir"
 }
 
 _pull_reconcile() {
