@@ -33,6 +33,7 @@ source "$SCRIPT_DIR/lib/config.sh"
 source "$SCRIPT_DIR/lib/auth.sh"
 source "$SCRIPT_DIR/lib/docker.sh"
 source "$SCRIPT_DIR/lib/git-session.sh"
+source "$SCRIPT_DIR/lib/merge-detect.sh"
 source "$SCRIPT_DIR/lib/session-mgmt.sh"
 source "$SCRIPT_DIR/lib/session-discovery.sh"
 

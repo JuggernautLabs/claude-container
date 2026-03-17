@@ -2089,64 +2089,26 @@ session_merge_into() {
         return 1  # Signal: no container needed
     fi
 
-    # Build summary for Claude's initial prompt
-    local merge_summary
-    merge_summary="Branch '$target_branch' was merged into this session. Here is what happened:"
-    merge_summary+=$'\n'
+    # Build summary for Claude's initial prompt using shared prompt builder
+    local _summary_lines_joined=""
     for line in "${summary_lines[@]}"; do
-        merge_summary+=$'\n'"  $line"
+        _summary_lines_joined+="$line"$'\n'
     done
-    if [[ $conflict_count -gt 0 ]]; then
-        merge_summary+=$'\n\n'"$conflict_count project(s) have merge conflicts that need resolution."
-        merge_summary+=$'\n\n'"Resolve all merge conflicts. The '$target_branch' branch is incoming work that should generally be accepted — prefer the incoming (theirs/'$target_branch') side unless it would remove or overwrite substantive session work."
-        merge_summary+=$'\n\n'"IMPORTANT: If resolving a conflict would discard or significantly alter work from the session (HEAD/ours), do NOT silently drop it. Instead, raise this to the human with:"
-        merge_summary+=$'\n'"  - What the session had (ours)"
-        merge_summary+=$'\n'"  - What the incoming branch has (theirs)"
-        merge_summary+=$'\n'"  - Why they conflict"
-        merge_summary+=$'\n'"  - Your recommendation"
-        merge_summary+=$'\n\n'"For each conflicted project:"
-        merge_summary+=$'\n'"1. Find all files with <<<<<<< markers: grep -r '<<<<<<< HEAD' ."
-        merge_summary+=$'\n'"2. Edit each file to resolve conflicts, preferring incoming changes unless they remove session work"
-        merge_summary+=$'\n'"3. git add the resolved files"
-        merge_summary+=$'\n'"4. git commit to complete the merge"
-        merge_summary+=$'\n\n'"Resolve autonomously when the incoming side clearly wins (new additions, non-overlapping changes, formatting). Ask the human when both sides made substantive changes to the same logic or when accepting incoming would remove session work."
-    fi
-    if [[ $dirty_count -gt 0 ]]; then
-        merge_summary+=$'\n\n'"$dirty_count project(s) had uncommitted changes in the session and could not be auto-merged. The host repos are mounted read-only at /host/{project_name} so you can complete the merge manually."
-        merge_summary+=$'\n\n'"For each dirty project:"
-        merge_summary+=$'\n'"1. cd /workspace/{project_name}"
-        merge_summary+=$'\n'"2. Review uncommitted changes: git status && git diff"
-        merge_summary+=$'\n'"3. Commit or stash the uncommitted work: git add -A && git commit -m 'WIP: uncommitted session work'"
-        merge_summary+=$'\n'"4. Merge from host: git remote add upstream /host/{project_name} && git fetch upstream $target_branch && git merge upstream/$target_branch --no-edit"
-        merge_summary+=$'\n'"5. Resolve any conflicts (prefer session/HEAD side), then git add and git commit"
-        merge_summary+=$'\n'"6. Clean up: git remote remove upstream"
-    fi
-    if [[ $reverse_conflict_count -gt 0 ]]; then
-        merge_summary+=$'\n\n'"=== REVERSE MERGE CONFLICTS ==="
-        merge_summary+=$'\n'"$reverse_conflict_count project(s) will conflict when merging your session back into '$target_branch' on the host."
-        merge_summary+=$'\n'"This is typically caused by prior squash-merges creating divergent git history."
-        merge_summary+=$'\n'"The host '$target_branch' branch is mounted read-only at /host/{project_name} for reference."
-        merge_summary+=$'\n'
-        for _i in "${!reverse_conflict_repos[@]}"; do
-            merge_summary+=$'\n'"  ${reverse_conflict_repos[$_i]}: ${reverse_conflict_files[$_i]}"
-        done
-        merge_summary+=$'\n\n'"For each reverse-conflict project:"
-        merge_summary+=$'\n'"1. cd /workspace/{project_name}"
-        merge_summary+=$'\n'"2. Fetch the host's $target_branch: git remote add host /host/{project_name} && git fetch host $target_branch"
-        merge_summary+=$'\n'"3. Merge host/$target_branch into your session: git merge host/$target_branch --no-edit"
-        merge_summary+=$'\n'"4. If conflicts, resolve them — the goal is that your session now contains everything from $target_branch"
-        merge_summary+=$'\n'"5. git add the resolved files && git commit"
-        merge_summary+=$'\n'"6. git remote remove host"
-        merge_summary+=$'\n\n'"After this, the host will be able to fast-forward $target_branch to your session — no more squash conflicts."
-    fi
+    local _rev_repos_joined="" _rev_files_joined=""
+    for _i in "${!reverse_conflict_repos[@]}"; do
+        _rev_repos_joined+="${reverse_conflict_repos[$_i]}"$'\n'
+        _rev_files_joined+="${reverse_conflict_files[$_i]}"$'\n'
+    done
 
-    merge_summary+=$'\n\n'"After resolving all conflicts, review the result:"
-    merge_summary+=$'\n'"- Do the merged changes preserve the functionality of the committed session work? Are there any regressions?"
-    merge_summary+=$'\n'"- Are there augmentations — new features or behavior introduced by '$target_branch' that extend or change what the session was doing?"
-    merge_summary+=$'\n'"- If anything is uncertain — ambiguous conflict resolutions, code that may have changed semantics, or areas where both branches made overlapping changes — present those uncertainties to me with your answers to the above questions."
-    merge_summary+=$'\n\n'"When you have finished resolving all conflicts and are satisfied with the result, run:"
-    merge_summary+=$'\n'"  fin \"<brief description of what was resolved>\""
-    merge_summary+=$'\n'"This will signal completion and terminate the session."
+    local merge_summary
+    merge_summary=$(\
+        _PROMPT_SUMMARY_LINES="$_summary_lines_joined" \
+        _PROMPT_CONFLICT_COUNT="$conflict_count" \
+        _PROMPT_DIRTY_COUNT="$dirty_count" \
+        _PROMPT_REVERSE_REPOS="$_rev_repos_joined" \
+        _PROMPT_REVERSE_FILES="$_rev_files_joined" \
+        build_reconcile_prompt "$session_name" "$target_branch"
+    )
 
     # Phase 5 (conflicts): Write all markers in 1 docker run
     # Stream branch, mounts, and summary via delimited protocol on stdin
@@ -3331,6 +3293,8 @@ session_auto_merge() {
         # Run each merge in a subshell
         (
             local _result_file="$_result_dir/${proj_name//\//_}"
+            local _detect_file
+            _detect_file=$(mktemp)
 
             # Helper: write to both internal result file and unified result dir
             _write_merge_result() {
@@ -3339,7 +3303,6 @@ session_auto_merge() {
                 if [[ -n "$_unified_result_dir" ]]; then
                     _pull_result_set "$_unified_result_dir" "$name" "merge_status" "$status"
                     _pull_result_set "$_unified_result_dir" "$name" "merge_detail" "$msg"
-                    # Write target branch HEAD for display
                     local _t_head
                     _t_head=$(git -C "$proj_path" rev-parse "refs/heads/$target_branch" 2>/dev/null || echo "")
                     [[ -n "$_t_head" ]] && _pull_result_set "$_unified_result_dir" "$name" "target_head" "$_t_head"
@@ -3352,253 +3315,125 @@ session_auto_merge() {
                 _ext_status=$(_pull_result_get "$_unified_result_dir" "$proj_name" "extract_status")
                 case "$_ext_status" in
                     diverged)
-                        local _c_ahead _h_ahead
-                        _c_ahead=$(_pull_result_get "$_unified_result_dir" "$proj_name" "diverge_container_ahead")
-                        _h_ahead=$(_pull_result_get "$_unified_result_dir" "$proj_name" "diverge_host_ahead")
                         _write_merge_result "SKIP" "$proj_name" "skipped (stale branch, extraction diverged)"
+                        rm -f "$_detect_file"
                         exit 0
                         ;;
                     failed)
                         local _ext_detail
                         _ext_detail=$(_pull_result_get "$_unified_result_dir" "$proj_name" "extract_detail")
                         _write_merge_result "SKIP" "$proj_name" "skipped (extraction failed: $_ext_detail)"
+                        rm -f "$_detect_file"
                         exit 0
                         ;;
                 esac
             fi
 
-            if [[ ! -d "$proj_path" ]]; then
-                _write_merge_result "SKIP" "$proj_name" "repo not found: $proj_path"
+            # --- Detection: uses shared detect_repo_merge_status ---
+            detect_repo_merge_status "$proj_path" "$session_name" "$target_branch" "$squash" "$_detect_file"
+
+            local _d_status _d_detail _d_files _d_target
+            _d_status=$(detect_result_get "$_detect_file" "merge_status")
+            _d_detail=$(detect_result_get "$_detect_file" "merge_detail")
+            _d_files=$(detect_result_get "$_detect_file" "conflict_files")
+            _d_target=$(detect_result_get "$_detect_file" "target_head")
+            rm -f "$_detect_file"
+
+            # Write conflict files to unified result dir
+            if [[ -n "$_unified_result_dir" && -n "$_d_files" ]]; then
+                _pull_result_set "$_unified_result_dir" "$proj_name" "conflict_files" "$_d_files"
+            fi
+
+            # If dry-run or detection says conflict/skip, just report
+            if [[ "$dry_run" == "true" ]] || [[ "$_d_status" == "CONFLICT" ]] || [[ "$_d_status" == "SKIP" ]]; then
+                _write_merge_result "$_d_status" "$proj_name" "$_d_detail"
                 exit 0
             fi
 
-            # Skip repos where no session branch exists (nothing to merge — unchanged)
-            if ! git -C "$proj_path" show-ref --verify --quiet "refs/heads/$session_name" 2>/dev/null; then
-                _write_merge_result "SKIP" "$proj_name" "no session branch (extraction may have been skipped)"
-                exit 0
-            fi
-
-            # Check if target repo is dirty
-            local orig_dirty
-            orig_dirty=$(git -C "$proj_path" status --porcelain 2>/dev/null)
-            if [[ -n "$orig_dirty" ]]; then
-                _write_merge_result "SKIP" "$proj_name" "host has uncommitted changes"
-                exit 0
-            fi
-
-            # If target branch doesn't exist, create it from session branch
-            if ! git -C "$proj_path" show-ref --verify --quiet "refs/heads/$target_branch" 2>/dev/null; then
-                if [[ "$dry_run" != "true" ]]; then
-                    git -C "$proj_path" branch "$target_branch" "$session_name" 2>/dev/null
-                fi
-                _write_merge_result "OK" "$proj_name" "created '$target_branch' from $session_name"
-                exit 0
-            fi
-
-            # --- Squash-base tracking (authoritative when exists) ---
-            if [[ "$squash" == "true" ]]; then
-                local _squash_ref="refs/claude-container/squash-base/${session_name}"
-                local _squash_base
-                _squash_base=$(git -C "$proj_path" rev-parse --verify "$_squash_ref" 2>/dev/null || echo "")
-
-                # Validate squash-base is an ancestor of current session.
-                # If not (different lineage from force-extract or rebase),
-                # the ref is stale — clear it and fall through to generic checks.
-                if [[ -n "$_squash_base" ]] && \
-                   ! git -C "$proj_path" merge-base --is-ancestor "$_squash_base" "$session_name" 2>/dev/null; then
-                    git -C "$proj_path" update-ref -d "$_squash_ref" 2>/dev/null || true
-                    _squash_base=""
-                fi
-
-                if [[ -n "$_squash_base" ]]; then
-                    local _new_count
-                    _new_count=$(git -C "$proj_path" rev-list --count "${_squash_base}..${session_name}" 2>/dev/null || echo "0")
-
-                    if [[ "$_new_count" == "0" ]]; then
-                        _write_merge_result "OK" "$proj_name" "squash-merged (no new commits since last squash)"
-                        exit 0
-                    fi
-
-                    # Cherry-pick only new commits since last squash
-                    local current_branch
-                    current_branch=$(git -C "$proj_path" symbolic-ref --short HEAD 2>/dev/null || echo "")
-                    local _need_checkout_back=false
-                    if [[ "$current_branch" != "$target_branch" ]]; then
-                        if ! git -C "$proj_path" checkout "$target_branch" 2>/dev/null; then
-                            _write_merge_result "SKIP" "$proj_name" "could not checkout $target_branch"
-                            exit 0
-                        fi
-                        _need_checkout_back=true
-                    fi
-
-                    if git -C "$proj_path" cherry-pick --no-commit "${_squash_base}..${session_name}" >/dev/null 2>&1; then
-                        if [[ "$dry_run" == "true" ]]; then
-                            git -C "$proj_path" reset --hard HEAD 2>/dev/null || true
-                            if $_need_checkout_back; then
-                                git -C "$proj_path" checkout "$current_branch" 2>/dev/null || true
-                            fi
-                            _write_merge_result "OK" "$proj_name" "would squash-merge into $target_branch ($_new_count new)"
-                            exit 0
-                        fi
-                        # Build commit message from original session commits
-                        local _squash_msg
-                        _squash_msg=$(git -C "$proj_path" log --format="%s" "${_squash_base}..${session_name}" 2>/dev/null | head -20)
-                        local _commit_out
-                        if [[ "$_new_count" == "1" ]]; then
-                            # Single commit: use its message directly
-                            _commit_out=$(git -C "$proj_path" commit -m "$_squash_msg" 2>&1) || true
-                        else
-                            # Multiple commits: list them under a summary header
-                            _commit_out=$(git -C "$proj_path" commit -m "$(printf '%s\n\n%s' \
-                                "$session_name → $target_branch ($_new_count commits)" \
-                                "$_squash_msg")" 2>&1) || true
-                        fi
-                        local _new_session_head
-                        _new_session_head=$(git -C "$proj_path" rev-parse "$session_name" 2>/dev/null)
-                        git -C "$proj_path" update-ref "$_squash_ref" "$_new_session_head"
-                        _write_merge_result "OK" "$proj_name" "squash-merged into $target_branch ($_new_count new)"
-                    else
-                        local _conflict_files=""
-                        _conflict_files=$(git -C "$proj_path" diff --name-only --diff-filter=U 2>/dev/null | head -5 | tr '\n' ', ')
-                        _conflict_files="${_conflict_files%,}"
-                        git -C "$proj_path" cherry-pick --abort 2>/dev/null || true
-                        if [[ -n "$_unified_result_dir" && -n "$_conflict_files" ]]; then
-                            _pull_result_set "$_unified_result_dir" "$proj_name" "conflict_files" "$_conflict_files"
-                        fi
-                        _write_merge_result "CONFLICT" "$proj_name" "would conflict"
-                    fi
-
-                    if $_need_checkout_back; then
-                        git -C "$proj_path" checkout "$current_branch" 2>/dev/null || true
-                    fi
+            # Detection says OK — check for special cases
+            case "$_d_detail" in
+                "already up to date"|"no new commits since last squash"|"content identical to"*)
+                    _write_merge_result "OK" "$proj_name" "$_d_detail"
                     exit 0
-                fi
-            fi
+                    ;;
+                "would create"*)
+                    git -C "$proj_path" branch "$target_branch" "$session_name" 2>/dev/null
+                    _write_merge_result "OK" "$proj_name" "created '$target_branch' from $session_name"
+                    exit 0
+                    ;;
+            esac
 
-            # --- Generic ancestry checks (no squash-base exists) ---
-
-            # Check if session is already ancestor of target (true merge ancestry)
-            if git -C "$proj_path" merge-base --is-ancestor "$session_name" "$target_branch" 2>/dev/null; then
-                _write_merge_result "OK" "$proj_name" "already up to date"
-                exit 0
-            fi
-
-            # Check if trees are identical (handles prior manual squash-merge
-            # where no squash-base ref was saved)
-            if git -C "$proj_path" diff --quiet "$session_name" "$target_branch" -- 2>/dev/null; then
-                _write_merge_result "OK" "$proj_name" "content identical to $target_branch"
-                exit 0
-            fi
-
-            # Check if this would be a fast-forward (target is ancestor of session)
-            local is_ff=false
-            if git -C "$proj_path" merge-base --is-ancestor "$target_branch" "$session_name" 2>/dev/null; then
-                is_ff=true
-            fi
-
-            # If not a fast-forward, dry-run the merge to check for conflicts
-            if ! $is_ff; then
-                local current_branch
-                current_branch=$(git -C "$proj_path" symbolic-ref --short HEAD 2>/dev/null || echo "")
-
-                # Checkout target, try merge --no-commit, check result, abort
-                local _checkout_ok=false
-                if [[ "$current_branch" == "$target_branch" ]]; then
-                    _checkout_ok=true
-                elif git -C "$proj_path" checkout "$target_branch" 2>/dev/null; then
-                    _checkout_ok=true
-                fi
-
-                if ! $_checkout_ok; then
+            # --- Execution: actually perform the merge ---
+            local current_branch
+            current_branch=$(git -C "$proj_path" symbolic-ref --short HEAD 2>/dev/null || echo "")
+            local _need_checkout_back=false
+            if [[ "$current_branch" != "$target_branch" ]]; then
+                if ! git -C "$proj_path" checkout "$target_branch" 2>/dev/null; then
                     _write_merge_result "SKIP" "$proj_name" "could not checkout $target_branch"
                     exit 0
                 fi
-
-                local _dryrun_rc=0
-                if ! git -C "$proj_path" merge --no-commit --no-ff "$session_name" >/dev/null 2>&1; then
-                    _dryrun_rc=1
-                fi
-
-                if [[ $_dryrun_rc -ne 0 ]]; then
-                    # Conflicts detected — capture conflicting file names, then abort
-                    local _conflict_files=""
-                    _conflict_files=$(git -C "$proj_path" diff --name-only --diff-filter=U 2>/dev/null | head -5 | tr '\n' ', ')
-                    _conflict_files="${_conflict_files%,}"
-                    git -C "$proj_path" merge --abort 2>/dev/null || true
-                    if [[ "$current_branch" != "$target_branch" ]]; then
-                        git -C "$proj_path" checkout "$current_branch" 2>/dev/null || true
-                    fi
-                    if [[ -n "$_unified_result_dir" && -n "$_conflict_files" ]]; then
-                        _pull_result_set "$_unified_result_dir" "$proj_name" "conflict_files" "$_conflict_files"
-                    fi
-                    _write_merge_result "CONFLICT" "$proj_name" "would conflict"
-                    exit 0
-                fi
-
-                # Clean merge — abort the dry-run, we'll do it for real
-                git -C "$proj_path" merge --abort 2>/dev/null || true
-                if [[ "$current_branch" != "$target_branch" ]]; then
-                    git -C "$proj_path" checkout "$current_branch" 2>/dev/null || true
-                fi
+                _need_checkout_back=true
             fi
 
-            # Safe to merge — either fast-forward or verified clean
-            if [[ "$dry_run" == "true" ]]; then
-                if [[ "$squash" == "true" ]]; then
-                    _write_merge_result "OK" "$proj_name" "would squash-merge into $target_branch"
-                elif $is_ff; then
-                    _write_merge_result "OK" "$proj_name" "would fast-forward into $target_branch"
+            # Check if squash-base cherry-pick path
+            local _squash_ref="refs/claude-container/squash-base/${session_name}"
+            local _squash_base
+            _squash_base=$(git -C "$proj_path" rev-parse --verify "$_squash_ref" 2>/dev/null || echo "")
+            if [[ -n "$_squash_base" ]] && \
+               ! git -C "$proj_path" merge-base --is-ancestor "$_squash_base" "$session_name" 2>/dev/null; then
+                git -C "$proj_path" update-ref -d "$_squash_ref" 2>/dev/null || true
+                _squash_base=""
+            fi
+
+            if [[ "$squash" == "true" && -n "$_squash_base" ]]; then
+                # Incremental squash: cherry-pick new commits
+                local _new_count
+                _new_count=$(git -C "$proj_path" rev-list --count "${_squash_base}..${session_name}" 2>/dev/null || echo "0")
+                git -C "$proj_path" cherry-pick --no-commit "${_squash_base}..${session_name}" >/dev/null 2>&1
+                local _squash_msg
+                _squash_msg=$(git -C "$proj_path" log --format="%s" "${_squash_base}..${session_name}" 2>/dev/null | head -20)
+                local _commit_out
+                if [[ "$_new_count" == "1" ]]; then
+                    _commit_out=$(git -C "$proj_path" commit -m "$_squash_msg" 2>&1) || true
                 else
-                    _write_merge_result "OK" "$proj_name" "would merge cleanly into $target_branch"
+                    _commit_out=$(git -C "$proj_path" commit -m "$(printf '%s\n\n%s' \
+                        "$session_name → $target_branch ($_new_count commits)" \
+                        "$_squash_msg")" 2>&1) || true
+                fi
+                git -C "$proj_path" update-ref "$_squash_ref" "$(git -C "$proj_path" rev-parse "$session_name")" 2>/dev/null || true
+                _write_merge_result "OK" "$proj_name" "squash-merged into $target_branch ($_new_count new)"
+            elif [[ "$squash" == "true" ]]; then
+                # First-time squash
+                local _merge_out _merge_rc=0
+                _merge_out=$(git -C "$proj_path" merge --squash "$session_name" 2>&1) || _merge_rc=$?
+                if [[ $_merge_rc -ne 0 ]]; then
+                    git -C "$proj_path" reset --hard HEAD 2>/dev/null || true
+                    _write_merge_result "SKIP" "$proj_name" "squash-merge failed unexpectedly"
+                elif git -C "$proj_path" diff --cached --quiet 2>/dev/null; then
+                    _write_merge_result "OK" "$proj_name" "already up to date"
+                else
+                    local _commit_out _commit_rc=0
+                    _commit_out=$(git -C "$proj_path" commit --no-edit 2>&1) || _commit_rc=$?
+                    if [[ $_commit_rc -ne 0 ]]; then
+                        git -C "$proj_path" reset --hard HEAD 2>/dev/null || true
+                        _write_merge_result "SKIP" "$proj_name" "commit failed after squash"
+                    else
+                        local _squash_ref="refs/claude-container/squash-base/${session_name}"
+                        git -C "$proj_path" update-ref "$_squash_ref" "$(git -C "$proj_path" rev-parse "$session_name")" 2>/dev/null || true
+                        _write_merge_result "OK" "$proj_name" "squash-merged into $target_branch"
+                        { [[ -n "$_merge_out" ]] && echo "$_merge_out"; [[ -n "$_commit_out" ]] && echo "$_commit_out"; } >> "$_result_file.detail"
+                    fi
                 fi
             else
-                local current_branch
-                current_branch=$(git -C "$proj_path" symbolic-ref --short HEAD 2>/dev/null || echo "")
+                # Regular merge
+                local _merge_out
+                _merge_out=$(git -C "$proj_path" merge "$session_name" --no-edit 2>&1) || true
+                _write_merge_result "OK" "$proj_name" "merged into $target_branch"
+                [[ -n "$_merge_out" ]] && echo "$_merge_out" >> "$_result_file.detail"
+            fi
 
-                # Checkout target branch if needed
-                local _need_checkout_back=false
-                if [[ "$current_branch" != "$target_branch" ]]; then
-                    if ! git -C "$proj_path" checkout "$target_branch" 2>/dev/null; then
-                        _write_merge_result "SKIP" "$proj_name" "could not checkout $target_branch"
-                        exit 0
-                    fi
-                    _need_checkout_back=true
-                fi
-
-                if [[ "$squash" == "true" ]]; then
-                    local _merge_out _merge_rc=0
-                    _merge_out=$(git -C "$proj_path" merge --squash "$session_name" 2>&1) || _merge_rc=$?
-                    if [[ $_merge_rc -ne 0 ]]; then
-                        # Squash merge failed (shouldn't happen — dry-run passed)
-                        git -C "$proj_path" reset --hard HEAD 2>/dev/null || true
-                        _write_merge_result "SKIP" "$proj_name" "squash-merge failed unexpectedly"
-                    elif git -C "$proj_path" diff --cached --quiet 2>/dev/null; then
-                        _write_merge_result "OK" "$proj_name" "already up to date"
-                    else
-                        local _commit_out _commit_rc=0
-                        _commit_out=$(git -C "$proj_path" commit --no-edit 2>&1) || _commit_rc=$?
-                        if [[ $_commit_rc -ne 0 ]]; then
-                            git -C "$proj_path" reset --hard HEAD 2>/dev/null || true
-                            _write_merge_result "SKIP" "$proj_name" "commit failed after squash"
-                        else
-                            # Save squash-base so future pulls only cherry-pick new commits
-                            local _squash_ref="refs/claude-container/squash-base/${session_name}"
-                            git -C "$proj_path" update-ref "$_squash_ref" "$(git -C "$proj_path" rev-parse "$session_name")" 2>/dev/null || true
-                            _write_merge_result "OK" "$proj_name" "squash-merged into $target_branch"
-                            { [[ -n "$_merge_out" ]] && echo "$_merge_out"; [[ -n "$_commit_out" ]] && echo "$_commit_out"; } >> "$_result_file.detail"
-                        fi
-                    fi
-                else
-                    local _merge_out
-                    _merge_out=$(git -C "$proj_path" merge "$session_name" --no-edit 2>&1) || true
-                    _write_merge_result "OK" "$proj_name" "merged into $target_branch"
-                    [[ -n "$_merge_out" ]] && echo "$_merge_out" >> "$_result_file.detail"
-                fi
-
-                # Return to original branch if we checked out
-                if $_need_checkout_back; then
-                    git -C "$proj_path" checkout "$current_branch" 2>/dev/null || true
-                fi
+            if $_need_checkout_back; then
+                git -C "$proj_path" checkout "$current_branch" 2>/dev/null || true
             fi
         ) &
         _pids+=($!)
