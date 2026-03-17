@@ -136,12 +136,6 @@ cmd_pull() {
         return $?
     fi
 
-    if $dry_run; then
-        # Dry-run: check what would happen without extracting or merging
-        session_auto_merge "$session_name" "$branch" true "$repo_filter" "$squash"
-        return $?
-    fi
-
     # --- Unified reporting mode ---
     local _pull_result_dir
     _pull_result_dir=$(mktemp -d)
@@ -171,6 +165,11 @@ cmd_pull() {
         # Show diffstat of what would change on target
         echo ""
         _verify_diffstat "$session_name" "$branch" "$_pull_result_dir" "$repo_filter" || true
+
+        if $dry_run; then
+            # --dry-run: show preview and stop
+            return 0
+        fi
 
         if $verify; then
             echo ""
