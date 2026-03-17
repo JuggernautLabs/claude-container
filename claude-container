@@ -1289,18 +1289,37 @@ if $USE_GIT_SESSION; then
             # Extract with result tracking
             session_extract "$SESSION_NAME" --force --result-dir "$_EXIT_RESULT_DIR"
 
-            # Merge with result tracking
-            session_auto_merge "$SESSION_NAME" "$MERGE_INTO_BRANCH_CHECK" false "" true "$_EXIT_RESULT_DIR" || true
-
-            # Show unified report
-            echo ""
-            _pull_report "$SESSION_NAME" "$MERGE_INTO_BRANCH_CHECK" "$_EXIT_RESULT_DIR"
-
             if [[ -n "$VERIFY_MERGE" ]]; then
-                # --verify: show diffstat of what would still need merging, ask before keeping
+                # --verify: show diffstat, ask before merging
                 echo ""
-                info "Verify mode: review above. Any repos that conflicted were skipped."
-                info "To merge skipped repos: claude-container pull -s $SESSION_NAME $MERGE_INTO_BRANCH_CHECK --no-squash"
+                _pull_report "$SESSION_NAME" "" "$_EXIT_RESULT_DIR"
+                echo ""
+                info "Changes that would land on '$MERGE_INTO_BRANCH_CHECK':"
+                echo ""
+                if _verify_diffstat "$SESSION_NAME" "$MERGE_INTO_BRANCH_CHECK" "$_EXIT_RESULT_DIR"; then
+                    echo ""
+                    printf "Merge into '%s'? [y/N] " "$MERGE_INTO_BRANCH_CHECK"
+                    read -r _verify_answer
+                    case "$_verify_answer" in
+                        [yY]|[yY][eE][sS])
+                            info "Merging..."
+                            session_auto_merge "$SESSION_NAME" "$MERGE_INTO_BRANCH_CHECK" false "" true "$_EXIT_RESULT_DIR" || true
+                            echo ""
+                            _pull_report "$SESSION_NAME" "$MERGE_INTO_BRANCH_CHECK" "$_EXIT_RESULT_DIR"
+                            ;;
+                        *)
+                            info "Aborted. Session branches extracted but not merged."
+                            info "To merge later: claude-container pull -s $SESSION_NAME $MERGE_INTO_BRANCH_CHECK"
+                            ;;
+                    esac
+                else
+                    info "Nothing to merge."
+                fi
+            else
+                # No verify — merge immediately and show report
+                session_auto_merge "$SESSION_NAME" "$MERGE_INTO_BRANCH_CHECK" false "" true "$_EXIT_RESULT_DIR" || true
+                echo ""
+                _pull_report "$SESSION_NAME" "$MERGE_INTO_BRANCH_CHECK" "$_EXIT_RESULT_DIR"
             fi
 
             rm -rf "$_EXIT_RESULT_DIR"
