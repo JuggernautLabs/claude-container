@@ -1911,7 +1911,6 @@ session_merge_into() {
             [[ -z "$_aname" ]] && continue
             local _apath="${_candidate_path[$_aname]}"
             if [[ "$_astatus" == "ancestor" ]]; then
-                info "    $_aname (already up to date)"
                 summary_lines+=("OK: $_aname (up to date)")
                 success_count=$((success_count + 1))
             elif [[ "$_astatus" == "needs_merge" ]]; then
@@ -1988,7 +1987,6 @@ session_merge_into() {
                     success_count=$((success_count + 1))
                     ;;
                 uptodate)
-                    info "    $_rname (already up to date)"
                     summary_lines+=("OK: $_rname (up to date)")
                     success_count=$((success_count + 1))
                     ;;

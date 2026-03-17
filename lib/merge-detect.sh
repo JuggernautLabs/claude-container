@@ -241,12 +241,15 @@ build_reconcile_prompt() {
     fi
 
     # Reverse merge conflicts
-    local _rev_repos _rev_files
-    IFS=$'\n' read -ra _rev_repos <<< "${_PROMPT_REVERSE_REPOS:-}"
-    IFS=$'\n' read -ra _rev_files <<< "${_PROMPT_REVERSE_FILES:-}"
+    local -a _rev_repos=() _rev_files=()
+    while IFS= read -r _line; do
+        [[ -n "$_line" ]] && _rev_repos+=("$_line")
+    done <<< "${_PROMPT_REVERSE_REPOS:-}"
+    while IFS= read -r _line; do
+        [[ -n "$_line" ]] && _rev_files+=("$_line")
+    done <<< "${_PROMPT_REVERSE_FILES:-}"
 
-    local _rev_count=0
-    for _r in "${_rev_repos[@]}"; do [[ -n "$_r" ]] && _rev_count=$((_rev_count + 1)); done
+    local _rev_count=${#_rev_repos[@]}
 
     if [[ $_rev_count -gt 0 ]]; then
         prompt+=$'\n\n'"=== REVERSE MERGE CONFLICTS ==="
