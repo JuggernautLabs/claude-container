@@ -33,6 +33,7 @@ _pull_status() {
     if [[ -n "$config_content" ]] && command -v yq &>/dev/null; then
         projects=$(parse_session_projects "$config_content")
     fi
+    [[ -n "$repo_filter" ]] && projects=$(augment_projects_from_volume "$volume" "$projects" "$repo_filter")
 
     # Build session HEAD lookup
     declare -A _head_map
@@ -168,6 +169,7 @@ _verify_diffstat() {
     if [[ -n "$config_content" ]]; then
         projects=$(parse_session_projects "$config_content")
     fi
+    [[ -n "$repo_filter" ]] && projects=$(augment_projects_from_volume "$volume" "$projects" "$repo_filter")
 
     local _total_files=0 _total_adds=0 _total_dels=0
     local _shown=0

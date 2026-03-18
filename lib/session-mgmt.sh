@@ -2274,9 +2274,20 @@ _extract_multi_project_direct() {
         return 1
     fi
 
-    # Parse config from content
+    # Parse config from content (full version includes extract flags)
     local projects
     projects=$(parse_session_projects "$config_content")
+    local projects_full
+    projects_full=$(parse_session_projects_full "$config_content")
+
+    # Build extract flag lookup from full config
+    declare -A _extract_flags
+    if [[ -n "$projects_full" ]]; then
+        while IFS='|' read -r _ef_name _ef_path _ef_extract; do
+            [[ -z "$_ef_name" ]] && continue
+            _extract_flags[$_ef_name]="${_ef_extract:-true}"
+        done <<< "$projects_full"
+    fi
 
     local success_count=0
     local fail_count=0
@@ -2291,6 +2302,14 @@ _extract_multi_project_direct() {
         [[ -z "$proj_name" ]] && continue
         # Skip repos not matching filter
         repo_matches_filter "$proj_name" "$repo_filter" || continue
+        # Skip extract: false repos — record as discovered
+        if [[ "${_extract_flags[$proj_name]:-true}" == "false" ]]; then
+            if [[ -n "$result_dir" ]]; then
+                _pull_result_set "$result_dir" "$proj_name" "repo_name" "$proj_name"
+                _pull_result_set "$result_dir" "$proj_name" "extract_status" "discovered"
+            fi
+            continue
+        fi
         if [[ ! -d "$proj_path" ]]; then
             info "  $proj_name: host path missing ($proj_path) — will extract from session"
             _missing_host_repos+=("$proj_name|$proj_path")
@@ -2611,6 +2630,8 @@ _extract_multi_project_direct() {
     done
 
     # Phase 4: Extract new repos (created in session) + missing-host repos (in config but host path gone)
+    # Note: discover_and_register() in cmd_pull now handles registration with extract: false.
+    # Phase 4 only processes repos that are in config WITHOUT extract: false (i.e., promoted or legacy).
     local _new_manifest
     _new_manifest=$(scan_repo_manifest "$volume")
 
@@ -2622,13 +2643,14 @@ _extract_multi_project_direct() {
 
     if [[ -n "$_new_manifest" ]]; then
         # Any repo in the volume that's NOT in the config needs extraction
-        # (covers both repos created inside the container and repos added
-        # via --add-repo/--discover-repos that aren't in config yet)
+        # BUT skip repos with extract: false (they're discovered but not yet promoted)
         while IFS='|' read -r _hash _name; do
             [[ -z "$_name" ]] && continue
             if [[ -z "${_config_names[$_name]:-}" ]]; then
                 # Respect --repo filter for non-config repos too
                 repo_matches_filter "$_name" "$repo_filter" || continue
+                # Skip if already registered with extract: false
+                [[ "${_extract_flags[$_name]:-true}" == "false" ]] && continue
                 _new_repos+=("$_name")
             fi
         done <<< "$_new_manifest"

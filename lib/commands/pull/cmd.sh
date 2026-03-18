@@ -21,6 +21,7 @@ cmd_pull() {
     local verify=false
     local discuss=false
     local show_prompt=false
+    local extract_discovered=false
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -70,6 +71,10 @@ cmd_pull() {
                 verify=true  # discuss implies verify
                 shift
                 ;;
+            --extract)
+                extract_discovered=true
+                shift
+                ;;
             --show-prompt)
                 show_prompt=true
                 shift
@@ -114,6 +119,22 @@ cmd_pull() {
     if $status_only; then
         _pull_status "$session_name" "$repo_filter"
         return $?
+    fi
+
+    # Discover repos created inside the container and register them
+    local _disc_volume="claude-session-${session_name}"
+    local _disc_cfg
+    _disc_cfg=$(read_session_config "$_disc_volume")
+    local _disc_proj=""
+    if [[ -n "$_disc_cfg" ]]; then
+        _disc_proj=$(parse_session_projects "$_disc_cfg")
+    fi
+    discover_and_register "$_disc_volume" "$_disc_cfg" "$_disc_proj"
+    if $extract_discovered; then
+        # Re-read config after discover_and_register wrote it
+        local _promo_cfg
+        _promo_cfg=$(read_session_config "$_disc_volume")
+        promote_discovered_repos "$_disc_volume" "$_promo_cfg" "$repo_filter"
     fi
 
     # Extract session branches to host repos

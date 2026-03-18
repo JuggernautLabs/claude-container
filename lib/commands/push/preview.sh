@@ -21,6 +21,28 @@ _push_preview() {
 
     local projects
     projects=$(parse_session_projects "$config_content")
+    if [[ -n "$repo_filter" ]]; then
+        projects=$(augment_projects_from_volume "$volume" "$projects" "$repo_filter")
+    fi
+
+    # Show discovered (extract: false) repos
+    local _disc_full
+    _disc_full=$(parse_session_projects_full "$config_content")
+    if [[ -n "$_disc_full" ]]; then
+        local -a _disc_repos=()
+        while IFS='|' read -r _dn _dp _de; do
+            [[ -z "$_dn" ]] && continue
+            [[ "$_de" == "false" ]] || continue
+            _disc_repos+=("$_dn")
+        done <<< "$_disc_full"
+        if [[ ${#_disc_repos[@]} -gt 0 ]]; then
+            echo "  Discovered (not extracted):"
+            for _dr in "${_disc_repos[@]}"; do
+                echo -e "    ${YELLOW}○${NC} $_dr — new in session (not extracted)"
+            done
+            echo ""
+        fi
+    fi
 
     # Phase 1: Scan session for dirty/merge state (1 docker run)
     local _util_image="${GIT_UTIL_IMAGE:-alpine/git}"
@@ -175,5 +197,26 @@ _push_preview() {
     if [[ ${#_needs_merge[@]} -eq 0 && ${#_problem_repos[@]} -eq 0 ]]; then
         echo ""
         info "Nothing to merge — session is up to date with '$target_branch'"
+    fi
+
+    # Warn about --repo filter terms that matched nothing
+    if [[ -n "$repo_filter" ]]; then
+        local _all_proj_names=()
+        while IFS='|' read -r _pn _pp; do
+            [[ -n "$_pn" ]] && _all_proj_names+=("$_pn")
+        done <<< "$projects"
+        local IFS=','
+        for _fterm in $repo_filter; do
+            local _fmatched=false
+            for _fname in "${_all_proj_names[@]}"; do
+                if [[ "$_fname" == *"$_fterm"* ]]; then
+                    _fmatched=true
+                    break
+                fi
+            done
+            if ! $_fmatched; then
+                warn "no repo matching '$_fterm' found in session"
+            fi
+        done
     fi
 }

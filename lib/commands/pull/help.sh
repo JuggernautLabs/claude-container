@@ -20,6 +20,8 @@ Options:
                            only merge new commits — no conflicts from squash history.
   --no-squash              Regular merge. Preserves full session commit history on target.
   --verify                 Extract and show results, then ask before merging
+  --extract                Extract repos discovered in session (created by agent).
+                           Use with --repo to extract specific repos, or alone for all.
   --dry-run                Show what would happen without extracting or merging
   --force, -f              Force extraction even if branches diverged (container wins)
   --help, -h               Show this help
@@ -66,6 +68,12 @@ Examples:
   # Pull a single repo
   claude-container pull -s myproj --repo gamma
   claude-container pull -s myproj main --repo plexus-gamma
+
+  # Extract a repo discovered in the session (created by agent)
+  claude-container pull -s myproj --extract --repo new-thing
+
+  # Extract ALL discovered repos
+  claude-container pull -s myproj --extract
 
   # Force extraction (overwrite diverged branches)
   claude-container pull -s myproj --force

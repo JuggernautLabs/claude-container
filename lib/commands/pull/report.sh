@@ -11,14 +11,17 @@ _pull_report() {
     local volume="claude-session-${session_name}"
 
     # Collect all repos that have result files
-    local _pulled=0 _unchanged=0 _needs_attention=0 _conflicts=0
+    local _pulled=0 _unchanged=0 _needs_attention=0 _conflicts=0 _target_ahead_count=0
 
-    # Read config to iterate repos in order
+    # Read config to iterate repos in order, augmenting with volume-only repos for unmatched filters
     local config_content
     config_content=$(read_session_config "$volume")
     local projects=""
     if [[ -n "$config_content" ]]; then
         projects=$(parse_session_projects "$config_content")
+    fi
+    if [[ -n "$repo_filter" ]]; then
+        projects=$(augment_projects_from_volume "$volume" "$projects" "$repo_filter")
     fi
 
     # Collect repo names from result files (covers repos not in config too)
@@ -63,6 +66,14 @@ _pull_report() {
         _merge_status=$(_pull_result_get "$result_dir" "$_repo" "merge_status")
         _merge_detail=$(_pull_result_get "$result_dir" "$_repo" "merge_detail")
         _conflict_files=$(_pull_result_get "$result_dir" "$_repo" "conflict_files")
+
+        # Never hide discovered repos — always show them with actionable hint
+        if [[ "$_ext_status" == "discovered" ]]; then
+            echo -e "  ${BLUE}$_repo${NC}"
+            echo -e "    extract:  ${YELLOW}○${NC} new in session (not extracted)"
+            echo -e "    ${DIM}→ claude-container pull -s ${session_name} --extract --repo ${_repo##*/}${NC}"
+            continue
+        fi
 
         # Hide repos that are unchanged on both extract and merge
         # (never hide when --repo filter is active — user explicitly asked for this repo)
@@ -153,7 +164,7 @@ _pull_report() {
                 _pulled=$((_pulled + 1))
                 ;;
             unchanged)
-                echo -e "    extract:  ${BLUE}—${NC} no changes"
+                echo -e "    extract:  — up to date"
                 _unchanged=$((_unchanged + 1))
                 ;;
             diverged)
@@ -178,7 +189,7 @@ _pull_report() {
                 OK)
                     case "$_merge_detail" in
                         "already up to date"|"up to date"*)
-                            echo -e "    merge:    — no modifications needed"
+                            echo -e "    merge:    — nothing to merge (session → ${target_branch})"
                             ;;
                         "squash-merge"*|"fast-forward"*|"merge cleanly"*)
                             echo -e "    merge:    ${GREEN}✓${NC} $_merge_detail"
@@ -199,16 +210,15 @@ _pull_report() {
                     _show_merge_diff=true
                     ;;
             esac
-            # Inline diffstat for repos that will be modified
+            # Inline diffstat summary (file count only — full diff shown in _verify_diffstat)
             if $_show_merge_diff; then
                 local _merge_proj_path
                 _merge_proj_path=$(echo "$projects" | grep "^${_repo}|" | head -1 | cut -d'|' -f2)
                 if [[ -n "$_merge_proj_path" && -d "$_merge_proj_path" ]]; then
-                    local _merge_stat
-                    _merge_stat=$(git -C "$_merge_proj_path" diff --stat "$target_branch".."$session_name" 2>/dev/null)
-                    if [[ -n "$_merge_stat" ]]; then
-                        echo "$_merge_stat" | sed '$d' | sed 's/^/              /'
-                        echo "              $(echo "$_merge_stat" | tail -1)"
+                    local _merge_stat_summary
+                    _merge_stat_summary=$(git -C "$_merge_proj_path" diff --stat "$target_branch".."$session_name" 2>/dev/null | tail -1)
+                    if [[ -n "$_merge_stat_summary" ]]; then
+                        echo -e "              ${DIM}${_merge_stat_summary}${NC}"
                     fi
                 fi
             fi
@@ -233,13 +243,15 @@ _pull_report() {
                 done <<< "$_rpt_ahead_log"
 
                 if [[ $_rpt_external -gt 0 ]]; then
-                    echo -e "    ${YELLOW}! ${target_branch} has ${_rpt_target_ahead} commit(s) not in session:${NC}"
+                    echo -e "    ${YELLOW}note: ${target_branch} is ${_rpt_target_ahead} commit(s) ahead of session:${NC}"
                     while IFS= read -r _rpt_line; do
                         [[ -n "$_rpt_line" ]] && echo "      $_rpt_line"
                     done <<< "$_rpt_ahead_log"
                     local _rpt_risk_stat
                     _rpt_risk_stat=$(git -C "$_rpt_proj_path" diff --stat "$session_name".."$target_branch" 2>/dev/null | tail -1)
                     [[ -n "$_rpt_risk_stat" ]] && echo -e "      ${YELLOW}$_rpt_risk_stat${NC}"
+                    echo -e "    ${DIM}→ claude-container push -s ${session_name} ${target_branch} --merge  (sync session)${NC}"
+                    _target_ahead_count=$((_target_ahead_count + 1))
                 else
                     local _rpt_squash_stat
                     _rpt_squash_stat=$(git -C "$_rpt_proj_path" diff --stat "$session_name".."$target_branch" 2>/dev/null | tail -1)
@@ -284,7 +296,27 @@ _pull_report() {
             warn "$_summary_line"
         fi
     fi
+    if [[ $_target_ahead_count -gt 0 ]]; then
+        echo -e "${YELLOW}${target_branch} is ahead of session in ${_target_ahead_count} repo(s) — consider 'claude-container push -s ${session_name} ${target_branch} --merge'${NC}"
+    fi
     if [[ $_unchanged -gt 0 ]]; then
         echo -e "${DIM}$_unchanged repo(s) unchanged — no modifications${NC}"
+    fi
+
+    # Warn about --repo filter terms that matched nothing
+    if [[ -n "$repo_filter" ]]; then
+        local IFS=','
+        for _fterm in $repo_filter; do
+            local _fmatched=false
+            for _fname in "${_repo_names[@]}"; do
+                if [[ "$_fname" == *"$_fterm"* ]]; then
+                    _fmatched=true
+                    break
+                fi
+            done
+            if ! $_fmatched; then
+                warn "no repo matching '$_fterm' found in session"
+            fi
+        done
     fi
 }

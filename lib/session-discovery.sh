@@ -159,3 +159,206 @@ check_repo_sync_status() {
         echo "not_extracted"
     fi
 }
+
+# Augment a projects list with volume-only repos that match unmatched --repo filter terms.
+# When a filter term matches nothing in the config, scans the volume and adds any matching
+# repos with resolved host paths. Returns the augmented projects string (name|path lines).
+#
+# Arguments:
+#   $1 - volume name (e.g. "claude-session-foo")
+#   $2 - projects string (name|path lines from parse_session_projects)
+#   $3 - repo_filter (comma-separated filter terms, may be empty)
+# Returns: augmented name|path lines on stdout (original + discovered)
+augment_projects_from_volume() {
+    local volume="$1"
+    local projects="$2"
+    local repo_filter="$3"
+
+    # Start with existing projects
+    [[ -n "$projects" ]] && echo "$projects"
+
+    # Nothing to augment if no filter
+    [[ -z "$repo_filter" ]] && return 0
+
+    # Find which filter terms have no config match
+    local -a _unmatched=()
+    local IFS=','
+    for _fterm in $repo_filter; do
+        local _found=false
+        if [[ -n "$projects" ]]; then
+            while IFS='|' read -r _pname _ppath; do
+                [[ -z "$_pname" ]] && continue
+                if [[ "$_pname" == *"$_fterm"* ]]; then
+                    _found=true
+                    break
+                fi
+            done <<< "$projects"
+        fi
+        $_found || _unmatched+=("$_fterm")
+    done
+
+    [[ ${#_unmatched[@]} -eq 0 ]] && return 0
+
+    # Scan volume for all repo names (single docker run, reuse get_session_heads pattern)
+    local _vol_repos
+    _vol_repos=$(docker run --rm --entrypoint sh \
+        -v "$volume:/session:ro" "${GIT_UTIL_IMAGE:-alpine/git}" \
+        -c '
+            for d in /session/*/ /session/*/*/; do
+                [ -d "$d/.git" ] || continue
+                name="${d#/session/}"
+                name="${name%/}"
+                echo "$name"
+            done
+        ' 2>/dev/null) || true
+
+    [[ -z "$_vol_repos" ]] && return 0
+
+    # Match unmatched filter terms against volume repos
+    while IFS= read -r _vname; do
+        [[ -z "$_vname" ]] && continue
+        for _fterm in "${_unmatched[@]}"; do
+            if [[ "$_vname" == *"$_fterm"* ]]; then
+                # Resolve host path using existing projects for org-sibling inference
+                local _host_path
+                _host_path=$(resolve_repo_host_path "$_vname" "$projects")
+                echo "${_vname}|${_host_path}"
+                break
+            fi
+        done
+    done <<< "$_vol_repos"
+}
+
+# Parse config YAML into name|path|extract triples on stdout.
+# Like parse_session_projects but includes the extract field (defaults to "true" if absent).
+# Arguments:
+#   $1 - config content (YAML string)
+# Returns: name|path|extract lines on stdout
+parse_session_projects_full() {
+    local config_content="$1"
+
+    [[ -z "$config_content" ]] && return 0
+
+    echo "$config_content" | yq eval \
+        '.projects | to_entries | .[] | .key + "|" + .value.path + "|" + (.value.extract // "true" | tostring)' - 2>/dev/null
+}
+
+# Discover repos in the session volume that aren't in .claude-projects.yml,
+# then register them with extract: false. Idempotent — second call finds nothing new.
+# Arguments:
+#   $1 - volume name (e.g. "claude-session-foo")
+#   $2 - config content (YAML string, may be empty)
+#   $3 - projects string (name|path lines from parse_session_projects)
+# Returns: prints info line if new repos found; writes updated config to volume
+discover_and_register() {
+    local volume="$1"
+    local config_content="$2"
+    local projects="$3"
+    local git_image="${GIT_UTIL_IMAGE:-alpine/git}"
+
+    # Build set of known project names from config
+    declare -A _known_names
+    if [[ -n "$projects" ]]; then
+        while IFS='|' read -r _pname _ppath; do
+            [[ -z "$_pname" ]] && continue
+            _known_names[$_pname]=1
+        done <<< "$projects"
+    fi
+
+    # Single docker run: list all repos in volume
+    local _vol_repos
+    _vol_repos=$(docker run --rm --entrypoint sh \
+        -v "$volume:/session:ro" "$git_image" \
+        -c '
+            for d in /session/*/ /session/*/*/; do
+                [ -d "$d/.git" ] || continue
+                name="${d#/session/}"
+                name="${name%/}"
+                echo "$name"
+            done
+        ' 2>/dev/null) || true
+
+    [[ -z "$_vol_repos" ]] && return 0
+
+    # Find repos not in config
+    local -a _new_repos=()
+    while IFS= read -r _vname; do
+        [[ -z "$_vname" ]] && continue
+        [[ -n "${_known_names[$_vname]:-}" ]] && continue
+        _new_repos+=("$_vname")
+    done <<< "$_vol_repos"
+
+    [[ ${#_new_repos[@]} -eq 0 ]] && return 0
+
+    # Register each new repo with extract: false
+    local _updated_cfg="$config_content"
+    if [[ -z "$_updated_cfg" ]]; then
+        _updated_cfg="projects: {}"
+    fi
+
+    local _count=0
+    for _new_name in "${_new_repos[@]}"; do
+        local _host_path
+        _host_path=$(resolve_repo_host_path "$_new_name" "$projects")
+        _updated_cfg=$(echo "$_updated_cfg" | yq eval \
+            ".projects.\"$_new_name\".path = \"$_host_path\" | .projects.\"$_new_name\".extract = false" -)
+        _count=$((_count + 1))
+    done
+
+    if [[ $_count -gt 0 ]]; then
+        # Write updated config back to volume
+        local _host_uid
+        _host_uid=$(get_host_uid)
+        echo "$_updated_cfg" | docker run --rm -i --entrypoint sh \
+            --user "$_host_uid:$_host_uid" \
+            -v "$volume:/session" \
+            "$git_image" \
+            -c 'cat > /session/.claude-projects.yml' 2>/dev/null
+        info "Discovered $_count new repo(s) in session"
+    fi
+}
+
+# Promote discovered repos (extract: false) to normal (remove extract field).
+# Arguments:
+#   $1 - volume name
+#   $2 - config content (YAML string)
+#   $3 - repo_filter (comma-separated, may be empty — empty means all)
+# Returns: writes updated config to volume
+promote_discovered_repos() {
+    local volume="$1"
+    local config_content="$2"
+    local repo_filter="$3"
+    local git_image="${GIT_UTIL_IMAGE:-alpine/git}"
+
+    [[ -z "$config_content" ]] && return 0
+
+    # Find extract: false entries
+    local _full_projects
+    _full_projects=$(parse_session_projects_full "$config_content")
+    [[ -z "$_full_projects" ]] && return 0
+
+    local _updated_cfg="$config_content"
+    local _count=0
+
+    while IFS='|' read -r _pname _ppath _pextract; do
+        [[ -z "$_pname" ]] && continue
+        [[ "$_pextract" == "false" ]] || continue
+        # Apply repo filter if provided
+        if [[ -n "$repo_filter" ]]; then
+            repo_matches_filter "$_pname" "$repo_filter" || continue
+        fi
+        _updated_cfg=$(echo "$_updated_cfg" | yq eval "del(.projects.\"$_pname\".extract)" -)
+        _count=$((_count + 1))
+    done <<< "$_full_projects"
+
+    if [[ $_count -gt 0 ]]; then
+        local _host_uid
+        _host_uid=$(get_host_uid)
+        echo "$_updated_cfg" | docker run --rm -i --entrypoint sh \
+            --user "$_host_uid:$_host_uid" \
+            -v "$volume:/session" \
+            "$git_image" \
+            -c 'cat > /session/.claude-projects.yml' 2>/dev/null
+        info "Promoted $_count discovered repo(s) for extraction"
+    fi
+}
