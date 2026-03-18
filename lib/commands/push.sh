@@ -16,6 +16,7 @@ cmd_push() {
     local force=false
     local verify=false
     local dry_run=false
+    local discuss=false
     local repo_filter=""
     local repo_branch=""
 
@@ -26,13 +27,21 @@ cmd_push() {
                 shift 2
                 ;;
             --repo)
-                # Parse --repo name[,branch]
-                if [[ "$2" == *,* ]]; then
-                    repo_filter="${2%%,*}"
-                    repo_branch="${2#*,}"
+                # Parse --repo name[,branch] — supports multiple: --repo a --repo b
+                local _repo_arg="$2"
+                local _repo_name _repo_br=""
+                if [[ "$_repo_arg" == *,* ]]; then
+                    _repo_name="${_repo_arg%%,*}"
+                    _repo_br="${_repo_arg#*,}"
                 else
-                    repo_filter="$2"
+                    _repo_name="$_repo_arg"
                 fi
+                if [[ -n "$repo_filter" ]]; then
+                    repo_filter="${repo_filter},${_repo_name}"
+                else
+                    repo_filter="$_repo_name"
+                fi
+                [[ -n "$_repo_br" ]] && repo_branch="$_repo_br"
                 shift 2
                 ;;
             --as)
@@ -62,6 +71,11 @@ cmd_push() {
                 ;;
             --dry-run)
                 dry_run=true
+                shift
+                ;;
+            --discuss)
+                discuss=true
+                verify=true
                 shift
                 ;;
             --help|-h)
@@ -123,6 +137,22 @@ cmd_push() {
                 if $dry_run; then
                     return 0
                 fi
+
+                if $discuss; then
+                    echo ""
+                    # Build result dir for discuss prompt
+                    local _push_discuss_dir
+                    _push_discuss_dir=$(mktemp -d)
+                    session_auto_merge "$session_name" "$merge_branch" true "$repo_filter" true "$_push_discuss_dir" 2>/dev/null || true
+                    local _discuss_prompt
+                    _discuss_prompt=$(_build_discuss_prompt "$session_name" "$merge_branch" "$_push_discuss_dir" "$repo_filter")
+                    rm -rf "$_push_discuss_dir"
+                    info "Launching Claude to discuss merge state..."
+                    echo ""
+                    claude "$_discuss_prompt"
+                    echo ""
+                fi
+
                 echo ""
                 printf "Merge '%s' into session '%s'? [y/N] " "$merge_branch" "$session_name"
                 local _answer

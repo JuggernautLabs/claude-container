@@ -15,6 +15,19 @@ success() { echo -e "${GREEN}✓${NC} $*" >&2; }
 warn() { echo -e "${YELLOW}⚠${NC} $*" >&2; }
 error() { echo -e "${RED}✗${NC} $*" >&2; }
 
+# Match a repo name against a comma-separated filter list (partial match).
+# Usage: repo_matches_filter <repo_name> <filter>
+# Returns 0 (true) if filter is empty or repo matches any entry.
+repo_matches_filter() {
+    local name="$1" filter="$2"
+    [[ -z "$filter" ]] && return 0
+    local IFS=','
+    for _f in $filter; do
+        [[ "$name" == *"$_f"* ]] && return 0
+    done
+    return 1
+}
+
 # Check if a directory is a git repository (handles both regular repos and worktrees)
 # Regular repo: .git is a directory
 # Worktree: .git is a file containing "gitdir: /path/to/main/.git/worktrees/name"

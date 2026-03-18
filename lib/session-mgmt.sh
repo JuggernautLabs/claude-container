@@ -2262,38 +2262,7 @@ _extract_multi_project_direct() {
     local repo_filter="${7:-}"
     local result_dir="${8:-}"
 
-    # Resolve partial repo name to full name if filter specified
-    if [[ -n "$repo_filter" ]]; then
-        local _all_projects
-        _all_projects=$(parse_session_projects "$config_content")
-        local _rf_suffix_matches=() _rf_substr_matches=()
-        while IFS='|' read -r _rn _rp; do
-            [[ -z "$_rn" ]] && continue
-            if [[ "$_rn" == "$repo_filter" ]]; then
-                _rf_suffix_matches=("$_rn"); break  # exact match
-            elif [[ "$_rn" == */"$repo_filter" ]]; then
-                _rf_suffix_matches+=("$_rn")
-            elif [[ "$_rn" == *"$repo_filter"* ]]; then
-                _rf_substr_matches+=("$_rn")
-            fi
-        done <<< "$_all_projects"
-        # Prefer suffix matches; fall back to substring
-        local _rf_matches=()
-        if [[ ${#_rf_suffix_matches[@]} -gt 0 ]]; then
-            _rf_matches=("${_rf_suffix_matches[@]}")
-        else
-            _rf_matches=("${_rf_substr_matches[@]}")
-        fi
-        if [[ ${#_rf_matches[@]} -eq 0 ]]; then
-            error "No repo matching '$repo_filter' in session"
-            return 1
-        elif [[ ${#_rf_matches[@]} -gt 1 ]]; then
-            error "'$repo_filter' is ambiguous — matches ${#_rf_matches[@]} repos:"
-            for _m in "${_rf_matches[@]}"; do echo "  $_m"; done
-            return 1
-        fi
-        repo_filter="${_rf_matches[0]}"
-    fi
+    # repo_filter is a comma-separated list of partial names; matching done by repo_matches_filter
 
     if [[ -z "$result_dir" ]]; then
         info "Multi-project session detected"
@@ -2321,7 +2290,7 @@ _extract_multi_project_direct() {
     while IFS='|' read -r proj_name proj_path; do
         [[ -z "$proj_name" ]] && continue
         # Skip repos not matching filter
-        [[ -n "$repo_filter" && "$proj_name" != "$repo_filter" ]] && continue
+        repo_matches_filter "$proj_name" "$repo_filter" || continue
         if [[ ! -d "$proj_path" ]]; then
             info "  $proj_name: host path missing ($proj_path) — will extract from session"
             _missing_host_repos+=("$proj_name|$proj_path")
@@ -2659,7 +2628,7 @@ _extract_multi_project_direct() {
             [[ -z "$_name" ]] && continue
             if [[ -z "${_config_names[$_name]:-}" ]]; then
                 # Respect --repo filter for non-config repos too
-                [[ -n "$repo_filter" && "$_name" != "$repo_filter" && "$_name" != *"$repo_filter"* ]] && continue
+                repo_matches_filter "$_name" "$repo_filter" || continue
                 _new_repos+=("$_name")
             fi
         done <<< "$_new_manifest"
@@ -3248,43 +3217,14 @@ session_auto_merge() {
     _result_dir=$(mktemp -d)
     trap "rm -rf '$_result_dir'" RETURN
 
-    # Resolve partial repo filter against project list
-    if [[ -n "$repo_filter" ]]; then
-        local _rf_suffix_matches=() _rf_substr_matches=()
-        while IFS='|' read -r _rn _rp; do
-            [[ -z "$_rn" ]] && continue
-            if [[ "$_rn" == "$repo_filter" ]]; then
-                _rf_suffix_matches=("$_rn"); break  # exact match
-            elif [[ "$_rn" == */"$repo_filter" ]]; then
-                _rf_suffix_matches+=("$_rn")
-            elif [[ "$_rn" == *"$repo_filter"* ]]; then
-                _rf_substr_matches+=("$_rn")
-            fi
-        done <<< "$projects"
-        # Prefer suffix matches; fall back to substring
-        local _rf_matches=()
-        if [[ ${#_rf_suffix_matches[@]} -gt 0 ]]; then
-            _rf_matches=("${_rf_suffix_matches[@]}")
-        else
-            _rf_matches=("${_rf_substr_matches[@]}")
-        fi
-        if [[ ${#_rf_matches[@]} -eq 0 ]]; then
-            error "No repo matching '$repo_filter' in session"
-            return 1
-        elif [[ ${#_rf_matches[@]} -gt 1 ]]; then
-            error "'$repo_filter' is ambiguous — matches ${#_rf_matches[@]} repos:"
-            for _m in "${_rf_matches[@]}"; do echo "  $_m"; done
-            return 1
-        fi
-        repo_filter="${_rf_matches[0]}"
-    fi
+    # repo_filter is a comma-separated list of partial names; matching done by repo_matches_filter
 
     # Launch each merge in parallel
     local _pids=()
     local _proj_names=()
     while IFS='|' read -r proj_name proj_path; do
         [[ -z "$proj_name" ]] && continue
-        [[ -n "$repo_filter" && "$proj_name" != "$repo_filter" ]] && continue
+        repo_matches_filter "$proj_name" "$repo_filter" || continue
 
         _proj_names+=("$proj_name")
 
