@@ -87,10 +87,16 @@ REMOVE_UNDISCOVERED=false
 # Subcommand dispatch — if first arg is a known command, delegate to it
 if [[ $# -gt 0 ]] && [[ ! "$1" =~ ^- ]]; then
     _subcmd="$1"
-    _subcmd_file="$SCRIPT_DIR/lib/commands/${_subcmd}.sh"
-    if [[ -f "$_subcmd_file" ]]; then
+    if [[ -d "$SCRIPT_DIR/lib/commands/${_subcmd}" ]]; then
         shift
-        source "$_subcmd_file"
+        for _f in "$SCRIPT_DIR/lib/commands/${_subcmd}"/*.sh; do
+            source "$_f"
+        done
+        "cmd_${_subcmd}" "$@"
+        exit $?
+    elif [[ -f "$SCRIPT_DIR/lib/commands/${_subcmd}.sh" ]]; then
+        shift
+        source "$SCRIPT_DIR/lib/commands/${_subcmd}.sh"
         "cmd_${_subcmd}" "$@"
         exit $?
     fi
@@ -1282,7 +1288,9 @@ if $USE_GIT_SESSION; then
                 rm -f /session/.merge-verify 2>/dev/null || true
 
             # Source the pull subcommand for unified reporting functions
-            source "$SCRIPT_DIR/lib/commands/pull.sh"
+            for _f in "$SCRIPT_DIR/lib/commands/pull/"*.sh; do
+                source "$_f"
+            done
 
             # Create unified result dir
             _EXIT_RESULT_DIR=$(mktemp -d)
@@ -1290,34 +1298,36 @@ if $USE_GIT_SESSION; then
             # Extract with result tracking
             session_extract "$SESSION_NAME" --force --result-dir "$_EXIT_RESULT_DIR"
 
+            # Dry-run merge to populate results
+            session_auto_merge "$SESSION_NAME" "$MERGE_INTO_BRANCH_CHECK" true "" true "$_EXIT_RESULT_DIR" 2>/dev/null || true
+
+            # Always show the report (what would happen)
+            echo ""
+            _pull_report "$SESSION_NAME" "$MERGE_INTO_BRANCH_CHECK" "$_EXIT_RESULT_DIR"
+
+            # Show diffstat
+            echo ""
+            _verify_diffstat "$SESSION_NAME" "$MERGE_INTO_BRANCH_CHECK" "$_EXIT_RESULT_DIR" || true
+
             if [[ -n "$VERIFY_MERGE" ]]; then
-                # --verify: show diffstat, ask before merging
+                # --verify: ask before merging
                 echo ""
-                _pull_report "$SESSION_NAME" "" "$_EXIT_RESULT_DIR"
-                echo ""
-                info "Changes that would land on '$MERGE_INTO_BRANCH_CHECK':"
-                echo ""
-                if _verify_diffstat "$SESSION_NAME" "$MERGE_INTO_BRANCH_CHECK" "$_EXIT_RESULT_DIR"; then
-                    echo ""
-                    printf "Merge into '%s'? [y/N] " "$MERGE_INTO_BRANCH_CHECK"
-                    read -r _verify_answer
-                    case "$_verify_answer" in
-                        [yY]|[yY][eE][sS])
-                            info "Merging..."
-                            session_auto_merge "$SESSION_NAME" "$MERGE_INTO_BRANCH_CHECK" false "" true "$_EXIT_RESULT_DIR" || true
-                            echo ""
-                            _pull_report "$SESSION_NAME" "$MERGE_INTO_BRANCH_CHECK" "$_EXIT_RESULT_DIR"
-                            ;;
-                        *)
-                            info "Aborted. Session branches extracted but not merged."
-                            info "To merge later: claude-container pull -s $SESSION_NAME $MERGE_INTO_BRANCH_CHECK"
-                            ;;
-                    esac
-                else
-                    info "Nothing to merge."
-                fi
+                printf "Merge into '%s'? [y/N] " "$MERGE_INTO_BRANCH_CHECK"
+                read -r _verify_answer
+                case "$_verify_answer" in
+                    [yY]|[yY][eE][sS])
+                        info "Merging..."
+                        session_auto_merge "$SESSION_NAME" "$MERGE_INTO_BRANCH_CHECK" false "" true "$_EXIT_RESULT_DIR" || true
+                        echo ""
+                        _pull_report "$SESSION_NAME" "$MERGE_INTO_BRANCH_CHECK" "$_EXIT_RESULT_DIR"
+                        ;;
+                    *)
+                        info "Aborted. Session branches extracted but not merged."
+                        info "To merge later: claude-container pull -s $SESSION_NAME $MERGE_INTO_BRANCH_CHECK"
+                        ;;
+                esac
             else
-                # No verify — merge immediately and show report
+                # No verify — merge immediately and show final report
                 session_auto_merge "$SESSION_NAME" "$MERGE_INTO_BRANCH_CHECK" false "" true "$_EXIT_RESULT_DIR" || true
                 echo ""
                 _pull_report "$SESSION_NAME" "$MERGE_INTO_BRANCH_CHECK" "$_EXIT_RESULT_DIR"

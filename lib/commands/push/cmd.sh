@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Subcommand: push
-# Push host changes into a container session (host → container)
+# Push host changes into a container session (host -> container)
 #
 # Usage:
 #   claude-container push -s <session> [branch] [options]
@@ -130,22 +130,18 @@ cmd_push() {
             local merge_branch="${branch:-main}"
 
             if $dry_run || $verify; then
-                # Source pull.sh for preview functions
-                source "$(dirname "${BASH_SOURCE[0]}")/pull.sh"
-                # Show preview of what merge would do
-                _pull_reconcile_preview "$session_name" "$merge_branch" "$repo_filter"
+                _push_preview "$session_name" "$merge_branch" "$repo_filter"
                 if $dry_run; then
                     return 0
                 fi
 
                 if $discuss; then
                     echo ""
-                    # Build result dir for discuss prompt
                     local _push_discuss_dir
                     _push_discuss_dir=$(mktemp -d)
                     session_auto_merge "$session_name" "$merge_branch" true "$repo_filter" true "$_push_discuss_dir" 2>/dev/null || true
                     local _discuss_prompt
-                    _discuss_prompt=$(_build_discuss_prompt "$session_name" "$merge_branch" "$_push_discuss_dir" "$repo_filter")
+                    _discuss_prompt=$(_push_discuss_prompt "$session_name" "$merge_branch" "$_push_discuss_dir" "$repo_filter")
                     rm -rf "$_push_discuss_dir"
                     info "Launching Claude to discuss merge state..."
                     echo ""
@@ -168,13 +164,28 @@ cmd_push() {
                 esac
             fi
 
-            if ! session_merge_into "$session_name" "$merge_branch"; then
-                # Clean merge — extract resolved state
-                session_extract "$session_name" --force
-                return 0
+            # Capture pre-merge state for reporting (if we didn't already show preview)
+            if ! $dry_run && ! $verify; then
+                _push_preview "$session_name" "$merge_branch" "$repo_filter"
+                echo ""
             fi
-            # Conflicts — exec back for container startup with auto-merge
-            exec "$0" --session "$session_name" --auto-merge
+
+            # Run the merge (suppress inline output — preview already showed what will happen)
+            local _merge_needs_container=false
+            if session_merge_into "$session_name" "$merge_branch" > /dev/null 2>&1; then
+                _merge_needs_container=true
+            fi
+
+            if $_merge_needs_container; then
+                # Conflicts — launch container for Claude
+                echo ""
+                warn "Merge has conflicts — launching container for Claude to resolve."
+                exec "$0" --session "$session_name" --auto-merge
+            fi
+
+            # Clean merge — show post-merge report
+            _push_report "$session_name" "$merge_branch" "$repo_filter"
+            return 0
             ;;
         rebase)
             # Rebase session onto host branch
@@ -185,55 +196,4 @@ cmd_push() {
             exec "$0" --session "$session_name"
             ;;
     esac
-}
-
-_push_help() {
-    cat <<EOF
-Usage: claude-container push -s <session> [branch] [options]
-
-Push host changes into a container session (host → container).
-
-Arguments:
-  branch                   Source branch to push from (default: main)
-
-Options:
-  --session, -s <name>     Session name (required)
-  --repo <name>[,<branch>] Only push this repo, optionally from a specific branch.
-                           Name can be partial (e.g. 'synapse' matches 'org/synapse').
-  --as <branch>            Don't merge — just place host branch in container as <branch>.
-                           Agent in container can merge at its own pace.
-  --ff                     Fast-forward from host branch (default)
-  --merge                  Merge host branch into session
-  --rebase                 Rebase session onto host branch
-  --verify                 Preview what merge would do and confirm before proceeding
-  --dry-run                Preview only, don't execute
-  --force, -f              Force operation
-  --help, -h               Show this help
-
-Strategies (mutually exclusive):
-  --as <branch>      Place host branch in container without merging. The agent can
-                     then: git merge <branch>  (e.g. git merge host/main)
-  --ff (default)     Fetch + fast-forward. If diverged, shows all available options.
-  --merge            Merge upstream into session. Launches container if conflicts.
-  --rebase           Rebase session onto upstream. Launches container if conflicts.
-
-Examples:
-  # Fast-forward from main (default)
-  claude-container push -s myproj main
-
-  # Fast-forward from main (main is default branch)
-  claude-container push -s myproj
-
-  # Merge main into session (launches container if conflicts)
-  claude-container push -s myproj main --merge
-
-  # Rebase session onto main (launches container if conflicts)
-  claude-container push -s myproj main --rebase
-
-  # Push a single repo's main branch into session
-  claude-container push -s myproj --repo synapse,main
-
-  # Force-reset a single diverged repo
-  claude-container push -s myproj --repo synapse,main --force
-EOF
 }
