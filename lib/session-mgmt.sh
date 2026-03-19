@@ -3645,6 +3645,35 @@ session_repair() {
         warn "Session has a running container — some repairs may not take effect until restart"
     fi
 
+    # 8. Check for uncommitted changes in session repos
+    local _dirty_scan
+    _dirty_scan=$(docker run --rm --entrypoint sh \
+        -e HOME=/tmp \
+        -v "$volume:/session:ro" "$git_image" \
+        -c '
+            git config --global --add safe.directory "*"
+            for d in /session/*/ /session/*/*/; do
+                [ -d "$d/.git" ] || continue
+                name="${d#/session/}"; name="${name%/}"
+                count=$(cd "$d" && git status --porcelain 2>/dev/null | wc -l | tr -d " ")
+                [ "$count" -gt 0 ] && echo "$name|$count"
+            done
+        ' 2>/dev/null) || true
+
+    if [[ -n "$_dirty_scan" ]]; then
+        local _dirty_count=0
+        warn "Uncommitted changes detected (won't be extracted by pull):"
+        while IFS='|' read -r _dname _dcount; do
+            [[ -z "$_dname" ]] && continue
+            echo -e "    ${YELLOW}!${NC} ${_dname} — ${_dcount} file(s)"
+            _dirty_count=$((_dirty_count + 1))
+        done <<< "$_dirty_scan"
+        echo -e "  ${DIM}To commit: claude-container -s $session --bash-exec 'cd /workspace/<repo> && git add -A && git commit -m WIP'${NC}"
+        all_ok=false
+    else
+        success "No uncommitted changes"
+    fi
+
     echo ""
     if $all_ok; then
         success "Session '$session' is healthy"
