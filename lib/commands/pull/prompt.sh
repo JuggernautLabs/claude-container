@@ -16,6 +16,7 @@ _pull_discuss_prompt() {
     config_content=$(read_session_config "$volume")
     projects=""
     [[ -n "$config_content" ]] && projects=$(parse_session_projects "$config_content")
+    [[ -n "$repo_filter" ]] && projects=$(augment_projects_from_volume "$volume" "$projects" "$repo_filter")
 
     local prompt=""
     prompt+="You are reviewing a claude-container session merge."

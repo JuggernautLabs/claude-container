@@ -25,7 +25,11 @@ cmd_watch() {
                 shift 2
                 ;;
             --repo)
-                repo_filter="$2"
+                if [[ -n "$repo_filter" ]]; then
+                    repo_filter="${repo_filter},$2"
+                else
+                    repo_filter="$2"
+                fi
                 shift 2
                 ;;
             --interval|-i)
@@ -71,7 +75,7 @@ cmd_watch() {
     _heads=$(get_session_heads "$volume")
     while IFS='|' read -r _name _head; do
         [[ -z "$_name" ]] && continue
-        [[ -n "$repo_filter" && "$_name" != *"$repo_filter"* ]] && continue
+        repo_matches_filter "$_name" "$repo_filter" || continue
         _prev_heads[$_name]="$_head"
     done <<< "$_heads"
 
@@ -99,7 +103,7 @@ cmd_watch() {
 
         while IFS='|' read -r _name _head; do
             [[ -z "$_name" ]] && continue
-            [[ -n "$repo_filter" && "$_name" != *"$repo_filter"* ]] && continue
+            repo_matches_filter "$_name" "$repo_filter" || continue
 
             local _prev="${_prev_heads[$_name]:-}"
             if [[ "$_head" != "$_prev" ]]; then
@@ -123,7 +127,7 @@ cmd_watch() {
                 _heads=$(get_session_heads "$volume")
                 while IFS='|' read -r _name _head; do
                     [[ -z "$_name" ]] && continue
-                    [[ -n "$repo_filter" && "$_name" != *"$repo_filter"* ]] && continue
+                    repo_matches_filter "$_name" "$repo_filter" || continue
                     if [[ "$_head" != "${_prev_heads[$_name]:-}" ]]; then
                         _more=true
                         _prev_heads[$_name]="$_head"

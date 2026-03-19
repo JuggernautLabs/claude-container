@@ -366,6 +366,7 @@ _pull_reconcile() {
     # Exec back into claude-container to launch container for resolution
     info "Launching container for conflict resolution..."
     echo ""
+    export AGENT_TASK="resolve-conflicts"
     exec "$0" --session "$session_name" --auto-merge
 }
 

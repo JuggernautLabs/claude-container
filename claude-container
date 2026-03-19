@@ -870,6 +870,18 @@ fi
 # Pass session name for statusline display
 DOCKER_ARGS+=("-e" "CLAUDE_SESSION_NAME=$SESSION_NAME")
 
+# Agent abstraction layer env vars
+DOCKER_ARGS+=("-e" "AGENT_TASK=${AGENT_TASK:-work}")
+if [[ -n "${AGENT_CONTEXT:-}" ]]; then
+    DOCKER_ARGS+=("-e" "AGENT_CONTEXT=$AGENT_CONTEXT")
+fi
+
+# Mount entrypoint and agent-run scripts
+DOCKER_ARGS+=(
+    "-v" "$SCRIPT_DIR/lib/container/entrypoint.sh:/usr/local/bin/cc-entrypoint:ro"
+    "-v" "$SCRIPT_DIR/lib/container/agent-run.sh:/usr/local/bin/agent-run:ro"
+)
+
 # Pass through claude args if provided
 if [[ ${#CLAUDE_ARGS[@]} -gt 0 ]]; then
     # Serialize the array as a base64-encoded string to preserve spaces and special chars
@@ -959,239 +971,9 @@ if $USE_GIT_SESSION && ! $EPHEMERAL && [[ -n "$SESSION_NAME" ]]; then
     fi
 fi
 
-# Run container with entrypoint script (skip if reusing existing container)
+# Run container with mounted entrypoint (skip if reusing existing container)
 if ! $_CONTAINER_REUSED; then
-docker run "${DOCKER_ARGS[@]}" "$IMAGE_NAME" /bin/bash -c '
-    set -e
-
-    # Read token from securely mounted file OR from nested env var
-    if [[ -n "${CLAUDE_CODE_OAUTH_TOKEN_NESTED:-}" ]]; then
-        # Nested container mode - token passed via env var
-        export CLAUDE_CODE_OAUTH_TOKEN="$CLAUDE_CODE_OAUTH_TOKEN_NESTED"
-    elif [[ -f /run/secrets/claude_token ]]; then
-        # Normal mode - token mounted as file
-        export CLAUDE_CODE_OAUTH_TOKEN=$(cat /run/secrets/claude_token)
-    else
-        echo "ERROR: No token found (neither file nor env var)" >&2
-        exit 1
-    fi
-
-    HOST_UID=${HOST_UID:-1000}
-    DEV_GID=61000
-
-    # Set up overlayfs if requested
-    if [[ "${USE_OVERLAY:-}" == "1" ]]; then
-        echo "Setting up overlay filesystem..."
-        mkdir -p /session-data/upper /session-data/work
-        rmdir /workspace 2>/dev/null || rm -f /workspace 2>/dev/null || true
-        mkdir -p /workspace
-        if fuse-overlayfs \
-            -o lowerdir=/workspace-lower,upperdir=/session-data/upper,workdir=/session-data/work \
-            /workspace 2>&1; then
-            echo "  Overlay mounted at /workspace"
-        else
-            mount --bind /workspace-lower /workspace 2>/dev/null || ln -sf /workspace-lower /workspace
-            echo "  Fallback: direct mount, read-only"
-        fi
-        cd /workspace
-        echo ""
-    fi
-
-    # Set up home directory
-    mkdir -p /home/developer/.claude /home/developer/.cargo /home/developer/.npm /home/developer/.cache/pip
-
-    # Create .claude.json with settings
-    # Pre-accept trust dialog for /workspace and all subdirectories
-    # to avoid the "Is this a project you trust?" prompt
-    python3 << 'TRUSTPY' 2>/dev/null || echo '{"theme":"dark-ansi","hasCompletedOnboarding":true,"bypassPermissionsModeAccepted":true}' > /home/developer/.claude.json
-import json, glob, os
-projects = {"/workspace": {"hasTrustDialogAccepted": True}}
-for pattern in ["/workspace/*/", "/workspace/*/*/"]:
-    for d in glob.glob(pattern):
-        if os.path.isdir(os.path.join(d, ".git")):
-            projects[d.rstrip("/")] = {"hasTrustDialogAccepted": True}
-config = {
-    "theme": "dark-ansi",
-    "hasCompletedOnboarding": True,
-    "bypassPermissionsModeAccepted": True,
-    "projects": projects
-}
-with open("/home/developer/.claude.json", "w") as f:
-    json.dump(config, f)
-TRUSTPY
-
-    # Create settings.json with statusline showing session name
-    # Base64-encoded to avoid quoting issues (runs inside single-quoted bash -c)
-    echo "eyJzdGF0dXNMaW5lIjp7InR5cGUiOiJjb21tYW5kIiwiY29tbWFuZCI6ImlucHV0PSQoY2F0KTsgbW9kZWw9JChlY2hvIFwiJGlucHV0XCIgfCBqcSAtciAnLm1vZGVsLmRpc3BsYXlfbmFtZSAvLyAubW9kZWwuaWQgLy8gXCI/XCInIHwgdHIgJ1s6dXBwZXI6XScgJ1s6bG93ZXI6XScgfCB0ciAnICcgJy0nKTsgY29zdD0kKGVjaG8gXCIkaW5wdXRcIiB8IGpxIC1yICcuY29zdC50b3RhbF9jb3N0X3VzZCAvLyAwJyB8IHhhcmdzIHByaW50ZiAnJCUuMmYnKTsgb3ZlcjIwMGs9JChlY2hvIFwiJGlucHV0XCIgfCBqcSAtciAnLmV4Y2VlZHNfMjAwa190b2tlbnMnKTsgaWYgWyBcIiRvdmVyMjAwa1wiID0gXCJ0cnVlXCIgXTsgdGhlbiBjdHg9J+KaoO+4jz4yMDBrJzsgZWxzZSBjdHg9JzwyMDBrJzsgZmk7IGN3ZD0kKGVjaG8gXCIkaW5wdXRcIiB8IGpxIC1yICcud29ya3NwYWNlLmN1cnJlbnRfZGlyJyk7IGRpcj0kKGJhc2VuYW1lIFwiJGN3ZFwiKTsgY2QgXCIkY3dkXCIgMj4vZGV2L251bGwgfHwgdHJ1ZTsgYnJhbmNoPSQoZ2l0IHN5bWJvbGljLXJlZiAtLXNob3J0IEhFQUQgMj4vZGV2L251bGwpOyBkaXJ0eT0kKGdpdCBzdGF0dXMgLS1wb3JjZWxhaW4gMj4vZGV2L251bGwgfCBoZWFkIC0xKTsgaWYgWyAtbiBcIiRkaXJ0eVwiIF07IHRoZW4gbWFyaz0nKic7IGVsc2UgbWFyaz0nJzsgZmk7IHNlc3M9XCIke0NMQVVERV9TRVNTSU9OX05BTUU6LX1cIjsgaWYgWyAtbiBcIiRzZXNzXCIgXSAmJiBbIC1uIFwiJGJyYW5jaFwiIF07IHRoZW4gZWNobyBcIlskc2Vzc10gJG1vZGVsQCRkaXI6KCRicmFuY2gkbWFyaykgJGNvc3QgJGN0eFwiOyBlbGlmIFsgLW4gXCIkc2Vzc1wiIF07IHRoZW4gZWNobyBcIlskc2Vzc10gJG1vZGVsQCRkaXIgJGNvc3QgJGN0eFwiOyBlbGlmIFsgLW4gXCIkYnJhbmNoXCIgXTsgdGhlbiBlY2hvIFwiJG1vZGVsQCRkaXI6KCRicmFuY2gkbWFyaykgJGNvc3QgJGN0eFwiOyBlbHNlIGVjaG8gXCIkbW9kZWxAJGRpciAkY29zdCAkY3R4XCI7IGZpIn19Cg==" | base64 -d > /home/developer/.claude/settings.json
-
-    # Copy git config
-    if [[ -f /root/.gitconfig ]]; then
-        cp /root/.gitconfig /home/developer/.gitconfig 2>/dev/null || true
-    fi
-
-    # Check for docker CLI if socket is mounted
-    if [[ -S /var/run/docker.sock ]] && ! command -v docker &>/dev/null; then
-        echo "WARNING: docker socket mounted but docker CLI not found"
-        echo "         Use --dockerfile to build an image with docker"
-    fi
-
-    if [[ "${RUN_AS_USER:-}" == "1" ]] || [[ "${RUN_AS_ROOTISH:-}" == "1" ]]; then
-        groupadd -g $DEV_GID developer 2>/dev/null || true
-        useradd -u $HOST_UID -g $DEV_GID -m -s /bin/bash developer 2>/dev/null || true
-        chown -R developer:developer /home/developer
-        chown developer:developer /workspace 2>/dev/null || true
-
-        # Make docker socket accessible if mounted
-        if [[ -S /var/run/docker.sock ]]; then
-            chmod 666 /var/run/docker.sock 2>/dev/null || true
-        fi
-
-        if [[ "${RUN_AS_ROOTISH:-}" == "1" ]]; then
-            if ! command -v sudo &>/dev/null; then
-                echo "WARNING: sudo not found - rootish mode requires sudo in the image"
-                echo "         Use --dockerfile to build an image with sudo, or use --as-root"
-            else
-                # Configure passwordless sudo for developer user
-                echo "developer ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/developer
-                chmod 0440 /etc/sudoers.d/developer
-
-                # Create rootish wrapper that uses sudo
-                cat > /usr/local/bin/rootish << '\''WRAPPER'\''
-#!/bin/bash
-exec sudo "$@"
-WRAPPER
-                chmod +x /usr/local/bin/rootish
-            fi
-        fi
-    fi
-
-    # Install fin command for merge-into / reconcile session completion
-    cat > /usr/local/bin/fin << '\''FINSCRIPT'\''
-#!/bin/bash
-if [[ $# -eq 0 ]]; then
-    echo "Usage: fin <description>"
-    echo "Signals completion of conflict resolution and terminates the session."
-    exit 1
-fi
-echo "$*" > /workspace/.reconcile-complete
-echo ""
-echo "Session complete: $*"
-kill 1
-FINSCRIPT
-    chmod +x /usr/local/bin/fin
-
-    # Verify mode
-    if [[ "${VERIFY_MODE:-}" == "1" ]]; then
-        echo "=== Verification ==="
-        echo "Run as: $(if [[ "${RUN_AS_ROOTISH:-}" == "1" ]]; then echo "developer (sudo)"; elif [[ "${RUN_AS_USER:-}" == "1" ]]; then echo "developer"; else echo "root"; fi)"
-        echo "Claude: $(which claude 2>&1)"
-        echo "Platform: ${PLATFORM:-unknown}"
-
-        echo ""
-        echo "=== Token Check ==="
-        if [[ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]]; then
-            if [[ -f /run/secrets/claude_token ]]; then
-                echo "  Token source: file"
-            elif [[ -n "${CLAUDE_CODE_OAUTH_TOKEN_NESTED:-}" ]]; then
-                echo "  Token source: nested env var"
-            else
-                echo "  Token source: environment"
-            fi
-            echo "  Token: ${CLAUDE_CODE_OAUTH_TOKEN:0:20}..."
-        else
-            echo "  Token missing"
-            exit 1
-        fi
-
-        echo ""
-        echo "=== Claude Test ==="
-        HOME=/home/developer claude --print "test" 2>&1 | head -5
-        exit 0
-    fi
-
-    # Determine working directory (main project if specified, otherwise /workspace)
-    WORK_DIR="/workspace"
-    if [[ -f /workspace/.main-project ]]; then
-        MAIN_PROJ=$(cat /workspace/.main-project)
-        if [[ -d "/workspace/$MAIN_PROJ" ]]; then
-            WORK_DIR="/workspace/$MAIN_PROJ"
-        fi
-    fi
-
-    # Shell-only mode - just run bash in working directory
-    if [[ "${SHELL_ONLY:-}" == "1" ]]; then
-        if [[ "${RUN_AS_USER:-}" == "1" ]] || [[ "${RUN_AS_ROOTISH:-}" == "1" ]]; then
-            exec gosu developer bash -c "export CLAUDE_CODE_OAUTH_TOKEN='\''$CLAUDE_CODE_OAUTH_TOKEN'\'' && cd $WORK_DIR && exec bash"
-        else
-            exec bash -c "cd $WORK_DIR && exec bash"
-        fi
-    fi
-
-    # Bash exec mode - run command and exit
-    if [[ -n "${BASH_EXEC:-}" ]]; then
-        cd $WORK_DIR
-        if [[ "${RUN_AS_USER:-}" == "1" ]] || [[ "${RUN_AS_ROOTISH:-}" == "1" ]]; then
-            exec gosu developer bash -c "$BASH_EXEC"
-        else
-            exec bash -c "$BASH_EXEC"
-        fi
-    fi
-
-    # Build claude command arguments
-    CLAUDE_CMD_ARGS=""
-
-    # Add permission flag if running as user
-    if [[ "${RUN_AS_USER:-}" == "1" ]] || [[ "${RUN_AS_ROOTISH:-}" == "1" ]]; then
-        CLAUDE_CMD_ARGS="--dangerously-skip-permissions"
-    fi
-
-    # Add --continue if requested
-    if [[ "${CONTINUE_SESSION:-}" == "1" ]]; then
-        CLAUDE_CMD_ARGS="--continue $CLAUDE_CMD_ARGS"
-    fi
-
-    # Add passthrough args if provided
-    if [[ -n "${CLAUDE_PASSTHROUGH_ARGS:-}" ]]; then
-        # Decode the base64-encoded args
-        PASSTHROUGH_DECODED=$(echo "$CLAUDE_PASSTHROUGH_ARGS" | base64 -d 2>/dev/null || echo "$CLAUDE_PASSTHROUGH_ARGS" | base64 -D 2>/dev/null)
-        # Append each arg (properly quoted for arguments with spaces)
-        while IFS= read -r arg; do
-            if [[ -n "$arg" ]]; then
-                # Quote the argument if it contains spaces
-                if [[ "$arg" =~ \  ]]; then
-                    CLAUDE_CMD_ARGS="$CLAUDE_CMD_ARGS \"$arg\""
-                else
-                    CLAUDE_CMD_ARGS="$CLAUDE_CMD_ARGS $arg"
-                fi
-            fi
-        done <<< "$PASSTHROUGH_DECODED"
-    fi
-
-    # Check for merge-into or sync summary to use as initial prompt
-    CLAUDE_INITIAL_PROMPT=""
-    if [[ -f /workspace/.merge-into-summary ]]; then
-        CLAUDE_INITIAL_PROMPT=$(cat /workspace/.merge-into-summary)
-        rm -f /workspace/.merge-into-summary
-    elif [[ -f /workspace/.sync-summary ]]; then
-        CLAUDE_INITIAL_PROMPT=$(cat /workspace/.sync-summary)
-        rm -f /workspace/.sync-summary
-    fi
-
-    cd $WORK_DIR
-    if [[ -n "$CLAUDE_INITIAL_PROMPT" ]]; then
-        # Write prompt to temp file to avoid shell quoting issues
-        echo "$CLAUDE_INITIAL_PROMPT" > /tmp/.claude-initial-prompt
-        if [[ "${RUN_AS_USER:-}" == "1" ]] || [[ "${RUN_AS_ROOTISH:-}" == "1" ]]; then
-            exec gosu developer bash -c "claude $CLAUDE_CMD_ARGS \"\$(cat /tmp/.claude-initial-prompt)\""
-        else
-            exec bash -c "HOME=/home/developer claude $CLAUDE_CMD_ARGS \"\$(cat /tmp/.claude-initial-prompt)\""
-        fi
-    elif [[ "${RUN_AS_USER:-}" == "1" ]] || [[ "${RUN_AS_ROOTISH:-}" == "1" ]]; then
-        exec gosu developer bash -c "claude $CLAUDE_CMD_ARGS"
-    else
-        exec bash -c "HOME=/home/developer claude $CLAUDE_CMD_ARGS"
-    fi
-'
+docker run "${DOCKER_ARGS[@]}" "$IMAGE_NAME" /bin/bash -c 'chmod +x /usr/local/bin/cc-entrypoint /usr/local/bin/agent-run 2>/dev/null; exec /usr/local/bin/cc-entrypoint'
 fi  # end: if ! $_CONTAINER_REUSED
 
 # Session exit message
@@ -1200,8 +982,93 @@ if $USE_GIT_SESSION; then
     [[ -n "$SESSION_NAME" && -f "$SESSIONS_CONFIG_DIR/${SESSION_NAME}.env" ]] && \
         touch "$SESSIONS_CONFIG_DIR/${SESSION_NAME}.env"
     echo ""
-    info "Session complete: $SESSION_NAME"
+
+    # Read agent result from volume (written by agent-run.sh)
+    _AGENT_RESULT=$(docker run --rm -v "$GIT_SESSION_VOLUME:/session:ro" "$IMAGE_NAME" \
+        cat /session/.agent-result 2>/dev/null || echo "")
+
+    # Display structured exit report
+    _agent_exit_report() {
+        local task="${AGENT_TASK:-work}"
+        local session="$SESSION_NAME"
+
+        if [[ -z "$_AGENT_RESULT" ]]; then
+            # No agent result file — agent made no commits or was shell/exec mode
+            echo "──────────────────────────────────────────────────"
+            echo "· Agent exited without changes"
+            if [[ "$task" == "resolve-conflicts" || "$task" == "rebase-conflicts" ]]; then
+                # Count expected repos from config
+                local _expected_repos=""
+                _expected_repos=$(docker run --rm -v "$GIT_SESSION_VOLUME:/session:ro" "$IMAGE_NAME" \
+                    sh -c 'ls -d /session/*/.git 2>/dev/null | wc -l' || echo "?")
+                echo "  Expected: resolve conflicts in ${_expected_repos} repo(s)"
+            fi
+            echo "──────────────────────────────────────────────────"
+        else
+            # Parse agent result
+            local _changed=0
+            local _unchanged=0
+            local _total_commits=0
+
+            if [[ "$task" == "resolve-conflicts" || "$task" == "rebase-conflicts" ]]; then
+                echo "─────────── session: $session ──────────────────────"
+            else
+                echo "→ Session complete: $session"
+            fi
+            echo ""
+
+            while IFS='|' read -r _repo _count _head; do
+                [[ "$_repo" == "---" ]] && break
+                [[ -z "$_repo" ]] && continue
+                if [[ "$_count" -gt 0 ]] 2>/dev/null; then
+                    if [[ "$task" == "resolve-conflicts" || "$task" == "rebase-conflicts" ]]; then
+                        echo "  $_repo"
+                        echo "    ✓ $_count commits (resolved conflicts)"
+                    else
+                        echo "  $_repo"
+                        echo "    $_count commits during session"
+                    fi
+                    _changed=$((_changed + 1))
+                    _total_commits=$((_total_commits + _count))
+                fi
+            done <<< "$_AGENT_RESULT"
+
+            # Show unchanged repos for conflict resolution tasks
+            if [[ "$task" == "resolve-conflicts" || "$task" == "rebase-conflicts" ]]; then
+                while IFS='|' read -r _repo _count _head; do
+                    [[ "$_repo" == "---" ]] && break
+                    [[ -z "$_repo" ]] && continue
+                done <<< "$_AGENT_RESULT"
+                # List repos that had no changes (need to enumerate workspace repos)
+                local _all_repos
+                _all_repos=$(docker run --rm -v "$GIT_SESSION_VOLUME:/session:ro" "$IMAGE_NAME" \
+                    sh -c 'for d in /session/*/; do [ -d "$d/.git" ] && basename "$d"; done' 2>/dev/null || echo "")
+                while IFS= read -r _ws_repo; do
+                    [[ -z "$_ws_repo" ]] && continue
+                    if ! echo "$_AGENT_RESULT" | grep -q "^${_ws_repo}|"; then
+                        echo "  $_ws_repo"
+                        echo "    · no changes"
+                        _unchanged=$((_unchanged + 1))
+                    fi
+                done <<< "$_all_repos"
+            fi
+
+            echo ""
+            echo "──────────────────────────────────────────────────"
+            if [[ "$task" == "resolve-conflicts" || "$task" == "rebase-conflicts" ]]; then
+                echo "✓ $_changed resolved, $_unchanged unchanged"
+            else
+                echo "$_total_commits commits across $_changed repo(s)"
+            fi
+        fi
+    }
+
+    _agent_exit_report
     echo ""
+
+    # Clean up agent result from volume
+    docker run --rm -v "$GIT_SESSION_VOLUME:/session" "$IMAGE_NAME" \
+        rm -f /session/.agent-result 2>/dev/null || true
 
     # Check if this was a sync session
     SYNC_BRANCH_CHECK=$(docker run --rm -v "$GIT_SESSION_VOLUME:/session:ro" "$IMAGE_NAME" \
@@ -1340,7 +1207,6 @@ if $USE_GIT_SESSION; then
             exec "$0" reconcile --continue
         fi
     else
-        echo "To pull changes to host:"
-        echo "  claude-container pull -s $SESSION_NAME"
+        echo "To pull: claude-container pull -s $SESSION_NAME"
     fi
 fi

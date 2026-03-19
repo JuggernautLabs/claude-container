@@ -382,6 +382,7 @@ _reconcile_process_next() {
 
         # Conflicts/dirty — exec into container for Claude to resolve
         # The exit handler will: extract, auto-merge, then exec reconcile --continue
+        export AGENT_TASK="resolve-conflicts"
         exec "$0" --session "$session_name" --auto-merge
         # exec replaces process — no code runs after this
     fi
