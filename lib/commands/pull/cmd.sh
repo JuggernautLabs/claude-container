@@ -148,21 +148,26 @@ cmd_pull() {
     fi
 
     # Extract-only --verify: show status preview and confirm before extracting
+    # Skip prompt when non-interactive (e.g. called from watch)
     if $verify && [[ -z "$branch" ]]; then
         _pull_status "$session_name" "$repo_filter"
-        echo ""
-        printf "Extract session branches to host? [y/N] "
-        local _ext_answer
-        read -r _ext_answer
-        case "$_ext_answer" in
-            [yY]|[yY][eE][sS])
-                info "Extracting..."
-                ;;
-            *)
-                info "Aborted."
-                return 0
-                ;;
-        esac
+        if $_PULL_STATUS_HAS_CHANGES && [[ -t 0 ]]; then
+            echo ""
+            printf "Extract session branches to host? [y/N] "
+            local _ext_answer
+            read -r _ext_answer
+            case "$_ext_answer" in
+                [yY]|[yY][eE][sS])
+                    info "Extracting..."
+                    ;;
+                *)
+                    info "Aborted."
+                    return 0
+                    ;;
+            esac
+        elif ! $_PULL_STATUS_HAS_CHANGES; then
+            return 0
+        fi
     fi
 
     # Extract session branches to host repos
