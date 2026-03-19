@@ -14,6 +14,7 @@ info() { echo -e "${BLUE}→${NC} $*" >&2; }
 success() { echo -e "${GREEN}✓${NC} $*" >&2; }
 warn() { echo -e "${YELLOW}⚠${NC} $*" >&2; }
 error() { echo -e "${RED}✗${NC} $*" >&2; }
+note() { echo -e "${DIM}· $*${NC}" >&2; }
 
 # Match a repo name against a comma-separated filter list (partial match).
 # Usage: repo_matches_filter <repo_name> <filter>

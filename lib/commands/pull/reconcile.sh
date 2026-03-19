@@ -200,13 +200,13 @@ _pull_reconcile_preview() {
             done <<< "$_ahead_log"
 
             if [[ $_rc_external -gt 0 ]]; then
-                echo -e "    ${YELLOW}! ${target_branch} has ${_target_ahead} commit(s) not in session:${NC}"
+                echo -e "    ${DIM}· ${target_branch} has ${_target_ahead} commit(s) not in session:${NC}"
                 while IFS= read -r _ahead_line; do
                     [[ -n "$_ahead_line" ]] && echo "      $_ahead_line"
                 done <<< "$_ahead_log"
                 local _risk_stat
                 _risk_stat=$(git -C "$proj_path" diff --stat "$session_name".."$target_branch" 2>/dev/null | tail -1)
-                [[ -n "$_risk_stat" ]] && echo -e "      ${YELLOW}$_risk_stat${NC}"
+                [[ -n "$_risk_stat" ]] && echo -e "      ${DIM}$_risk_stat${NC}"
             else
                 local _rc_squash_stat
                 _rc_squash_stat=$(git -C "$proj_path" diff --stat "$session_name".."$target_branch" 2>/dev/null | tail -1)

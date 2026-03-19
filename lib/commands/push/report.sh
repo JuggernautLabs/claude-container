@@ -19,6 +19,7 @@ _push_report() {
 
     local projects
     projects=$(parse_session_projects "$config_content")
+    [[ -n "$repo_filter" ]] && projects=$(augment_projects_from_volume "$volume" "$projects" "$repo_filter")
 
     # Get post-merge session state
     local _util_image="${GIT_UTIL_IMAGE:-alpine/git}"
@@ -66,7 +67,7 @@ _push_report() {
             echo -e "  ${GREEN}✓${NC} $proj_name  ${DIM}session:${_post_head}${NC}"
             _merged=$((_merged + 1))
         else
-            echo -e "  ${YELLOW}!${NC} $proj_name  ${DIM}$_still_ahead commit(s) still ahead${NC}"
+            echo -e "  ${DIM}·${NC} $proj_name  ${DIM}$_still_ahead commit(s) still ahead${NC}"
             _skipped=$((_skipped + 1))
         fi
     done <<< "$projects"

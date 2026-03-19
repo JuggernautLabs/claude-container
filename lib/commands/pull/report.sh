@@ -243,13 +243,13 @@ _pull_report() {
                 done <<< "$_rpt_ahead_log"
 
                 if [[ $_rpt_external -gt 0 ]]; then
-                    echo -e "    ${YELLOW}note: ${target_branch} is ${_rpt_target_ahead} commit(s) ahead of session:${NC}"
+                    echo -e "    ${DIM}note: ${target_branch} is ${_rpt_target_ahead} commit(s) ahead of session:${NC}"
                     while IFS= read -r _rpt_line; do
                         [[ -n "$_rpt_line" ]] && echo "      $_rpt_line"
                     done <<< "$_rpt_ahead_log"
                     local _rpt_risk_stat
                     _rpt_risk_stat=$(git -C "$_rpt_proj_path" diff --stat "$session_name".."$target_branch" 2>/dev/null | tail -1)
-                    [[ -n "$_rpt_risk_stat" ]] && echo -e "      ${YELLOW}$_rpt_risk_stat${NC}"
+                    [[ -n "$_rpt_risk_stat" ]] && echo -e "      ${DIM}$_rpt_risk_stat${NC}"
                     echo -e "    ${DIM}→ claude-container push -s ${session_name} ${target_branch} --merge  (sync session)${NC}"
                     _target_ahead_count=$((_target_ahead_count + 1))
                 else
@@ -297,7 +297,7 @@ _pull_report() {
         fi
     fi
     if [[ $_target_ahead_count -gt 0 ]]; then
-        echo -e "${YELLOW}${target_branch} is ahead of session in ${_target_ahead_count} repo(s) — consider 'claude-container push -s ${session_name} ${target_branch} --merge'${NC}"
+        echo -e "${DIM}${target_branch} is ahead of session in ${_target_ahead_count} repo(s) — consider 'claude-container push -s ${session_name} ${target_branch} --merge'${NC}"
     fi
     if [[ $_unchanged -gt 0 ]]; then
         echo -e "${DIM}$_unchanged repo(s) unchanged — no modifications${NC}"
