@@ -196,6 +196,7 @@ _push_preview() {
 
     if [[ ${#_needs_merge[@]} -eq 0 && ${#_problem_repos[@]} -eq 0 ]]; then
         info "Nothing to merge — session is up to date with '$target_branch'"
+        return 1
     fi
 
     # Warn about --repo filter terms that matched nothing

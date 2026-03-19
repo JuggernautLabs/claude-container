@@ -124,7 +124,9 @@ cmd_push() {
             fi
 
             if $verify; then
-                _push_preview "$session_name" "$refresh_branch" "$repo_filter"
+                if ! _push_preview "$session_name" "$refresh_branch" "$repo_filter"; then
+                    return 0
+                fi
 
                 if $discuss; then
                     echo ""
@@ -163,7 +165,9 @@ cmd_push() {
             local merge_branch="${branch:-main}"
 
             if $dry_run || $verify; then
-                _push_preview "$session_name" "$merge_branch" "$repo_filter"
+                if ! _push_preview "$session_name" "$merge_branch" "$repo_filter"; then
+                    return 0
+                fi
                 if $dry_run; then
                     return 0
                 fi
@@ -213,6 +217,7 @@ cmd_push() {
                 # Conflicts — launch container for Claude
                 echo ""
                 warn "Merge has conflicts — launching container for Claude to resolve."
+                export AGENT_TASK="resolve-conflicts"
                 exec "$0" --session "$session_name" --auto-merge
             fi
 
@@ -226,6 +231,7 @@ cmd_push() {
             session_sync "$session_name" "$rebase_branch"
             # session_sync stores .sync-branch marker and returns to main script
             # for container startup (conflicts need Claude). Exec back.
+            export AGENT_TASK="rebase-conflicts"
             exec "$0" --session "$session_name"
             ;;
     esac
