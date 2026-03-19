@@ -1,6 +1,47 @@
 #!/usr/bin/env bash
 # Pull report — reads result files and renders per-repo output
 
+# Check for --repo filter terms that matched no git repos.
+# Distinguishes "exists but not a git repo" from "not found at all."
+_check_unmatched_filters() {
+    local repo_filter="$1"
+    local volume="$2"
+    shift 2
+    local -a all_repos=("$@")
+
+    local _vol_dirs=""
+    local IFS=','
+    for _fterm in $repo_filter; do
+        local _fmatched=false
+        for _fname in "${all_repos[@]}"; do
+            if [[ "$_fname" == *"$_fterm"* ]]; then
+                _fmatched=true
+                break
+            fi
+        done
+        if ! $_fmatched; then
+            # Check if directory exists in volume but isn't a git repo
+            if [[ -z "$_vol_dirs" ]]; then
+                _vol_dirs=$(docker run --rm -v "$volume:/session:ro" alpine sh -c \
+                    'for d in /session/*/ /session/*/*/; do [ -d "$d" ] && echo "${d#/session/}"; done' 2>/dev/null || true)
+            fi
+            local _dir_exists=false
+            while IFS= read -r _vd; do
+                [[ -z "$_vd" ]] && continue
+                if [[ "$_vd" == *"$_fterm"* ]]; then
+                    _dir_exists=true
+                    break
+                fi
+            done <<< "$_vol_dirs"
+            if $_dir_exists; then
+                warn "'$_fterm' exists in session but is not a git repo"
+            else
+                warn "no repo matching '$_fterm' found in session"
+            fi
+        fi
+    done
+}
+
 # Unified pull report — reads result files and renders per-repo output
 # Usage: _pull_report <session_name> <branch> <result_dir> [repo_filter]
 _pull_report() {
@@ -222,19 +263,7 @@ _pull_report() {
                     [[ -n "$_apname" ]] && _all_session_repos+=("$_apname")
                 done <<< "$projects"
             fi
-            local IFS=','
-            for _fterm in $repo_filter; do
-                local _fmatched=false
-                for _fname in "${_all_session_repos[@]}"; do
-                    if [[ "$_fname" == *"$_fterm"* ]]; then
-                        _fmatched=true
-                        break
-                    fi
-                done
-                if ! $_fmatched; then
-                    warn "no repo matching '$_fterm' found in session"
-                fi
-            done
+            _check_unmatched_filters "$repo_filter" "$volume" "${_all_session_repos[@]}"
         fi
         return 0
     fi
@@ -325,18 +354,6 @@ _pull_report() {
                 [[ -n "$_apname" ]] && _all_session_repos+=("$_apname")
             done <<< "$projects"
         fi
-        local IFS=','
-        for _fterm in $repo_filter; do
-            local _fmatched=false
-            for _fname in "${_all_session_repos[@]}"; do
-                if [[ "$_fname" == *"$_fterm"* ]]; then
-                    _fmatched=true
-                    break
-                fi
-            done
-            if ! $_fmatched; then
-                warn "no repo matching '$_fterm' found in session"
-            fi
-        done
+        _check_unmatched_filters "$repo_filter" "$volume" "${_all_session_repos[@]}"
     fi
 }

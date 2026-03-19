@@ -3668,7 +3668,7 @@ session_repair() {
             echo -e "    ${YELLOW}!${NC} ${_dname} — ${_dcount} file(s)"
             _dirty_count=$((_dirty_count + 1))
         done <<< "$_dirty_scan"
-        echo -e "  ${DIM}To commit: claude-container -s $session --bash-exec 'cd /workspace/<repo> && git add -A && git commit -m WIP'${NC}"
+        echo -e "  ${DIM}Use: claude-container -s $session --shell  (then git add/commit in each repo)${NC}"
         all_ok=false
     else
         success "No uncommitted changes"
