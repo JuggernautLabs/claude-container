@@ -147,6 +147,24 @@ cmd_pull() {
         promote_discovered_repos "$_disc_volume" "$_promo_cfg" "$repo_filter"
     fi
 
+    # Extract-only --verify: show status preview and confirm before extracting
+    if $verify && [[ -z "$branch" ]]; then
+        _pull_status "$session_name" "$repo_filter"
+        echo ""
+        printf "Extract session branches to host? [y/N] "
+        local _ext_answer
+        read -r _ext_answer
+        case "$_ext_answer" in
+            [yY]|[yY][eE][sS])
+                info "Extracting..."
+                ;;
+            *)
+                info "Aborted."
+                return 0
+                ;;
+        esac
+    fi
+
     # Extract session branches to host repos
     local extract_args=("$session_name")
     if $force; then
