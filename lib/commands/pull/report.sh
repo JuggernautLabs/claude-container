@@ -244,10 +244,6 @@ _pull_report() {
     echo ""
     _rule
 
-    if [[ $_target_ahead_count -gt 0 ]]; then
-        echo -e "${DIM}${target_branch} ahead in ${_target_ahead_count} repo(s) — push --merge to sync${NC}"
-    fi
-
     # Warn about --repo filter terms that matched nothing
     if [[ -n "$repo_filter" ]]; then
         local IFS=','

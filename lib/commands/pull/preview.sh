@@ -244,6 +244,35 @@ _verify_diffstat() {
     if [[ $_total_files -gt 0 ]]; then
         info "Total: $_total_files file(s), +$_total_adds -$_total_dels"
     fi
+
+    # Target-ahead hint (after diffs, where user will see it last)
+    if [[ -n "$result_dir" ]]; then
+        local _ta_count=0
+        for _rfile in "$result_dir"/*; do
+            [[ -f "$_rfile" ]] || continue
+            [[ "$_rfile" == *.detail ]] && continue
+            local _ta_val
+            _ta_val=$(grep "^target_ahead=" "$_rfile" 2>/dev/null | tail -1 | cut -d= -f2-)
+            [[ -z "$_ta_val" || "$_ta_val" == "0" ]] && continue
+            # Check if non-benign (has external commits)
+            local _ta_repo_name
+            _ta_repo_name=$(grep "^repo_name=" "$_rfile" 2>/dev/null | tail -1 | cut -d= -f2-)
+            local _ta_path
+            _ta_path=$(echo "$projects" | grep "^${_ta_repo_name}|" | head -1 | cut -d'|' -f2)
+            if [[ -n "$_ta_path" && -d "$_ta_path" ]]; then
+                local _ta_ext=0
+                while IFS= read -r _ta_line; do
+                    [[ -z "$_ta_line" ]] && continue
+                    echo "$_ta_line" | grep -qE "^[0-9a-f]+ ${session_name} → " || _ta_ext=$((_ta_ext + 1))
+                done <<< "$(git -C "$_ta_path" log --oneline "$session_name".."$target_branch" 2>/dev/null | head -5)"
+                [[ $_ta_ext -gt 0 ]] && _ta_count=$((_ta_count + 1))
+            fi
+        done
+        if [[ $_ta_count -gt 0 ]]; then
+            echo -e "${DIM}${target_branch} ahead in ${_ta_count} repo(s) — push --merge to sync${NC}"
+        fi
+    fi
+
     # Return total files so caller can skip prompt if 0
     return $(( _total_files > 0 ? 0 : 1 ))
 }
