@@ -203,12 +203,6 @@ while [[ $# -gt 0 ]]; do
             ;;
 
         # Session management actions (use with --session)
-        # Note: --extract, --sync, --refresh, --merge-into are deprecated in favor of push/pull/status subcommands
-        --extract)
-            warn "Deprecated: use 'pull' subcommand instead (e.g., 'claude-container pull -s <session>')"
-            _set_action "extract"
-            shift
-            ;;
         --delete)
             _set_action "delete"
             shift
@@ -226,32 +220,8 @@ while [[ $# -gt 0 ]]; do
             IMPORT_SOURCE="$2"
             shift 2
             ;;
-        --sync)
-            warn "Deprecated: use 'push --rebase' instead (e.g., 'claude-container push -s <session> ${2:-main} --rebase')"
-            _set_action "sync"
-            SYNC_BRANCH="${2:-main}"
-            shift 2
-            ;;
-        --refresh)
-            warn "Deprecated: use 'push' subcommand instead (e.g., 'claude-container push -s <session> [branch]')"
-            _set_action "refresh"
-            # Optional branch argument (default: session name)
-            if [[ -n "${2:-}" ]] && [[ ! "$2" =~ ^- ]]; then
-                REFRESH_BRANCH="$2"
-                shift 2
-            else
-                REFRESH_BRANCH=""
-                shift
-            fi
-            ;;
         --from)
             FROM_BRANCH="$2"
-            shift 2
-            ;;
-        --merge-into)
-            warn "Deprecated: use 'push --merge' instead (e.g., 'claude-container push -s <session> $2 --merge')"
-            _set_action "merge-into"
-            MERGE_INTO_BRANCH="$2"
             shift 2
             ;;
         --auto-merge)
@@ -287,10 +257,6 @@ while [[ $# -gt 0 ]]; do
             ;;
 
         # Actions without session requirement
-        --sessions|--list-sessions)
-            _set_action "list"
-            shift
-            ;;
         --cleanup)
             _set_action "cleanup"
             shift
@@ -397,14 +363,6 @@ Session Management (use with -s <session>):
   --clone-from <session>   Clone all volumes from existing session
   --remove-undiscovered    With push --discover-repos: remove stale repos
 
-  Deprecated (use push/pull/status subcommands instead):
-  --extract                → pull
-  --sync <branch>          → push <branch> --rebase
-  --refresh [branch]       → push [branch]
-  --merge-into <branch>    → push <branch> --merge
-  --sessions               → list
-  --auto-merge [branch]    Use with pull <branch> instead
-
   Modifiers: --force/-f, --yes/-y, --regex/-r
 
 Global Commands (no session required):
@@ -466,10 +424,6 @@ done
 
 # Handle actions that don't require a session
 case "$ACTION" in
-    list)
-        session_list
-        exit 0
-        ;;
     cleanup)
         session_cleanup
         exit 0
@@ -488,14 +442,6 @@ if [[ -n "$ACTION" ]]; then
     fi
 
     case "$ACTION" in
-        extract)
-            $ACTION_FORCE && session_extract "$SESSION_NAME" --force || session_extract "$SESSION_NAME"
-            if $AUTO_MERGE; then
-                echo ""
-                session_auto_merge "$SESSION_NAME" "${AUTO_MERGE_BRANCH:-main}"
-            fi
-            exit 0
-            ;;
         delete)
             delete_args=("$SESSION_NAME")
             $ACTION_REGEX && delete_args+=(--regex)
@@ -518,22 +464,6 @@ if [[ -n "$ACTION" ]]; then
             fi
             $ACTION_FORCE && session_import "$IMPORT_SOURCE" "$SESSION_NAME" --force || session_import "$IMPORT_SOURCE" "$SESSION_NAME"
             exit 0
-            ;;
-        sync)
-            session_sync "$SESSION_NAME" "$SYNC_BRANCH"
-            # Note: doesn't exit - continues to container startup
-            ;;
-        refresh)
-            session_refresh "$SESSION_NAME" "${REFRESH_BRANCH:-$SESSION_NAME}"
-            # Note: doesn't exit - continues to container startup
-            ;;
-        merge-into)
-            if ! session_merge_into "$SESSION_NAME" "$MERGE_INTO_BRANCH"; then
-                # Nothing for Claude to resolve — extract and exit
-                session_extract "$SESSION_NAME" --force
-                exit 0
-            fi
-            # Has conflicts/dirty — continues to container startup
             ;;
     esac
 fi
