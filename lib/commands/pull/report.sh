@@ -44,9 +44,6 @@ _pull_report() {
         [[ -f "$_rfile" ]] || continue
         [[ "$_rfile" == *.detail ]] && continue
         local _rname
-        _rname=$(_pull_result_get "$result_dir" "$(basename "$_rfile")" "repo_name" 2>/dev/null)
-        # repo_name might be stored with slashes, but file uses underscores
-        # Read it directly from the file
         _rname=$(grep "^repo_name=" "$_rfile" 2>/dev/null | tail -1 | cut -d= -f2-)
         [[ -z "$_rname" ]] && continue
         if [[ -z "${_repo_seen[$_rname]:-}" ]]; then
@@ -54,6 +51,16 @@ _pull_report() {
             _repo_seen[$_rname]=1
         fi
     done
+
+    # Header
+    if [[ -n "$target_branch" ]]; then
+        _rule "pull: ${session_name} → ${target_branch}"
+    else
+        _rule "pull: ${session_name}"
+    fi
+    echo ""
+
+    local _first_repo=true
 
     for _repo in "${_repo_names[@]}"; do
         local _ext_status _ext_commits _ext_files _ext_detail
@@ -69,8 +76,10 @@ _pull_report() {
 
         # Never hide discovered repos — always show them with actionable hint
         if [[ "$_ext_status" == "discovered" ]]; then
+            $_first_repo || echo ""
+            _first_repo=false
             echo -e "  ${BLUE}$_repo${NC}"
-            echo -e "    extract:  ${YELLOW}○${NC} new in session (not extracted)"
+            echo -e "    extract   ${YELLOW}○${NC} new in session (not extracted)"
             echo -e "    ${DIM}→ claude-container pull -s ${session_name} --extract --repo ${_repo##*/}${NC}"
             continue
         fi
@@ -126,22 +135,25 @@ _pull_report() {
         _container_head=$(_pull_result_get "$result_dir" "$_repo" "container_head")
         _session_head=$(_pull_result_get "$result_dir" "$_repo" "session_head")
         _target_head=$(_pull_result_get "$result_dir" "$_repo" "target_head")
-        local _short_container="${_container_head:0:7}"
         local _short_session="${_session_head:0:7}"
         local _short_target="${_target_head:0:7}"
 
-        # Render repo header with hashes (collapse container/session when identical)
-        local _hash_info=""
-        if [[ -n "$_container_head" && -n "$_session_head" && "$_container_head" == "$_session_head" ]]; then
-            _hash_info="  session:${_short_session}"
-        else
-            [[ -n "$_container_head" ]] && _hash_info="  container:${_short_container}"
-            [[ -n "$_session_head" ]] && _hash_info="${_hash_info}  session:${_short_session}"
-        fi
+        # Blank line between repos
+        $_first_repo || echo ""
+        _first_repo=false
+
+        # Repo name
+        echo -e "  ${BLUE}$_repo${NC}"
+
+        # Hashes on their own dim line
+        local _hash_parts=()
+        [[ -n "$_session_head" ]] && _hash_parts+=("session:${_short_session}")
         if [[ -n "$_target_head" && -n "$target_branch" ]]; then
-            _hash_info="${_hash_info}  ${target_branch}:${_short_target}"
+            _hash_parts+=("${target_branch}:${_short_target}")
         fi
-        echo -e "  ${BLUE}$_repo${NC}${_hash_info}"
+        if [[ ${#_hash_parts[@]} -gt 0 ]]; then
+            echo -e "    ${DIM}${_hash_parts[*]}${NC}"
+        fi
 
         # Extract line
         case "$_ext_status" in
@@ -149,32 +161,32 @@ _pull_report() {
                 local _ext_info=""
                 [[ -n "$_ext_commits" && "$_ext_commits" != "0" ]] && _ext_info="${_ext_commits} commits"
                 [[ -n "$_ext_files" && "$_ext_files" != "0" ]] && _ext_info="${_ext_info:+$_ext_info, }${_ext_files} files"
-                echo -e "    extract:  ${GREEN}✓${NC} updated${_ext_info:+ ($_ext_info)}"
+                echo -e "    extract   ${GREEN}✓${NC} updated${_ext_info:+ ($_ext_info)}"
                 _pulled=$((_pulled + 1))
                 ;;
             cloned)
                 local _ext_info=""
                 [[ -n "$_ext_commits" && "$_ext_commits" != "0" ]] && _ext_info="${_ext_commits} commits"
                 [[ -n "$_ext_files" && "$_ext_files" != "0" ]] && _ext_info="${_ext_info:+$_ext_info, }${_ext_files} files"
-                echo -e "    extract:  ${GREEN}✓${NC} cloned${_ext_info:+ ($_ext_info)}"
+                echo -e "    extract   ${GREEN}✓${NC} cloned${_ext_info:+ ($_ext_info)}"
                 _pulled=$((_pulled + 1))
                 ;;
             synced_local)
-                echo -e "    extract:  ${GREEN}✓${NC} synced local into container"
+                echo -e "    extract   ${GREEN}✓${NC} synced local into container"
                 _pulled=$((_pulled + 1))
                 ;;
             unchanged)
-                echo -e "    extract:  — up to date"
+                echo -e "    extract   ${DIM}— up to date${NC}"
                 _unchanged=$((_unchanged + 1))
                 ;;
             diverged)
                 local _div_info=""
                 [[ -n "$_c_ahead" && -n "$_h_ahead" ]] && _div_info=" (container +${_c_ahead}, host +${_h_ahead})"
-                echo -e "    extract:  ${YELLOW}!${NC} diverged${_div_info}"
+                echo -e "    extract   ${YELLOW}!${NC} diverged${_div_info}"
                 _needs_attention=$((_needs_attention + 1))
                 ;;
             failed)
-                echo -e "    extract:  ${RED}x${NC} failed${_ext_detail:+ ($_ext_detail)}"
+                echo -e "    extract   ${RED}✗${NC} failed${_ext_detail:+ ($_ext_detail)}"
                 _needs_attention=$((_needs_attention + 1))
                 ;;
             *)
@@ -189,28 +201,28 @@ _pull_report() {
                 OK)
                     case "$_merge_detail" in
                         "already up to date"|"up to date"*)
-                            echo -e "    merge:    — nothing to merge (session → ${target_branch})"
+                            echo -e "    merge     ${DIM}— up to date${NC}"
                             ;;
-                        "squash-merge"*|"fast-forward"*|"merge cleanly"*)
-                            echo -e "    merge:    ${GREEN}✓${NC} $_merge_detail"
+                        "squash-merge"*|"fast-forward"*|"merge cleanly"*|"squash-merged"*)
+                            echo -e "    merge     ${GREEN}✓${NC} $_merge_detail"
                             _show_merge_diff=true
                             ;;
                         *)
-                            echo -e "    merge:    ${GREEN}✓${NC} $_merge_detail"
+                            echo -e "    merge     ${GREEN}✓${NC} $_merge_detail"
                             _show_merge_diff=true
                             ;;
                     esac
                     ;;
                 SKIP)
-                    echo -e "    merge:    ${YELLOW}!${NC} skipped${_merge_detail:+ — ${_merge_detail}}"
+                    echo -e "    merge     ${YELLOW}!${NC} skipped${_merge_detail:+ — ${_merge_detail}}"
                     ;;
                 CONFLICT)
-                    echo -e "    merge:    ${RED}x${NC} conflict${_conflict_files:+ ($_conflict_files)}"
+                    echo -e "    merge     ${RED}✗${NC} conflict${_conflict_files:+ ($_conflict_files)}"
                     _conflicts=$((_conflicts + 1))
                     _show_merge_diff=true
                     ;;
             esac
-            # Inline diffstat summary (file count only — full diff shown in _verify_diffstat)
+            # Inline diffstat summary
             if $_show_merge_diff; then
                 local _merge_proj_path
                 _merge_proj_path=$(echo "$projects" | grep "^${_repo}|" | head -1 | cut -d'|' -f2)
@@ -224,7 +236,7 @@ _pull_report() {
             fi
         fi
 
-        # Target-ahead warning: show commits on target that session doesn't have
+        # Target-ahead note
         local _rpt_target_ahead
         _rpt_target_ahead=$(_pull_result_get "$result_dir" "$_repo" "target_ahead")
         if [[ -n "$_rpt_target_ahead" && "$_rpt_target_ahead" != "0" ]]; then
@@ -236,21 +248,19 @@ _pull_report() {
                 _rpt_ahead_log=$(git -C "$_rpt_proj_path" log --oneline "$session_name".."$target_branch" 2>/dev/null | head -5)
                 while IFS= read -r _rpt_line; do
                     [[ -z "$_rpt_line" ]] && continue
-                    # Our squash-merge commits match: "session_name -> target (N commits)"
                     if ! echo "$_rpt_line" | grep -qE "^[0-9a-f]+ ${session_name} → "; then
                         _rpt_external=$((_rpt_external + 1))
                     fi
                 done <<< "$_rpt_ahead_log"
 
                 if [[ $_rpt_external -gt 0 ]]; then
-                    echo -e "    ${DIM}note: ${target_branch} is ${_rpt_target_ahead} commit(s) ahead of session:${NC}"
+                    echo -e "    ${DIM}note: ${target_branch} +${_rpt_target_ahead} ahead of session:${NC}"
                     while IFS= read -r _rpt_line; do
-                        [[ -n "$_rpt_line" ]] && echo "      $_rpt_line"
+                        [[ -n "$_rpt_line" ]] && echo -e "      ${DIM}$_rpt_line${NC}"
                     done <<< "$_rpt_ahead_log"
                     local _rpt_risk_stat
                     _rpt_risk_stat=$(git -C "$_rpt_proj_path" diff --stat "$session_name".."$target_branch" 2>/dev/null | tail -1)
                     [[ -n "$_rpt_risk_stat" ]] && echo -e "      ${DIM}$_rpt_risk_stat${NC}"
-                    echo -e "    ${DIM}→ claude-container push -s ${session_name} ${target_branch} --merge  (sync session)${NC}"
                     _target_ahead_count=$((_target_ahead_count + 1))
                 else
                     local _rpt_squash_stat
@@ -266,19 +276,22 @@ _pull_report() {
 
         # Action line for repos needing attention
         if [[ "$_ext_status" == "diverged" ]]; then
-            echo -e "    ${BLUE}fix:${NC}  claude-container pull -s ${session_name} --force  ${DIM}(overwrite local)${NC}"
-            echo -e "      or: claude-container push -s ${session_name} ${target_branch:-main} --merge  ${DIM}(merge into session)${NC}"
+            echo -e "    ${BLUE}fix:${NC} pull -s ${session_name} --force  ${DIM}(overwrite local)${NC}"
+            echo -e "      ${DIM}or: push -s ${session_name} ${target_branch:-main} --merge  (merge into session)${NC}"
         elif [[ "$_merge_status" == "CONFLICT" ]]; then
-            echo -e "    ${BLUE}fix:${NC}  claude-container pull -s ${session_name} ${target_branch} --reconcile  ${DIM}(Claude resolves conflicts)${NC}"
-            echo -e "      or: claude-container pull -s ${session_name} ${target_branch} --no-squash  ${DIM}(merge commit, keep history)${NC}"
+            echo -e "    ${BLUE}fix:${NC} pull -s ${session_name} ${target_branch} --reconcile  ${DIM}(Claude resolves)${NC}"
+            echo -e "      ${DIM}or: pull -s ${session_name} ${target_branch} --no-squash  (merge commit)${NC}"
         fi
     done
 
-    # Summary
+    # Footer
     echo ""
+    _rule
+
+    # Summary line
     local _summary_parts=()
     if [[ $_pulled -gt 0 ]]; then
-        _summary_parts+=("${_pulled} merged into ${target_branch:-main}")
+        _summary_parts+=("${_pulled} merged")
     fi
     if [[ $_conflicts -gt 0 ]]; then
         _summary_parts+=("${_conflicts} conflict(s)")
@@ -290,6 +303,9 @@ _pull_report() {
     if [[ ${#_summary_parts[@]} -gt 0 ]]; then
         local _summary_line
         _summary_line=$(IFS=', '; echo "${_summary_parts[*]}")
+        if [[ -n "$target_branch" ]]; then
+            _summary_line="${_summary_line} into ${target_branch}"
+        fi
         if [[ $_needs_attention -eq 0 && $_conflicts -eq 0 ]]; then
             success "$_summary_line"
         else
@@ -297,10 +313,10 @@ _pull_report() {
         fi
     fi
     if [[ $_target_ahead_count -gt 0 ]]; then
-        echo -e "${DIM}${target_branch} is ahead of session in ${_target_ahead_count} repo(s) — consider 'claude-container push -s ${session_name} ${target_branch} --merge'${NC}"
+        echo -e "${DIM}${target_branch} ahead in ${_target_ahead_count} repo(s) — push --merge to sync${NC}"
     fi
     if [[ $_unchanged -gt 0 ]]; then
-        echo -e "${DIM}$_unchanged repo(s) unchanged — no modifications${NC}"
+        echo -e "${DIM}${_unchanged} unchanged${NC}"
     fi
 
     # Warn about --repo filter terms that matched nothing

@@ -13,7 +13,8 @@ _push_report() {
     config_content=$(read_session_config "$volume")
     if [[ -z "$config_content" ]]; then
         echo ""
-        success "Done — session '$session_name' merged from '$source_branch'"
+        _rule "push: ${source_branch} → ${session_name}"
+        success "Done"
         return 0
     fi
 
@@ -44,9 +45,12 @@ _push_report() {
     done <<< "$_post_scan"
 
     # Check each repo: is host branch now an ancestor of session HEAD?
-    local _merged=0 _skipped=0 _up_to_date=0
+    local _merged=0 _skipped=0
 
     echo ""
+    _rule "push: ${source_branch} → ${session_name}"
+    echo ""
+
     while IFS='|' read -r proj_name proj_path; do
         [[ -z "$proj_name" ]] && continue
         repo_matches_filter "$proj_name" "$repo_filter" || continue
@@ -67,7 +71,7 @@ _push_report() {
             echo -e "  ${GREEN}✓${NC} $proj_name  ${DIM}session:${_post_head}${NC}"
             _merged=$((_merged + 1))
         else
-            echo -e "  ${DIM}·${NC} $proj_name  ${DIM}$_still_ahead commit(s) still ahead${NC}"
+            echo -e "  ${DIM}·${NC} $proj_name  ${DIM}${_still_ahead} still ahead${NC}"
             _skipped=$((_skipped + 1))
         fi
     done <<< "$projects"
@@ -75,10 +79,11 @@ _push_report() {
     # Extract silently to sync host session branches
     session_extract "$session_name" --force > /dev/null 2>&1
 
-    # Summary
+    # Footer
     echo ""
+    _rule
     if [[ $_skipped -eq 0 ]]; then
-        success "Done — session '$session_name' merged from '$source_branch'"
+        success "$_merged merged from ${source_branch}"
     else
         warn "Merged with issues — $_skipped repo(s) may need attention"
     fi

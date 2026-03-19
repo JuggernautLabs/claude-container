@@ -16,6 +16,24 @@ warn() { echo -e "${YELLOW}⚠${NC} $*" >&2; }
 error() { echo -e "${RED}✗${NC} $*" >&2; }
 note() { echo -e "${DIM}· $*${NC}" >&2; }
 
+# Horizontal rule with optional centered label
+_rule() {
+    local label="${1:-}"
+    local width=50
+    if [[ -n "$label" ]]; then
+        local pad=$(( (width - ${#label} - 2) / 2 ))
+        local left="" right=""
+        for ((i=0; i<pad; i++)); do left+="─"; done
+        for ((i=0; i<pad; i++)); do right+="─"; done
+        while [[ $(( ${#left} + ${#label} + ${#right} + 2 )) -lt $width ]]; do right+="─"; done
+        echo -e "${DIM}${left} ${NC}${label}${DIM} ${right}${NC}"
+    else
+        local line=""
+        for ((i=0; i<width; i++)); do line+="─"; done
+        echo -e "${DIM}${line}${NC}"
+    fi
+}
+
 # Match a repo name against a comma-separated filter list (partial match).
 # Usage: repo_matches_filter <repo_name> <filter>
 # Returns 0 (true) if filter is empty or repo matches any entry.
