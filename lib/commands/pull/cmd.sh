@@ -23,6 +23,7 @@ cmd_pull() {
     local show_prompt=false
     local extract_discovered=false
     local enable_session_only=false
+    local at_commitish=""
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -83,6 +84,10 @@ cmd_pull() {
             --enable-session-only)
                 enable_session_only=true
                 shift
+                ;;
+            --at)
+                at_commitish="$2"
+                shift 2
                 ;;
             --help|-h)
                 _pull_help
@@ -156,6 +161,9 @@ cmd_pull() {
     if [[ -n "$repo_filter" ]]; then
         extract_args+=(--repo "$repo_filter")
     fi
+    if [[ -n "$at_commitish" ]]; then
+        extract_args+=(--at "$at_commitish")
+    fi
 
     if $reconcile; then
         # Reconcile mode requires a branch
@@ -178,8 +186,12 @@ cmd_pull() {
     _pull_result_dir=$(mktemp -d)
     trap "rm -rf '$_pull_result_dir'" RETURN
 
-    if [[ -n "$branch" ]]; then
+    if [[ -n "$branch" && -n "$at_commitish" ]]; then
+        info "Pulling session '$session_name' @ $at_commitish into '$branch'..."
+    elif [[ -n "$branch" ]]; then
         info "Pulling session '$session_name' into '$branch'..."
+    elif [[ -n "$at_commitish" ]]; then
+        info "Pulling session '$session_name' @ $at_commitish..."
     else
         info "Pulling session '$session_name'..."
     fi

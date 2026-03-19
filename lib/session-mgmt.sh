@@ -2189,12 +2189,13 @@ $line"
 
 # Extract session changes as branches in original repos
 # Uses git bundle to extract only git data (ignores build artifacts)
-# Usage: session_extract <session_name> [--force]
+# Usage: session_extract <session_name> [--force] [--at <commitish>]
 session_extract() {
     local session_name="$1"
     local force=false
     local repo_filter=""
     local result_dir=""
+    local at_commitish=""
 
     # Parse flags
     shift
@@ -2203,6 +2204,7 @@ session_extract() {
             --force|-f) force=true; shift ;;
             --repo) repo_filter="$2"; shift 2 ;;
             --result-dir) result_dir="$2"; shift 2 ;;
+            --at) at_commitish="$2"; shift 2 ;;
             *) shift ;;
         esac
     done
@@ -2244,7 +2246,7 @@ session_extract() {
     if [[ "$has_config" == "yes" ]]; then
         local config_content
         config_content=$(read_session_config "$volume")
-        _extract_multi_project_direct "$session_name" "$volume" "$_util_image" "$config_content" "$force" "$_old_manifest" "$repo_filter" "$result_dir"
+        _extract_multi_project_direct "$session_name" "$volume" "$_util_image" "$config_content" "$force" "$_old_manifest" "$repo_filter" "$result_dir" "$at_commitish"
     else
         _extract_single_project_direct "$session_name" "$volume" "$_util_image" "$force"
     fi
@@ -2261,6 +2263,7 @@ _extract_multi_project_direct() {
     local old_manifest="${6:-}"
     local repo_filter="${7:-}"
     local result_dir="${8:-}"
+    local at_commitish="${9:-}"
 
     # repo_filter is a comma-separated list of partial names; matching done by repo_matches_filter
 
@@ -2344,9 +2347,11 @@ _extract_multi_project_direct() {
     # Phase 2: Get session HEADs + .git sizes (single fast docker run), then only bundle changed repos.
     # Docker Desktop volume I/O is slow — bundling all repos takes ~90s for 20+ repos.
     # By comparing HEADs first, we skip repos with no changes (typically most of them).
+    local _at_ref="${at_commitish:-HEAD}"
     local _session_heads
     _session_heads=$(docker run --rm --entrypoint sh \
         -v "$volume:/session:ro" \
+        -e "AT_REF=$_at_ref" \
         "$git_image" \
         -c '
             git config --global --add safe.directory "*"
@@ -2354,7 +2359,7 @@ _extract_multi_project_direct() {
                 [ -d "$d/.git" ] || continue
                 name="${d#/session/}"
                 name="${name%/}"
-                head=$(cd "$d" && git rev-parse HEAD 2>/dev/null)
+                head=$(cd "$d" && git rev-parse "$AT_REF" 2>/dev/null || git rev-parse HEAD 2>/dev/null)
                 gitsize=$(du -sm "$d/.git" 2>/dev/null | cut -f1)
                 [ -n "$head" ] && echo "$name|$head|${gitsize:-0}"
             done
@@ -2488,6 +2493,7 @@ _extract_multi_project_direct() {
         docker run --rm --entrypoint sh \
             -v "$volume:/session:ro" \
             -v "$bundle_dir:/bundles" \
+            -e "AT_REF=$_at_ref" \
             "$git_image" \
             -c '
                 git config --global --add safe.directory "*"
@@ -2495,7 +2501,8 @@ _extract_multi_project_direct() {
                     [ -z "$name" ] && continue
                     safe=$(echo "$name" | tr "/" "_")
                     cd "/session/$name" 2>/dev/null || continue
-                    git bundle create "/tmp/${safe}.bundle" HEAD 2>/dev/null && \
+                    ref=$(git rev-parse "$AT_REF" 2>/dev/null || echo HEAD)
+                    git bundle create "/tmp/${safe}.bundle" "$ref" 2>/dev/null && \
                         mv "/tmp/${safe}.bundle" "/bundles/${safe}.bundle" 2>/dev/null
                 done < /bundles/.to-bundle
             ' 2>/dev/null || true
