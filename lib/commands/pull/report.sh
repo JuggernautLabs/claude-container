@@ -10,10 +10,10 @@ _pull_report() {
     local repo_filter="${4:-}"
     local volume="claude-session-${session_name}"
 
-    # Collect all repos that have result files
-    local _pulled=0 _unchanged=0 _needs_attention=0 _conflicts=0 _skipped=0 _target_ahead_count=0
+    # Counters
+    local _ready=0 _unchanged=0 _needs_attention=0 _conflicts=0 _skipped=0 _target_ahead_count=0
 
-    # Read config to iterate repos in order, augmenting with volume-only repos for unmatched filters
+    # Read config to iterate repos in order
     local config_content
     config_content=$(read_session_config "$volume")
     local projects=""
@@ -24,10 +24,9 @@ _pull_report() {
         projects=$(augment_projects_from_volume "$volume" "$projects" "$repo_filter")
     fi
 
-    # Collect repo names from result files (covers repos not in config too)
+    # Collect repo names from result files
     local -a _repo_names=()
     local -A _repo_seen=()
-    # First: repos in config order
     if [[ -n "$projects" ]]; then
         while IFS='|' read -r _pname _ppath; do
             [[ -z "$_pname" ]] && continue
@@ -39,7 +38,6 @@ _pull_report() {
             fi
         done <<< "$projects"
     fi
-    # Then: any result files for repos not in config
     for _rfile in "$result_dir"/*; do
         [[ -f "$_rfile" ]] || continue
         [[ "$_rfile" == *.detail ]] && continue
@@ -52,59 +50,38 @@ _pull_report() {
         fi
     done
 
-    local _first_repo=true
-    local _header_shown=false
-    _ensure_header() {
-        if ! $_header_shown; then
-            if [[ -n "$target_branch" ]]; then
-                _rule "pull: ${session_name} → ${target_branch}"
-            else
-                _rule "pull: ${session_name}"
-            fi
-            echo ""
-            _header_shown=true
-        fi
-    }
+    # ── Pass 1: classify repos into buckets ──
+    local -a _skip_lines=()    # "repo — reason"
+    local -a _ready_repos=()   # repos that will merge
+    local -a _conflict_repos=() # repos with conflicts
+    local -a _attention_repos=() # repos needing attention (diverged extract, etc.)
+    local -a _discovered_repos=() # repos not yet extracted
 
     for _repo in "${_repo_names[@]}"; do
-        local _ext_status _ext_commits _ext_files _ext_detail
+        local _ext_status _merge_status _merge_detail _conflict_files
         _ext_status=$(_pull_result_get "$result_dir" "$_repo" "extract_status")
-        _ext_commits=$(_pull_result_get "$result_dir" "$_repo" "extract_commits")
-        _ext_files=$(_pull_result_get "$result_dir" "$_repo" "extract_files")
-        _ext_detail=$(_pull_result_get "$result_dir" "$_repo" "extract_detail")
-
-        local _merge_status _merge_detail _conflict_files
         _merge_status=$(_pull_result_get "$result_dir" "$_repo" "merge_status")
         _merge_detail=$(_pull_result_get "$result_dir" "$_repo" "merge_detail")
         _conflict_files=$(_pull_result_get "$result_dir" "$_repo" "conflict_files")
 
-        # Never hide discovered repos — always show them with actionable hint
+        # Discovered (not extracted)
         if [[ "$_ext_status" == "discovered" ]]; then
-            _ensure_header
-            $_first_repo || echo ""
-            _first_repo=false
-            echo -e "  ${BLUE}$_repo${NC}"
-            echo -e "    extract   ${YELLOW}○${NC} new in session (not extracted)"
-            echo -e "    ${DIM}→ claude-container pull -s ${session_name} --extract --repo ${_repo##*/}${NC}"
+            _discovered_repos+=("$_repo")
             continue
         fi
 
-        # Hide repos that are unchanged on both extract and merge
-        # (never hide when --repo filter is active — user explicitly asked for this repo)
+        # Quiet check: unchanged on both extract and merge
         local _is_quiet=false
         local _rpt_ta
         _rpt_ta=$(_pull_result_get "$result_dir" "$_repo" "target_ahead")
         if [[ -z "$repo_filter" ]] && [[ "$_ext_status" == "unchanged" || -z "$_ext_status" ]]; then
-            # Candidate for hiding: check merge status
             local _merge_is_noop=false
             case "$_merge_detail" in
                 "already up to date"|"up to date"*) _merge_is_noop=true ;;
-                "host has uncommitted changes") _merge_is_noop=true ;;  # SKIP but no content change
+                "host has uncommitted changes") _merge_is_noop=true ;;
                 "") [[ -z "$_merge_status" ]] && _merge_is_noop=true ;;
             esac
-
             if $_merge_is_noop; then
-                # Check if target-ahead commits are all benign (our squash-merges)
                 local _has_external=false
                 if [[ -n "$_rpt_ta" && "$_rpt_ta" != "0" ]]; then
                     local _hide_proj_path
@@ -131,204 +108,144 @@ _pull_report() {
             continue
         fi
 
-        local _c_ahead _h_ahead
-        _c_ahead=$(_pull_result_get "$result_dir" "$_repo" "diverge_container_ahead")
-        _h_ahead=$(_pull_result_get "$result_dir" "$_repo" "diverge_host_ahead")
-
-        # Read commit hashes for display
-        local _container_head _session_head _target_head
-        _container_head=$(_pull_result_get "$result_dir" "$_repo" "container_head")
-        _session_head=$(_pull_result_get "$result_dir" "$_repo" "session_head")
-        _target_head=$(_pull_result_get "$result_dir" "$_repo" "target_head")
-        local _short_session="${_session_head:0:7}"
-        local _short_target="${_target_head:0:7}"
-
-        # Blank line between repos
-        _ensure_header
-        $_first_repo || echo ""
-        _first_repo=false
-
-        # Repo name
-        echo -e "  ${BLUE}$_repo${NC}"
-
-        # Hashes on their own dim line
-        local _hash_parts=()
-        [[ -n "$_session_head" ]] && _hash_parts+=("session:${_short_session}")
-        if [[ -n "$_target_head" && -n "$target_branch" ]]; then
-            _hash_parts+=("${target_branch}:${_short_target}")
-        fi
-        if [[ ${#_hash_parts[@]} -gt 0 ]]; then
-            echo -e "    ${DIM}${_hash_parts[*]}${NC}"
+        # Extract-level attention
+        if [[ "$_ext_status" == "diverged" || "$_ext_status" == "failed" ]]; then
+            _attention_repos+=("$_repo")
+            _needs_attention=$((_needs_attention + 1))
         fi
 
-        # Extract line
-        case "$_ext_status" in
-            updated)
-                local _ext_info=""
-                [[ -n "$_ext_commits" && "$_ext_commits" != "0" ]] && _ext_info="${_ext_commits} commits"
-                [[ -n "$_ext_files" && "$_ext_files" != "0" ]] && _ext_info="${_ext_info:+$_ext_info, }${_ext_files} files"
-                echo -e "    extract   ${GREEN}✓${NC} updated${_ext_info:+ ($_ext_info)}"
-                _pulled=$((_pulled + 1))
+        # Merge classification
+        case "$_merge_status" in
+            OK)
+                case "$_merge_detail" in
+                    "already up to date"|"up to date"*)
+                        # up-to-date merge — don't count as ready
+                        ;;
+                    *)
+                        _ready_repos+=("$_repo")
+                        _ready=$((_ready + 1))
+                        ;;
+                esac
                 ;;
-            cloned)
-                local _ext_info=""
-                [[ -n "$_ext_commits" && "$_ext_commits" != "0" ]] && _ext_info="${_ext_commits} commits"
-                [[ -n "$_ext_files" && "$_ext_files" != "0" ]] && _ext_info="${_ext_info:+$_ext_info, }${_ext_files} files"
-                echo -e "    extract   ${GREEN}✓${NC} cloned${_ext_info:+ ($_ext_info)}"
-                _pulled=$((_pulled + 1))
+            SKIP)
+                _skip_lines+=("${_repo##*/} — ${_merge_detail}")
+                _skipped=$((_skipped + 1))
                 ;;
-            synced_local)
-                echo -e "    extract   ${GREEN}✓${NC} synced local into container"
-                _pulled=$((_pulled + 1))
-                ;;
-            unchanged)
-                echo -e "    extract   ${DIM}— up to date${NC}"
-                _unchanged=$((_unchanged + 1))
-                ;;
-            diverged)
-                local _div_info=""
-                [[ -n "$_c_ahead" && -n "$_h_ahead" ]] && _div_info=" (container +${_c_ahead}, host +${_h_ahead})"
-                echo -e "    extract   ${YELLOW}!${NC} diverged${_div_info}"
-                _needs_attention=$((_needs_attention + 1))
-                ;;
-            failed)
-                echo -e "    extract   ${RED}✗${NC} failed${_ext_detail:+ ($_ext_detail)}"
-                _needs_attention=$((_needs_attention + 1))
-                ;;
-            *)
-                # No extract result (e.g. status-only check)
+            CONFLICT)
+                _conflict_repos+=("$_repo")
+                _conflicts=$((_conflicts + 1))
                 ;;
         esac
 
-        # Merge line (only if target branch was specified)
-        if [[ -n "$target_branch" && -n "$_merge_status" ]]; then
-            local _show_merge_diff=false
-            case "$_merge_status" in
-                OK)
-                    case "$_merge_detail" in
-                        "already up to date"|"up to date"*)
-                            echo -e "    merge     ${DIM}— up to date${NC}"
-                            ;;
-                        "squash-merge"*|"fast-forward"*|"merge cleanly"*|"squash-merged"*)
-                            echo -e "    merge     ${GREEN}✓${NC} $_merge_detail"
-                            _show_merge_diff=true
-                            ;;
-                        *)
-                            echo -e "    merge     ${GREEN}✓${NC} $_merge_detail"
-                            _show_merge_diff=true
-                            ;;
-                    esac
-                    ;;
-                SKIP)
-                    echo -e "    merge     ${YELLOW}!${NC} skipped${_merge_detail:+ — ${_merge_detail}}"
-                    _skipped=$((_skipped + 1))
-                    ;;
-                CONFLICT)
-                    echo -e "    merge     ${RED}✗${NC} conflict${_conflict_files:+ ($_conflict_files)}"
-                    _conflicts=$((_conflicts + 1))
-                    _show_merge_diff=true
-                    ;;
-            esac
-            # Inline diffstat summary
-            if $_show_merge_diff; then
-                local _merge_proj_path
-                _merge_proj_path=$(echo "$projects" | grep "^${_repo}|" | head -1 | cut -d'|' -f2)
-                if [[ -n "$_merge_proj_path" && -d "$_merge_proj_path" ]]; then
-                    local _merge_stat_summary
-                    _merge_stat_summary=$(git -C "$_merge_proj_path" diff --stat "$target_branch".."$session_name" 2>/dev/null | tail -1)
-                    if [[ -n "$_merge_stat_summary" ]]; then
-                        echo -e "              ${DIM}${_merge_stat_summary}${NC}"
+        # Count target-ahead
+        if [[ -n "$_rpt_ta" && "$_rpt_ta" != "0" ]]; then
+            local _ta_proj_path
+            _ta_proj_path=$(echo "$projects" | grep "^${_repo}|" | head -1 | cut -d'|' -f2)
+            if [[ -n "$_ta_proj_path" && -d "$_ta_proj_path" ]]; then
+                local _ta_log _ta_external=0
+                _ta_log=$(git -C "$_ta_proj_path" log --oneline "$session_name".."$target_branch" 2>/dev/null | head -5)
+                while IFS= read -r _ta_line; do
+                    [[ -z "$_ta_line" ]] && continue
+                    if ! echo "$_ta_line" | grep -qE "^[0-9a-f]+ ${session_name} → "; then
+                        _ta_external=$((_ta_external + 1))
                     fi
-                fi
+                done <<< "$_ta_log"
+                [[ $_ta_external -gt 0 ]] && _target_ahead_count=$((_target_ahead_count + 1))
             fi
-        fi
-
-        # Target-ahead note
-        local _rpt_target_ahead
-        _rpt_target_ahead=$(_pull_result_get "$result_dir" "$_repo" "target_ahead")
-        if [[ -n "$_rpt_target_ahead" && "$_rpt_target_ahead" != "0" ]]; then
-            local _rpt_proj_path
-            _rpt_proj_path=$(echo "$projects" | grep "^${_repo}|" | head -1 | cut -d'|' -f2)
-            if [[ -n "$_rpt_proj_path" && -d "$_rpt_proj_path" ]]; then
-                # Check if all ahead commits are our own squash-merges (benign)
-                local _rpt_ahead_log _rpt_external=0
-                _rpt_ahead_log=$(git -C "$_rpt_proj_path" log --oneline "$session_name".."$target_branch" 2>/dev/null | head -5)
-                while IFS= read -r _rpt_line; do
-                    [[ -z "$_rpt_line" ]] && continue
-                    if ! echo "$_rpt_line" | grep -qE "^[0-9a-f]+ ${session_name} → "; then
-                        _rpt_external=$((_rpt_external + 1))
-                    fi
-                done <<< "$_rpt_ahead_log"
-
-                if [[ $_rpt_external -gt 0 ]]; then
-                    echo -e "    ${DIM}note: ${target_branch} +${_rpt_target_ahead} ahead of session:${NC}"
-                    while IFS= read -r _rpt_line; do
-                        [[ -n "$_rpt_line" ]] && echo -e "      ${DIM}$_rpt_line${NC}"
-                    done <<< "$_rpt_ahead_log"
-                    local _rpt_risk_stat
-                    _rpt_risk_stat=$(git -C "$_rpt_proj_path" diff --stat "$session_name".."$target_branch" 2>/dev/null | tail -1)
-                    [[ -n "$_rpt_risk_stat" ]] && echo -e "      ${DIM}$_rpt_risk_stat${NC}"
-                    _target_ahead_count=$((_target_ahead_count + 1))
-                else
-                    local _rpt_squash_stat
-                    _rpt_squash_stat=$(git -C "$_rpt_proj_path" diff --stat "$session_name".."$target_branch" 2>/dev/null | tail -1)
-                    if [[ -n "$_rpt_squash_stat" ]]; then
-                        echo -e "    ${DIM}${target_branch} +${_rpt_target_ahead} (prior squash-merge): $_rpt_squash_stat${NC}"
-                    else
-                        echo -e "    ${DIM}${target_branch} +${_rpt_target_ahead} (prior squash-merge)${NC}"
-                    fi
-                fi
-            fi
-        fi
-
-        # Action line for repos needing attention
-        if [[ "$_ext_status" == "diverged" ]]; then
-            echo -e "    ${BLUE}fix:${NC} pull -s ${session_name} --force  ${DIM}(overwrite local)${NC}"
-            echo -e "      ${DIM}or: push -s ${session_name} ${target_branch:-main} --merge  (merge into session)${NC}"
-        elif [[ "$_merge_status" == "CONFLICT" ]]; then
-            echo -e "    ${BLUE}fix:${NC} pull -s ${session_name} ${target_branch} --reconcile  ${DIM}(Claude resolves)${NC}"
-            echo -e "      ${DIM}or: pull -s ${session_name} ${target_branch} --no-squash  (merge commit)${NC}"
         fi
     done
 
-    # Footer (only if header was shown — skip frame when all repos hidden)
-    if $_header_shown; then
-        echo ""
-        _rule
+    # ── Pass 2: render ──
+
+    # Nothing visible at all?
+    local _has_content=false
+    [[ $_ready -gt 0 || $_skipped -gt 0 || $_conflicts -gt 0 || $_needs_attention -gt 0 || ${#_discovered_repos[@]} -gt 0 ]] && _has_content=true
+
+    # Header
+    if [[ -n "$target_branch" ]]; then
+        _rule "pull: ${session_name} → ${target_branch}"
+    else
+        _rule "pull: ${session_name}"
     fi
 
-    # Summary line
+    # Summary line (right after header)
     local _summary_parts=()
-    if [[ $_pulled -gt 0 ]]; then
-        _summary_parts+=("${_pulled} merged")
-    fi
-    if [[ $_skipped -gt 0 ]]; then
-        _summary_parts+=("${_skipped} skipped")
-    fi
-    if [[ $_conflicts -gt 0 ]]; then
-        _summary_parts+=("${_conflicts} conflict(s)")
-    fi
-    if [[ $_needs_attention -gt 0 ]]; then
-        _summary_parts+=("${_needs_attention} need attention")
-    fi
+    [[ $_ready -gt 0 ]] && _summary_parts+=("${_ready} ready")
+    [[ $_skipped -gt 0 ]] && _summary_parts+=("${_skipped} skipped")
+    [[ $_conflicts -gt 0 ]] && _summary_parts+=("${_conflicts} conflict(s)")
+    [[ $_needs_attention -gt 0 ]] && _summary_parts+=("${_needs_attention} need attention")
 
     if [[ ${#_summary_parts[@]} -gt 0 ]]; then
         local _summary_line
         _summary_line=$(IFS=', '; echo "${_summary_parts[*]}")
-        if [[ -n "$target_branch" ]]; then
-            _summary_line="${_summary_line} into ${target_branch}"
-        fi
-        if [[ $_needs_attention -eq 0 && $_conflicts -eq 0 ]]; then
+        if [[ $_needs_attention -eq 0 && $_conflicts -eq 0 && $_skipped -eq 0 ]]; then
             success "$_summary_line"
+        elif [[ $_needs_attention -eq 0 && $_conflicts -eq 0 ]]; then
+            # Has skips but no real problems
+            info "$_summary_line"
         else
             warn "$_summary_line"
         fi
     fi
-    if [[ $_target_ahead_count -gt 0 ]]; then
-        echo -e "${DIM}${target_branch} ahead in ${_target_ahead_count} repo(s) — push --merge to sync${NC}"
-    fi
     if [[ $_unchanged -gt 0 ]]; then
         echo -e "${DIM}${_unchanged} unchanged${NC}"
+    fi
+
+    # Skipped repos (compact list)
+    if [[ ${#_skip_lines[@]} -gt 0 ]]; then
+        echo ""
+        echo "  skipped:"
+        for _sl in "${_skip_lines[@]}"; do
+            echo -e "    ${DIM}${_sl}${NC}"
+        done
+    fi
+
+    # Discovered repos
+    if [[ ${#_discovered_repos[@]} -gt 0 ]]; then
+        echo ""
+        echo "  discovered (not extracted):"
+        for _dr in "${_discovered_repos[@]}"; do
+            echo -e "    ${YELLOW}○${NC} ${_dr##*/}"
+        done
+        echo -e "    ${DIM}→ pull -s ${session_name} --extract${NC}"
+    fi
+
+    # Conflicts
+    if [[ ${#_conflict_repos[@]} -gt 0 ]]; then
+        echo ""
+        echo "  conflicts:"
+        for _cr in "${_conflict_repos[@]}"; do
+            local _cf
+            _cf=$(_pull_result_get "$result_dir" "$_cr" "conflict_files")
+            echo -e "    ${RED}✗${NC} ${_cr##*/}${_cf:+ ($_cf)}"
+        done
+        echo -e "    ${DIM}→ pull -s ${session_name} ${target_branch} --reconcile${NC}"
+    fi
+
+    # Attention (diverged extract, etc.)
+    if [[ ${#_attention_repos[@]} -gt 0 ]]; then
+        echo ""
+        echo "  need attention:"
+        for _ar in "${_attention_repos[@]}"; do
+            local _ar_ext _ar_detail
+            _ar_ext=$(_pull_result_get "$result_dir" "$_ar" "extract_status")
+            _ar_detail=$(_pull_result_get "$result_dir" "$_ar" "extract_detail")
+            local _c_ahead _h_ahead
+            _c_ahead=$(_pull_result_get "$result_dir" "$_ar" "diverge_container_ahead")
+            _h_ahead=$(_pull_result_get "$result_dir" "$_ar" "diverge_host_ahead")
+            local _div_info=""
+            [[ -n "$_c_ahead" && -n "$_h_ahead" ]] && _div_info=" (container +${_c_ahead}, host +${_h_ahead})"
+            echo -e "    ${YELLOW}!${NC} ${_ar##*/} — ${_ar_ext}${_div_info}${_ar_detail:+ — $_ar_detail}"
+        done
+        echo -e "    ${DIM}→ pull -s ${session_name} --force  (overwrite local)${NC}"
+    fi
+
+    # Footer
+    echo ""
+    _rule
+
+    if [[ $_target_ahead_count -gt 0 ]]; then
+        echo -e "${DIM}${target_branch} ahead in ${_target_ahead_count} repo(s) — push --merge to sync${NC}"
     fi
 
     # Warn about --repo filter terms that matched nothing
