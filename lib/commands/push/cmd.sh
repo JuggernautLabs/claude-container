@@ -116,15 +116,48 @@ cmd_push() {
             ;;
         ff)
             # Fast-forward: fetch + ff from host branch (default)
-            if $dry_run || $verify; then
-                # Preview needs merge path — redirect there
-                strategy="merge"
-            else
-                local refresh_branch="${repo_branch:-${branch:-main}}"
-                session_refresh "$session_name" "$refresh_branch" "$repo_filter" "$force"
-                return $?
+            local refresh_branch="${repo_branch:-${branch:-main}}"
+
+            if $dry_run; then
+                _push_preview "$session_name" "$refresh_branch" "$repo_filter"
+                return 0
             fi
-            ;&  # fall through to merge
+
+            if $verify; then
+                _push_preview "$session_name" "$refresh_branch" "$repo_filter"
+
+                if $discuss; then
+                    echo ""
+                    local _ff_discuss_dir
+                    _ff_discuss_dir=$(mktemp -d)
+                    session_auto_merge "$session_name" "$refresh_branch" true "$repo_filter" true "$_ff_discuss_dir" 2>/dev/null || true
+                    local _ff_discuss_prompt
+                    _ff_discuss_prompt=$(_push_discuss_prompt "$session_name" "$refresh_branch" "$_ff_discuss_dir" "$repo_filter")
+                    rm -rf "$_ff_discuss_dir"
+                    info "Launching Claude to discuss merge state..."
+                    echo ""
+                    claude "$_ff_discuss_prompt"
+                    echo ""
+                fi
+
+                echo ""
+                printf "Push '%s' into session '%s'? [y/N] " "$refresh_branch" "$session_name"
+                local _ff_answer
+                read -r _ff_answer
+                case "$_ff_answer" in
+                    [yY]|[yY][eE][sS])
+                        info "Pushing..."
+                        ;;
+                    *)
+                        info "Aborted."
+                        return 0
+                        ;;
+                esac
+            fi
+
+            session_refresh "$session_name" "$refresh_branch" "$repo_filter" "$force"
+            return $?
+            ;;
         merge)
             # Merge host branch into session
             local merge_branch="${branch:-main}"
