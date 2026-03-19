@@ -281,6 +281,7 @@ _verify_diffstat() {
             [[ -z "$_ta_val" || "$_ta_val" == "0" ]] && continue
             local _ta_repo_name
             _ta_repo_name=$(grep "^repo_name=" "$_rfile" 2>/dev/null | tail -1 | cut -d= -f2-)
+            repo_matches_filter "$_ta_repo_name" "$repo_filter" || continue
             local _ta_path
             _ta_path=$(echo "$projects" | grep "^${_ta_repo_name}|" | head -1 | cut -d'|' -f2)
             if [[ -n "$_ta_path" && -d "$_ta_path" ]]; then

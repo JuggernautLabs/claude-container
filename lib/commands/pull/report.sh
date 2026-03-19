@@ -85,6 +85,7 @@ _pull_report() {
         local _rname
         _rname=$(grep "^repo_name=" "$_rfile" 2>/dev/null | tail -1 | cut -d= -f2-)
         [[ -z "$_rname" ]] && continue
+        repo_matches_filter "$_rname" "$repo_filter" || continue
         if [[ -z "${_repo_seen[$_rname]:-}" ]]; then
             _repo_names+=("$_rname")
             _repo_seen[$_rname]=1

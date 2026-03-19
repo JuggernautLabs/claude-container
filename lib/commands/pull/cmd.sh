@@ -280,6 +280,9 @@ cmd_pull() {
             for _vf in "$_pull_result_dir"/*; do
                 [[ -f "$_vf" ]] || continue
                 [[ "$_vf" == *.detail ]] && continue
+                local _vf_name
+                _vf_name=$(grep "^repo_name=" "$_vf" 2>/dev/null | tail -1 | cut -d= -f2-)
+                repo_matches_filter "$_vf_name" "$repo_filter" || continue
                 local _vm
                 _vm=$(grep "^merge_detail=" "$_vf" 2>/dev/null | tail -1 | cut -d= -f2-)
                 case "$_vm" in
