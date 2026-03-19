@@ -13,6 +13,8 @@ Arguments:
 Options:
   --session, -s <name>     Session name (required)
   --repo <name>            Only pull this repo (partial name OK, e.g. 'gamma')
+  --at <commitish>         Extract from a specific commit instead of HEAD.
+                           Accepts any git ref: SHA, tag, branch, HEAD~N.
   --status                 Read-only check: compare container vs host (no extraction)
   --reconcile, -R          Full reconcile: stash dirty, merge target into session,
                            launch Claude for conflicts, then merge back
@@ -20,6 +22,7 @@ Options:
                            only merge new commits — no conflicts from squash history.
   --no-squash              Regular merge. Preserves full session commit history on target.
   --verify                 Extract and show results, then ask before merging
+  --discuss                Like --verify, but also launches Claude to discuss the diff
   --extract                Extract repos discovered in session (created by agent).
                            Use with --repo to extract specific repos, or alone for all.
   --dry-run                Show what would happen without extracting or merging
@@ -53,11 +56,15 @@ Examples:
   # Extract session branches to host repos
   claude-container pull -s myproj
 
+  # Extract from a specific point in session history
+  claude-container pull -s myproj --at HEAD~3
+  claude-container pull -s myproj main --at v1.0
+
   # Extract and merge into main (skips repos that would conflict)
   claude-container pull -s myproj main
 
-  # Extract and merge into develop
-  claude-container pull -s myproj develop
+  # Review before merging
+  claude-container pull -s myproj main --verify
 
   # Full reconcile cycle against main
   claude-container pull -s myproj main --reconcile
