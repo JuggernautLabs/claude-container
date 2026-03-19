@@ -217,6 +217,10 @@ cmd_pull() {
 
     # Extract with result tracking
     extract_args+=(--result-dir "$_pull_result_dir")
+    # Suppress extraction noise when verify/dry-run — the report speaks for itself
+    if ($verify || $dry_run) && [[ -n "$branch" ]]; then
+        extract_args+=(--quiet)
+    fi
     session_extract "${extract_args[@]}"
 
     # If branch specified, dry-run merge first to populate results + show preview

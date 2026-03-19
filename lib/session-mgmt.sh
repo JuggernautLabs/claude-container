@@ -2231,13 +2231,14 @@ $line"
 
 # Extract session changes as branches in original repos
 # Uses git bundle to extract only git data (ignores build artifacts)
-# Usage: session_extract <session_name> [--force] [--at <commitish>]
+# Usage: session_extract <session_name> [--force] [--at <commitish>] [--quiet]
 session_extract() {
     local session_name="$1"
     local force=false
     local repo_filter=""
     local result_dir=""
     local at_commitish=""
+    local quiet=false
 
     # Parse flags
     shift
@@ -2247,6 +2248,7 @@ session_extract() {
             --repo) repo_filter="$2"; shift 2 ;;
             --result-dir) result_dir="$2"; shift 2 ;;
             --at) at_commitish="$2"; shift 2 ;;
+            --quiet|-q) quiet=true; shift ;;
             *) shift ;;
         esac
     done
@@ -2265,7 +2267,7 @@ session_extract() {
         return 1
     fi
 
-    if [[ -z "$result_dir" ]]; then
+    if [[ -z "$result_dir" ]] && ! $quiet; then
         info "Extracting session '$session_name'..."
     fi
     local _util_image="${GIT_UTIL_IMAGE:-alpine/git}"
@@ -2288,7 +2290,7 @@ session_extract() {
     if [[ "$has_config" == "yes" ]]; then
         local config_content
         config_content=$(read_session_config "$volume")
-        _extract_multi_project_direct "$session_name" "$volume" "$_util_image" "$config_content" "$force" "$_old_manifest" "$repo_filter" "$result_dir" "$at_commitish"
+        _extract_multi_project_direct "$session_name" "$volume" "$_util_image" "$config_content" "$force" "$_old_manifest" "$repo_filter" "$result_dir" "$at_commitish" "$quiet"
     else
         _extract_single_project_direct "$session_name" "$volume" "$_util_image" "$force"
     fi
@@ -2306,10 +2308,11 @@ _extract_multi_project_direct() {
     local repo_filter="${7:-}"
     local result_dir="${8:-}"
     local at_commitish="${9:-}"
+    local quiet="${10:-false}"
 
     # repo_filter is a comma-separated list of partial names; matching done by repo_matches_filter
 
-    if [[ -z "$result_dir" ]]; then
+    if [[ -z "$result_dir" ]] && [[ "$quiet" != "true" ]]; then
         info "Multi-project session detected"
         echo ""
     fi
@@ -2522,14 +2525,16 @@ _extract_multi_project_direct() {
 
     # Bundle only changed repos
     if [[ ${#_need_bundle[@]} -gt 0 ]]; then
-        # Warn about large repos (>10MB .git) that will be slow to bundle
-        for _bname in "${_need_bundle[@]}"; do
-            local _bsize="${_session_size_map[$_bname]:-0}"
-            if [[ "$_bsize" -gt 10 ]]; then
-                note "  $_bname has ${_bsize}MB .git — bundling may be slow"
-            fi
-        done
-        info "Bundling ${#_need_bundle[@]} changed repo(s)..."
+        if [[ "$quiet" != "true" ]]; then
+            # Note about large repos (>10MB .git) that will be slow to bundle
+            for _bname in "${_need_bundle[@]}"; do
+                local _bsize="${_session_size_map[$_bname]:-0}"
+                if [[ "$_bsize" -gt 10 ]]; then
+                    note "  $_bname has ${_bsize}MB .git — bundling may be slow"
+                fi
+            done
+            info "Bundling ${#_need_bundle[@]} changed repo(s)..."
+        fi
         printf '%s\n' "${_need_bundle[@]}" > "$bundle_dir/.to-bundle"
 
         docker run --rm --entrypoint sh \
