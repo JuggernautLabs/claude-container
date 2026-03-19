@@ -1409,7 +1409,7 @@ session_refresh() {
         repo_filter="${_matches[0]}"
     fi
 
-    info "Refreshing session '$session_name' from host branch '$refresh_branch'..."
+    _rule "push: ${refresh_branch} → ${session_name}"
     echo ""
 
     local success_count=0
@@ -1515,38 +1515,66 @@ session_refresh() {
             wait
         " 2>/dev/null)
 
-    # Parse results
+    # Parse results — collect for rendering
+    local -a _results=()
     while IFS='|' read -r status proj_name msg; do
         [[ -z "$status" ]] && continue
+        _results+=("$status|$proj_name|$msg")
         case "$status" in
-            OK)
-                success "  $proj_name ($msg)"
-                success_count=$((success_count + 1))
-                ;;
-            SAME)
-                echo "  $proj_name ($msg)"
-                ;;
-            SKIP)
-                warn "  $proj_name ($msg)"
-                skip_count=$((skip_count + 1))
-                ;;
-            DIVERGE)
-                warn "  $proj_name ($msg)"
-                fail_count=$((fail_count + 1))
-                ;;
-            FAIL)
-                error "  $proj_name ($msg)"
-                fail_count=$((fail_count + 1))
-                ;;
-            DIRTY)
-                warn "  $proj_name ($msg)"
-                fail_count=$((fail_count + 1))
-                ;;
-            WARN)
-                warn "  $proj_name ($msg)"
-                ;;
+            OK) success_count=$((success_count + 1)) ;;
+            SKIP) skip_count=$((skip_count + 1)) ;;
+            DIVERGE|FAIL|DIRTY) fail_count=$((fail_count + 1)) ;;
         esac
     done <<< "$refresh_output"
+
+    # Render: show changed/problem repos, hide up-to-date
+    local _same_count=0
+    local _first_repo=true
+    for _r in "${_results[@]}"; do
+        local _st _pn _mg
+        IFS='|' read -r _st _pn _mg <<< "$_r"
+        case "$_st" in
+            SAME)
+                _same_count=$((_same_count + 1))
+                ;;
+            OK)
+                $_first_repo || echo ""
+                _first_repo=false
+                echo -e "  ${BLUE}$_pn${NC}"
+                echo -e "    ${GREEN}✓${NC} $_mg"
+                ;;
+            DIVERGE)
+                $_first_repo || echo ""
+                _first_repo=false
+                echo -e "  ${BLUE}$_pn${NC}"
+                echo -e "    ${YELLOW}!${NC} $_mg"
+                ;;
+            SKIP)
+                $_first_repo || echo ""
+                _first_repo=false
+                echo -e "  ${BLUE}$_pn${NC}"
+                echo -e "    ${DIM}— $_mg${NC}"
+                ;;
+            FAIL)
+                $_first_repo || echo ""
+                _first_repo=false
+                echo -e "  ${BLUE}$_pn${NC}"
+                echo -e "    ${RED}✗${NC} $_mg"
+                ;;
+            DIRTY)
+                $_first_repo || echo ""
+                _first_repo=false
+                echo -e "  ${BLUE}$_pn${NC}"
+                echo -e "    ${YELLOW}!${NC} $_mg"
+                ;;
+            WARN)
+                $_first_repo || echo ""
+                _first_repo=false
+                echo -e "  ${BLUE}$_pn${NC}"
+                echo -e "    ${YELLOW}!${NC} $_mg"
+                ;;
+        esac
+    done
 
     # Phase 3: Detect repos created inside the session that aren't in the config
     # (e.g. repos created by Claude during the session)
@@ -1594,17 +1622,31 @@ session_refresh() {
     write_repo_manifest "$volume"
 
     echo ""
-    if [[ $success_count -gt 0 ]]; then
-        success "$success_count project(s) updated"
+    _rule
+
+    local _summary_parts=()
+    [[ $success_count -gt 0 ]] && _summary_parts+=("${success_count} updated")
+    [[ $fail_count -gt 0 ]] && _summary_parts+=("${fail_count} diverged")
+    [[ $skip_count -gt 0 ]] && _summary_parts+=("${skip_count} skipped")
+
+    if [[ ${#_summary_parts[@]} -gt 0 ]]; then
+        local _summary_line
+        _summary_line=$(IFS=', '; echo "${_summary_parts[*]}")
+        if [[ $fail_count -eq 0 ]]; then
+            success "$_summary_line"
+        else
+            warn "$_summary_line"
+        fi
     fi
-    if [[ $skip_count -gt 0 ]]; then
-        warn "$skip_count project(s) skipped"
+    if [[ $_same_count -gt 0 ]]; then
+        echo -e "${DIM}${_same_count} unchanged${NC}"
     fi
     if [[ $fail_count -gt 0 ]]; then
-        warn "$fail_count project(s) diverged — options:"
-        echo "  push -s $session_name --merge       Merge host branch into session (launches container if conflicts)"
-        echo "  push -s $session_name --rebase       Rebase session onto host branch (launches container if conflicts)"
-        echo "  push -s $session_name --ff --force   Force-reset session to host HEAD (discards session changes)"
+        echo ""
+        echo -e "${DIM}Diverged repos can be resolved with:${NC}"
+        echo -e "  ${DIM}push -s $session_name --merge       merge host into session${NC}"
+        echo -e "  ${DIM}push -s $session_name --rebase      rebase session onto host${NC}"
+        echo -e "  ${DIM}push -s $session_name --ff --force  reset session to host HEAD${NC}"
     fi
 }
 
