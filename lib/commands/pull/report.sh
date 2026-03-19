@@ -98,6 +98,9 @@ _pull_report() {
     local -a _discovered_lines=() # "repo"
     local -a _attention_lines=()  # "repo — problem"
 
+    local _cwd
+    _cwd=$(pwd)
+
     for _repo in "${_repo_names[@]}"; do
         local _ext_status _merge_status _merge_detail _conflict_files
         _ext_status=$(_pull_result_get "$result_dir" "$_repo" "extract_status")
@@ -107,9 +110,17 @@ _pull_report() {
 
         local _short_name="${_repo##*/}"
 
+        # Resolve display path (relative to cwd or ~/... shortened)
+        local _abs_path
+        _abs_path=$(echo "$projects" | grep "^${_repo}|" | head -1 | cut -d'|' -f2)
+        local _rel_path="$_short_name"
+        if [[ -n "$_abs_path" ]]; then
+            _rel_path=$(python3 -c "import os; print(os.path.relpath('$_abs_path', '$_cwd'))" 2>/dev/null || echo "${_abs_path/#$HOME/~}")
+        fi
+
         # Discovered (not extracted) → own bucket
         if [[ "$_ext_status" == "discovered" ]]; then
-            _discovered_lines+=("$_short_name")
+            _discovered_lines+=("$_rel_path")
             continue
         fi
 
@@ -158,13 +169,13 @@ _pull_report() {
             _h_ahead=$(_pull_result_get "$result_dir" "$_repo" "diverge_host_ahead")
             local _div_info=""
             [[ -n "$_c_ahead" && -n "$_h_ahead" ]] && _div_info=" (container +${_c_ahead}, host +${_h_ahead})"
-            _attention_lines+=("$_short_name — diverged${_div_info}")
+            _attention_lines+=("$_rel_path — diverged${_div_info}")
             continue
         fi
         if [[ "$_ext_status" == "failed" ]]; then
             local _ext_detail
             _ext_detail=$(_pull_result_get "$result_dir" "$_repo" "extract_detail")
-            _attention_lines+=("$_short_name — extract failed${_ext_detail:+ ($_ext_detail)}")
+            _attention_lines+=("$_rel_path — extract failed${_ext_detail:+ ($_ext_detail)}")
             continue
         fi
 
@@ -184,17 +195,17 @@ _pull_report() {
                         if [[ -n "$_rpath" && -d "$_rpath" ]]; then
                             _rdiff=$(git -C "$_rpath" diff --stat "$target_branch".."$session_name" 2>/dev/null | tail -1)
                         fi
-                        _ready_lines+=("$_short_name — $_merge_detail${_rdiff:+ | $_rdiff}")
+                        _ready_lines+=("$_rel_path — $_merge_detail${_rdiff:+ | $_rdiff}")
                         _ready=$((_ready + 1))
                         ;;
                 esac
                 ;;
             SKIP)
-                _skip_lines+=("$_short_name — ${_merge_detail}")
+                _skip_lines+=("$_rel_path — ${_merge_detail}")
                 _skipped=$((_skipped + 1))
                 ;;
             CONFLICT)
-                _conflict_lines+=("$_short_name${_conflict_files:+ ($_conflict_files)}")
+                _conflict_lines+=("$_rel_path${_conflict_files:+ ($_conflict_files)}")
                 _conflicts=$((_conflicts + 1))
                 ;;
             "")
@@ -206,7 +217,7 @@ _pull_report() {
                     local _einfo=""
                     [[ -n "$_ext_commits" && "$_ext_commits" != "0" ]] && _einfo="${_ext_commits} commits"
                     [[ -n "$_ext_files" && "$_ext_files" != "0" ]] && _einfo="${_einfo:+$_einfo, }${_ext_files} files"
-                    _ready_lines+=("$_short_name — extracted${_einfo:+ ($_einfo)}")
+                    _ready_lines+=("$_rel_path — extracted${_einfo:+ ($_einfo)}")
                     _ready=$((_ready + 1))
                 else
                     _unchanged=$((_unchanged + 1))
@@ -246,7 +257,13 @@ _pull_report() {
                 _rule "pull: ${session_name}"
             fi
             for _repo in "${_repo_names[@]}"; do
-                echo -e "  ${GREEN}✓${NC} ${_repo##*/} — up to date"
+                local _rp
+                _rp=$(echo "$projects" | grep "^${_repo}|" | head -1 | cut -d'|' -f2)
+                local _rd="${_repo##*/}"
+                if [[ -n "$_rp" ]]; then
+                    _rd=$(python3 -c "import os; print(os.path.relpath('$_rp', '$_cwd'))" 2>/dev/null || echo "${_rp/#$HOME/~}")
+                fi
+                echo -e "  ${GREEN}✓${NC} ${_rd} — up to date"
             done
             echo ""
             _rule
