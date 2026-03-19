@@ -224,13 +224,15 @@ cmd_pull() {
     # Extraction flattens the container→session delta — we need this for the report
     snapshot_session_state "claude-session-${session_name}" "$session_name" "${branch:-}" "$_pull_result_dir" "$repo_filter"
 
-    # Extract with result tracking
-    extract_args+=(--result-dir "$_pull_result_dir")
-    # Suppress extraction noise when verify/dry-run — the report speaks for itself
-    if ($verify || $dry_run) && [[ -n "$branch" ]]; then
-        extract_args+=(--quiet)
+    # Extract with result tracking (skip entirely on --dry-run — snapshot has all the data)
+    if ! $dry_run; then
+        extract_args+=(--result-dir "$_pull_result_dir")
+        # Suppress extraction noise when --verify — the report speaks for itself
+        if $verify && [[ -n "$branch" ]]; then
+            extract_args+=(--quiet)
+        fi
+        session_extract "${extract_args[@]}"
     fi
-    session_extract "${extract_args[@]}"
 
     # If branch specified, dry-run merge first to populate results + show preview
     local _merge_rc=0
