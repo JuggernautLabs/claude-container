@@ -75,9 +75,7 @@ _pull_status() {
         local _path="${_entry#*|}"
 
         # Apply repo filter
-        if [[ -n "$repo_filter" ]]; then
-            [[ "$_name" != *"$repo_filter"* ]] && continue
-        fi
+        repo_matches_filter "$_name" "$repo_filter" || continue
 
         local _s_head="${_head_map[$_name]:-}"
         if [[ -z "$_s_head" ]]; then
@@ -134,8 +132,15 @@ _pull_status() {
         elif git -C "$_path" merge-base --is-ancestor "$_s_head" "$_h_head" 2>/dev/null; then
             local _ahead
             _ahead=$(git -C "$_path" rev-list --count "$_s_head".."$_h_head" 2>/dev/null || echo "?")
-            echo -e "    ${DIM}← host ahead by $_ahead commit(s)${NC}"
-            _changed=$((_changed + 1))
+            local _ext_ahead
+            _ext_ahead=$(count_external_ahead "$_path" "$session_name" "$session_name")
+            if [[ "$_ext_ahead" -eq 0 ]]; then
+                echo -e "    ${GREEN}✓${NC} up to date ${DIM}(squashed)${NC}"
+                _up_to_date=$((_up_to_date + 1))
+            else
+                echo -e "    ${DIM}← host ahead by $_ahead commit(s)${NC}"
+                _changed=$((_changed + 1))
+            fi
         else
             local _merge_base
             _merge_base=$(git -C "$_path" merge-base "$_h_head" "$_s_head" 2>/dev/null || echo "")
@@ -144,8 +149,24 @@ _pull_status() {
                 _c_ahead=$(git -C "$_path" rev-list --count "$_merge_base".."$_s_head" 2>/dev/null || echo "?")
                 _h_ahead=$(git -C "$_path" rev-list --count "$_merge_base".."$_h_head" 2>/dev/null || echo "?")
             fi
-            echo -e "    ${YELLOW}!${NC} diverged (container +${_c_ahead}, host +${_h_ahead})"
-            _diverged=$((_diverged + 1))
+
+            if [[ "$_c_ahead" == "0" && "$_h_ahead" == "0" ]]; then
+                echo -e "    ${GREEN}✓${NC} up to date ${DIM}(rebased)${NC}"
+                _up_to_date=$((_up_to_date + 1))
+            elif [[ "$_c_ahead" == "0" ]]; then
+                local _ext_ahead
+                _ext_ahead=$(count_external_ahead "$_path" "$session_name" "$session_name")
+                if [[ "$_ext_ahead" -eq 0 ]]; then
+                    echo -e "    ${GREEN}✓${NC} up to date ${DIM}(squashed)${NC}"
+                    _up_to_date=$((_up_to_date + 1))
+                else
+                    echo -e "    ${YELLOW}!${NC} diverged (container +${_c_ahead}, host +${_h_ahead})"
+                    _diverged=$((_diverged + 1))
+                fi
+            else
+                echo -e "    ${YELLOW}!${NC} diverged (container +${_c_ahead}, host +${_h_ahead})"
+                _diverged=$((_diverged + 1))
+            fi
         fi
     done
 
@@ -168,6 +189,10 @@ _pull_status() {
             warn "$_line"
         fi
     fi
+
+    # Set global for callers that need to know if extraction is needed
+    _PULL_STATUS_HAS_CHANGES=false
+    [[ $_changed -gt 0 || $_diverged -gt 0 || $_not_extracted -gt 0 ]] && _PULL_STATUS_HAS_CHANGES=true
 }
 
 # Show per-repo diffstat of session vs target branch for --verify
@@ -254,18 +279,14 @@ _verify_diffstat() {
             local _ta_val
             _ta_val=$(grep "^target_ahead=" "$_rfile" 2>/dev/null | tail -1 | cut -d= -f2-)
             [[ -z "$_ta_val" || "$_ta_val" == "0" ]] && continue
-            # Check if non-benign (has external commits)
             local _ta_repo_name
             _ta_repo_name=$(grep "^repo_name=" "$_rfile" 2>/dev/null | tail -1 | cut -d= -f2-)
             local _ta_path
             _ta_path=$(echo "$projects" | grep "^${_ta_repo_name}|" | head -1 | cut -d'|' -f2)
             if [[ -n "$_ta_path" && -d "$_ta_path" ]]; then
-                local _ta_ext=0
-                while IFS= read -r _ta_line; do
-                    [[ -z "$_ta_line" ]] && continue
-                    echo "$_ta_line" | grep -qE "^[0-9a-f]+ ${session_name} → " || _ta_ext=$((_ta_ext + 1))
-                done <<< "$(git -C "$_ta_path" log --oneline "$session_name".."$target_branch" 2>/dev/null | head -5)"
-                [[ $_ta_ext -gt 0 ]] && _ta_count=$((_ta_count + 1))
+                local _ta_ext
+                _ta_ext=$(count_external_ahead "$_ta_path" "$session_name" "$target_branch")
+                [[ "$_ta_ext" -gt 0 ]] && _ta_count=$((_ta_count + 1))
             fi
         done
         if [[ $_ta_count -gt 0 ]]; then

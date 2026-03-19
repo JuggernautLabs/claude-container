@@ -124,11 +124,17 @@ _pull_report() {
             continue
         fi
 
-        # Quiet check: unchanged on both extract and merge, no interesting target-ahead
+        # Read pre-extraction status (set by detect_pre_extract_status in cmd_pull)
+        local _pre_status _pre_new_commits
+        _pre_status=$(_pull_result_get "$result_dir" "$_repo" "pre_status")
+        _pre_new_commits=$(_pull_result_get "$result_dir" "$_repo" "pre_new_commits")
+        [[ -z "$_pre_new_commits" ]] && _pre_new_commits=0
+
+        # Quiet check: hide repos with no new commits AND no interesting merge/target state
         local _is_quiet=false
         local _rpt_ta
         _rpt_ta=$(_pull_result_get "$result_dir" "$_repo" "target_ahead")
-        if [[ -z "$repo_filter" ]] && [[ "$_ext_status" == "unchanged" || -z "$_ext_status" ]]; then
+        if [[ -z "$repo_filter" ]] && [[ "$_pre_new_commits" == "0" ]]; then
             local _merge_is_noop=false
             case "$_merge_detail" in
                 "already up to date"|"up to date"*) _merge_is_noop=true ;;
@@ -136,23 +142,12 @@ _pull_report() {
                 "") [[ -z "$_merge_status" ]] && _merge_is_noop=true ;;
             esac
             if $_merge_is_noop; then
-                local _has_external=false
-                if [[ -n "$_rpt_ta" && "$_rpt_ta" != "0" ]]; then
-                    local _hide_proj_path
-                    _hide_proj_path=$(echo "$projects" | grep "^${_repo}|" | head -1 | cut -d'|' -f2)
-                    if [[ -n "$_hide_proj_path" && -d "$_hide_proj_path" ]]; then
-                        local _hide_log
-                        _hide_log=$(git -C "$_hide_proj_path" log --oneline "$session_name".."$target_branch" 2>/dev/null | head -5)
-                        while IFS= read -r _hide_line; do
-                            [[ -z "$_hide_line" ]] && continue
-                            if ! echo "$_hide_line" | grep -qE "^[0-9a-f]+ ${session_name} → "; then
-                                _has_external=true
-                                break
-                            fi
-                        done <<< "$_hide_log"
-                    fi
+                # Check if target has external (non-squash) commits ahead
+                local _ext_ahead=0
+                if [[ -n "$_rpt_ta" && "$_rpt_ta" != "0" && -n "$_abs_path" && -d "$_abs_path" ]]; then
+                    _ext_ahead=$(count_external_ahead "$_abs_path" "$session_name" "$target_branch")
                 fi
-                if ! $_has_external; then
+                if [[ "$_ext_ahead" -eq 0 ]]; then
                     _is_quiet=true
                     _unchanged=$((_unchanged + 1))
                 fi
@@ -180,28 +175,34 @@ _pull_report() {
         fi
 
         # Merge classification (every repo lands in exactly one bucket)
+        # _pre_new_commits tells us if extraction pulled new work from the container
         case "$_merge_status" in
             OK)
                 case "$_merge_detail" in
                     "already up to date"|"up to date"*)
-                        # Merge noop but repo wasn't quiet — must have interesting target-ahead
-                        _unchanged=$((_unchanged + 1))
+                        if [[ "$_pre_new_commits" -gt 0 ]]; then
+                            _ready_lines+=("$_rel_path — ${_pre_new_commits} new commits extracted, already in ${target_branch}")
+                            _ready=$((_ready + 1))
+                        else
+                            _unchanged=$((_unchanged + 1))
+                        fi
                         ;;
                     *)
-                        # Get inline diffstat for the ready line
                         local _rdiff=""
-                        local _rpath
-                        _rpath=$(echo "$projects" | grep "^${_repo}|" | head -1 | cut -d'|' -f2)
-                        if [[ -n "$_rpath" && -d "$_rpath" ]]; then
-                            _rdiff=$(git -C "$_rpath" diff --stat "$target_branch".."$session_name" 2>/dev/null | tail -1)
+                        if [[ -n "$_abs_path" && -d "$_abs_path" ]]; then
+                            _rdiff=$(git -C "$_abs_path" diff --stat "$target_branch".."$session_name" 2>/dev/null | tail -1)
                         fi
-                        _ready_lines+=("$_rel_path — $_merge_detail${_rdiff:+ | $_rdiff}")
+                        local _new_info=""
+                        [[ "$_pre_new_commits" -gt 0 ]] && _new_info="${_pre_new_commits} new commits, "
+                        _ready_lines+=("$_rel_path — ${_new_info}${_merge_detail}${_rdiff:+ | $_rdiff}")
                         _ready=$((_ready + 1))
                         ;;
                 esac
                 ;;
             SKIP)
-                _skip_lines+=("$_rel_path — ${_merge_detail}")
+                local _skip_info=""
+                [[ "$_pre_new_commits" -gt 0 ]] && _skip_info="${_pre_new_commits} new commits, "
+                _skip_lines+=("$_rel_path — ${_skip_info}${_merge_detail}")
                 _skipped=$((_skipped + 1))
                 ;;
             CONFLICT)
@@ -226,20 +227,10 @@ _pull_report() {
         esac
 
         # Count target-ahead (for the hint in diffstat, not rendered here)
-        if [[ -n "$_rpt_ta" && "$_rpt_ta" != "0" ]]; then
-            local _ta_proj_path
-            _ta_proj_path=$(echo "$projects" | grep "^${_repo}|" | head -1 | cut -d'|' -f2)
-            if [[ -n "$_ta_proj_path" && -d "$_ta_proj_path" ]]; then
-                local _ta_log _ta_external=0
-                _ta_log=$(git -C "$_ta_proj_path" log --oneline "$session_name".."$target_branch" 2>/dev/null | head -5)
-                while IFS= read -r _ta_line; do
-                    [[ -z "$_ta_line" ]] && continue
-                    if ! echo "$_ta_line" | grep -qE "^[0-9a-f]+ ${session_name} → "; then
-                        _ta_external=$((_ta_external + 1))
-                    fi
-                done <<< "$_ta_log"
-                [[ $_ta_external -gt 0 ]] && _target_ahead_count=$((_target_ahead_count + 1))
-            fi
+        if [[ -n "$_rpt_ta" && "$_rpt_ta" != "0" && -n "$_abs_path" && -d "$_abs_path" ]]; then
+            local _ext_ahead
+            _ext_ahead=$(count_external_ahead "$_abs_path" "$session_name" "$target_branch")
+            [[ "$_ext_ahead" -gt 0 ]] && _target_ahead_count=$((_target_ahead_count + 1))
         fi
     done
 

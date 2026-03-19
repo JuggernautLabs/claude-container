@@ -208,6 +208,109 @@ detect_result_get() {
     grep "^${2}=" "$1" 2>/dev/null | tail -1 | cut -d= -f2-
 }
 
+# Check if a git log line is a squash-merge commit (our own, not external)
+# Usage: is_squash_commit <log_line> <session_name>
+# Returns 0 if the line matches the squash pattern, 1 otherwise
+is_squash_commit() {
+    echo "$1" | grep -qE "^[0-9a-f]+ ${2} → "
+}
+
+# Count non-squash (external) commits on target ahead of session
+# Usage: count_external_ahead <repo_path> <session_name> <target_branch>
+# Outputs: count (0 means all ahead commits are our squash-merges)
+count_external_ahead() {
+    local repo_path="$1" session_name="$2" target_branch="$3"
+    local _ext=0
+    local _log
+    _log=$(git -C "$repo_path" log --oneline "$session_name".."$target_branch" 2>/dev/null | head -10)
+    while IFS= read -r _line; do
+        [[ -z "$_line" ]] && continue
+        is_squash_commit "$_line" "$session_name" || _ext=$((_ext + 1))
+    done <<< "$_log"
+    echo "$_ext"
+}
+
+# Pre-extraction status for a single repo: compare container HEAD vs host session branch vs target
+# Writes results to the pull result dir so the report can show deltas.
+# Must be called BEFORE extraction (which flattens the container→session delta).
+#
+# Usage: detect_pre_extract_status <repo_name> <container_head> <host_path> <session_name> <target_branch> <result_dir>
+#
+# Result keys written:
+#   container_head    = container HEAD hash
+#   pre_session_head  = host session branch HEAD (before extraction)
+#   pre_target_head   = host target branch HEAD
+#   pre_new_commits   = count of commits container has that session branch doesn't
+#   pre_status        = ahead | up_to_date | rebased | diverged | not_extracted
+detect_pre_extract_status() {
+    local repo_name="$1"
+    local container_head="$2"
+    local host_path="$3"
+    local session_name="$4"
+    local target_branch="$5"
+    local result_dir="$6"
+
+    _pull_result_set "$result_dir" "$repo_name" "container_head" "$container_head"
+    _pull_result_set "$result_dir" "$repo_name" "repo_name" "$repo_name"
+
+    # Host session branch HEAD
+    local session_head=""
+    if [[ -n "$host_path" && -d "$host_path" ]]; then
+        if git -C "$host_path" show-ref --verify --quiet "refs/heads/$session_name" 2>/dev/null; then
+            session_head=$(git -C "$host_path" rev-parse "refs/heads/$session_name" 2>/dev/null)
+        fi
+        _pull_result_set "$result_dir" "$repo_name" "pre_session_head" "${session_head:-}"
+
+        # Target branch HEAD
+        if [[ -n "$target_branch" ]]; then
+            local target_head=""
+            target_head=$(git -C "$host_path" rev-parse "refs/heads/$target_branch" 2>/dev/null || echo "")
+            [[ -n "$target_head" ]] && _pull_result_set "$result_dir" "$repo_name" "pre_target_head" "$target_head"
+        fi
+    fi
+
+    # Compute pre-extraction delta
+    if [[ -z "$session_head" ]]; then
+        _pull_result_set "$result_dir" "$repo_name" "pre_status" "not_extracted"
+        _pull_result_set "$result_dir" "$repo_name" "pre_new_commits" "0"
+        return 0
+    fi
+
+    if [[ "$container_head" == "$session_head" ]]; then
+        _pull_result_set "$result_dir" "$repo_name" "pre_status" "up_to_date"
+        _pull_result_set "$result_dir" "$repo_name" "pre_new_commits" "0"
+    elif [[ -n "$host_path" && -d "$host_path" ]]; then
+        if git -C "$host_path" merge-base --is-ancestor "$session_head" "$container_head" 2>/dev/null; then
+            # Container is ahead of session branch (normal case after work)
+            local _nc
+            _nc=$(git -C "$host_path" rev-list --count "$session_head".."$container_head" 2>/dev/null || echo "0")
+            _pull_result_set "$result_dir" "$repo_name" "pre_status" "ahead"
+            _pull_result_set "$result_dir" "$repo_name" "pre_new_commits" "$_nc"
+        else
+            # Different SHAs but not ancestor — rebased or diverged
+            local _mb
+            _mb=$(git -C "$host_path" merge-base "$session_head" "$container_head" 2>/dev/null || echo "")
+            if [[ -n "$_mb" ]]; then
+                local _c_ahead _h_ahead
+                _c_ahead=$(git -C "$host_path" rev-list --count "$_mb".."$container_head" 2>/dev/null || echo "0")
+                _h_ahead=$(git -C "$host_path" rev-list --count "$_mb".."$session_head" 2>/dev/null || echo "0")
+                if [[ "$_c_ahead" == "0" && "$_h_ahead" == "0" ]]; then
+                    _pull_result_set "$result_dir" "$repo_name" "pre_status" "rebased"
+                else
+                    _pull_result_set "$result_dir" "$repo_name" "pre_status" "rebased"
+                fi
+                _pull_result_set "$result_dir" "$repo_name" "pre_new_commits" "$_c_ahead"
+            else
+                _pull_result_set "$result_dir" "$repo_name" "pre_status" "diverged"
+                _pull_result_set "$result_dir" "$repo_name" "pre_new_commits" "0"
+            fi
+        fi
+    else
+        _pull_result_set "$result_dir" "$repo_name" "pre_status" "ahead"
+        _pull_result_set "$result_dir" "$repo_name" "pre_new_commits" "0"
+    fi
+}
+
 # Build Claude's reconcile prompt from detection results and session state.
 # Usage: build_reconcile_prompt <session_name> <target_branch> <summary_lines[]> <conflict_count> <dirty_count> <reverse_conflict_repos[]> <reverse_conflict_files[]>
 # Output: prompt text to stdout
