@@ -197,10 +197,44 @@ _pull_report() {
     [[ $_ready -gt 0 || $_skipped -gt 0 || $_conflicts -gt 0 || ${#_attention_lines[@]} -gt 0 || ${#_discovered_lines[@]} -gt 0 ]] && _has_content=true
 
     if ! $_has_content; then
-        if [[ $_unchanged -gt 0 ]]; then
+        # When --repo filter is active, show each matched repo by name
+        if [[ -n "$repo_filter" && $_unchanged -gt 0 ]]; then
+            if [[ -n "$target_branch" ]]; then
+                _rule "pull: ${session_name} → ${target_branch}"
+            else
+                _rule "pull: ${session_name}"
+            fi
+            for _repo in "${_repo_names[@]}"; do
+                echo -e "  ${GREEN}✓${NC} ${_repo##*/} — up to date"
+            done
+            echo ""
+            _rule
+        elif [[ $_unchanged -gt 0 ]]; then
             echo -e "${DIM}${_unchanged} repo(s) unchanged${NC}"
         else
             echo -e "${DIM}no repos to report${NC}"
+        fi
+        # Still check for unmatched filter terms
+        if [[ -n "$repo_filter" ]]; then
+            local -a _all_session_repos=()
+            if [[ -n "$projects" ]]; then
+                while IFS='|' read -r _apname _appath; do
+                    [[ -n "$_apname" ]] && _all_session_repos+=("$_apname")
+                done <<< "$projects"
+            fi
+            local IFS=','
+            for _fterm in $repo_filter; do
+                local _fmatched=false
+                for _fname in "${_all_session_repos[@]}"; do
+                    if [[ "$_fname" == *"$_fterm"* ]]; then
+                        _fmatched=true
+                        break
+                    fi
+                done
+                if ! $_fmatched; then
+                    warn "no repo matching '$_fterm' found in session"
+                fi
+            done
         fi
         return 0
     fi
