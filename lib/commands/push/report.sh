@@ -22,27 +22,10 @@ _push_report() {
     projects=$(parse_session_projects "$config_content")
     [[ -n "$repo_filter" ]] && projects=$(augment_projects_from_volume "$volume" "$projects" "$repo_filter")
 
-    # Get post-merge session state
-    local _util_image="${GIT_UTIL_IMAGE:-alpine/git}"
-    local _post_scan
-    _post_scan=$(docker run --rm --entrypoint sh \
-        -e HOME=/tmp \
-        -v "$volume:/session:ro" "$_util_image" \
-        -c '
-            git config --global --add safe.directory "*"
-            for d in /session/*/ /session/*/*/; do
-                [ -d "$d/.git" ] || continue
-                name="${d#/session/}"; name="${name%/}"
-                head=$(cd "$d" && git rev-parse --short HEAD 2>/dev/null)
-                echo "$name|$head"
-            done
-        ' 2>/dev/null) || true
-
-    declare -A _post_heads
-    while IFS='|' read -r _sn _sh; do
-        [[ -z "$_sn" ]] && continue
-        _post_heads[$_sn]="$_sh"
-    done <<< "$_post_scan"
+    # Get post-merge session state via snapshot
+    local _post_snap_dir
+    _post_snap_dir=$(mktemp -d)
+    snapshot_session_state "$volume" "$session_name" "$source_branch" "$_post_snap_dir" "$repo_filter"
 
     # Check each repo: is host branch now an ancestor of session HEAD?
     local _merged=0 _skipped=0
@@ -60,21 +43,25 @@ _push_report() {
         _host_head=$(git -C "$proj_path" rev-parse "refs/heads/$source_branch" 2>/dev/null || echo "")
         [[ -z "$_host_head" ]] && continue
 
-        local _post_head="${_post_heads[$proj_name]:-}"
+        local _post_head
+        _post_head=$(_pull_result_get "$_post_snap_dir" "$proj_name" "container_head")
         [[ -z "$_post_head" ]] && continue
+        local _post_short="${_post_head:0:7}"
 
         # Check ancestry: is host branch HEAD now in session?
         local _still_ahead
         _still_ahead=$(git -C "$proj_path" rev-list --count "$session_name".."$source_branch" 2>/dev/null || echo "0")
 
         if [[ "$_still_ahead" -eq 0 ]]; then
-            echo -e "  ${GREEN}✓${NC} $proj_name  ${DIM}session:${_post_head}${NC}"
+            echo -e "  ${GREEN}✓${NC} $proj_name  ${DIM}session:${_post_short}${NC}"
             _merged=$((_merged + 1))
         else
             echo -e "  ${DIM}·${NC} $proj_name  ${DIM}${_still_ahead} still ahead${NC}"
             _skipped=$((_skipped + 1))
         fi
     done <<< "$projects"
+
+    rm -rf "$_post_snap_dir"
 
     # Extract silently to sync host session branches
     session_extract "$session_name" --force > /dev/null 2>&1

@@ -220,23 +220,9 @@ cmd_pull() {
     fi
     echo ""
 
-    # Capture pre-extraction status (container vs session vs target) BEFORE extraction
+    # Snapshot ALL container + host state BEFORE extraction
     # Extraction flattens the container→session delta — we need this for the report
-    local _pre_heads
-    _pre_heads=$(get_session_heads "claude-session-${session_name}")
-    if [[ -n "$_pre_heads" ]]; then
-        local _pre_cfg
-        _pre_cfg=$(read_session_config "claude-session-${session_name}")
-        local _pre_projects=""
-        [[ -n "$_pre_cfg" ]] && _pre_projects=$(parse_session_projects "$_pre_cfg")
-
-        while IFS='|' read -r _ph_name _ph_head; do
-            [[ -z "$_ph_name" ]] && continue
-            local _ph_path
-            _ph_path=$(echo "$_pre_projects" | grep "^${_ph_name}|" | head -1 | cut -d'|' -f2)
-            detect_pre_extract_status "$_ph_name" "$_ph_head" "${_ph_path:-}" "$session_name" "${branch:-}" "$_pull_result_dir"
-        done <<< "$_pre_heads"
-    fi
+    snapshot_session_state "claude-session-${session_name}" "$session_name" "${branch:-}" "$_pull_result_dir" "$repo_filter"
 
     # Extract with result tracking
     extract_args+=(--result-dir "$_pull_result_dir")

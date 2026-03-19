@@ -27,32 +27,10 @@ _push_discuss_prompt() {
     prompt+=$'\n'"Here is the current state of each repo:"
     prompt+=$'\n'
 
-    # Scan session for current state
-    local _util_image="${GIT_UTIL_IMAGE:-alpine/git}"
-    local _scan
-    _scan=$(docker run --rm --entrypoint sh \
-        -e HOME=/tmp \
-        -v "$volume:/session:ro" "$_util_image" \
-        -c '
-            git config --global --add safe.directory "*"
-            for d in /session/*/ /session/*/*/; do
-                [ -d "$d/.git" ] || continue
-                name="${d#/session/}"; name="${name%/}"
-                head=$(cd "$d" && git rev-parse --short HEAD 2>/dev/null)
-                dirty=$(cd "$d" && git status --porcelain 2>/dev/null | wc -l | tr -d " ")
-                merging="no"
-                [ -f "$d/.git/MERGE_HEAD" ] && merging="yes"
-                echo "$name|$head|$dirty|$merging"
-            done
-        ' 2>/dev/null) || true
-
-    declare -A _session_heads _session_dirty _session_merging
-    while IFS='|' read -r _sn _sh _sd _sm; do
-        [[ -z "$_sn" ]] && continue
-        _session_heads[$_sn]="$_sh"
-        _session_dirty[$_sn]="${_sd:-0}"
-        _session_merging[$_sn]="$_sm"
-    done <<< "$_scan"
+    # Use snapshot for session state
+    local _prompt_snap_dir
+    _prompt_snap_dir=$(mktemp -d)
+    snapshot_session_state "$volume" "$session_name" "$source_branch" "$_prompt_snap_dir" "$repo_filter"
 
     local _active_count=0
 
@@ -60,6 +38,12 @@ _push_discuss_prompt() {
         while IFS='|' read -r _pname _ppath; do
             [[ -z "$_pname" ]] && continue
             repo_matches_filter "$_pname" "$repo_filter" || continue
+
+            # Read from snapshot
+            local _s_head _s_dirty _s_merging
+            _s_head=$(_pull_result_get "$_prompt_snap_dir" "$_pname" "container_head")
+            _s_dirty=$(_pull_result_get "$_prompt_snap_dir" "$_pname" "dirty_count")
+            _s_merging=$(_pull_result_get "$_prompt_snap_dir" "$_pname" "merging")
 
             # Check if host has commits session doesn't
             local _host_ahead=0
@@ -69,20 +53,20 @@ _push_discuss_prompt() {
 
             # Skip repos where host has nothing new and session is clean
             if [[ "$_host_ahead" -eq 0 ]] && \
-               [[ "${_session_dirty[$_pname]:-0}" -eq 0 ]] && \
-               [[ "${_session_merging[$_pname]:-no}" == "no" ]]; then
+               [[ "${_s_dirty:-0}" -eq 0 ]] && \
+               [[ "${_s_merging:-no}" == "no" ]]; then
                 continue
             fi
 
             _active_count=$((_active_count + 1))
             prompt+=$'\n'"## $_pname"
-            prompt+=$'\n'"  session HEAD: ${_session_heads[$_pname]:-unknown}"
+            prompt+=$'\n'"  session HEAD: ${_s_head:0:7}"
 
-            if [[ "${_session_merging[$_pname]:-no}" == "yes" ]]; then
+            if [[ "${_s_merging:-no}" == "yes" ]]; then
                 prompt+=$'\n'"  WARNING: merge already in progress in session"
             fi
-            if [[ "${_session_dirty[$_pname]:-0}" -gt 0 ]]; then
-                prompt+=$'\n'"  WARNING: ${_session_dirty[$_pname]} uncommitted file(s) in session"
+            if [[ "${_s_dirty:-0}" -gt 0 ]]; then
+                prompt+=$'\n'"  WARNING: ${_s_dirty} uncommitted file(s) in session"
             fi
 
             if [[ "$_host_ahead" -gt 0 && -d "$_ppath" ]]; then
@@ -92,13 +76,15 @@ _push_discuss_prompt() {
                 [[ -n "$_log" ]] && prompt+=$'\n'"$(echo "$_log" | sed 's/^/    /')"
 
                 local _stat
-                _stat=$(git -C "$_ppath" diff --stat "$session_name".."$source_branch" 2>/dev/null)
+                _stat=$(snapshot_diff "$_prompt_snap_dir" "$_pname" "inbound" "stat")
                 [[ -n "$_stat" ]] && prompt+=$'\n'"  diff:"$'\n'"$(echo "$_stat" | sed 's/^/    /')"
             elif [[ "$_host_ahead" -eq 0 ]]; then
                 prompt+=$'\n'"  host '$source_branch': up to date with session"
             fi
         done <<< "$projects"
     fi
+
+    rm -rf "$_prompt_snap_dir"
 
     if [[ $_active_count -eq 0 ]]; then
         prompt+=$'\n'"All repos are up to date — nothing to push."

@@ -1828,31 +1828,21 @@ session_merge_into() {
     local summary_lines=()  # Collect summary for Claude's initial prompt
     local mount_repos=()    # Collect proj_name|proj_path for .merge-into-mounts marker
 
-    # Phase 1: Single fast scan for merge-in-progress + dirty status across all repos
-    local _util_image="${GIT_UTIL_IMAGE:-alpine/git}"
-    local _merge_scan
-    _merge_scan=$(docker run --rm --entrypoint sh \
-        -e HOME=/tmp \
-        -v "$volume:/session:ro" "$_util_image" \
-        -c '
-            git config --global --add safe.directory "*"
-            for d in /session/*/ /session/*/*/; do
-                [ -d "$d/.git" ] || continue
-                name="${d#/session/}"; name="${name%/}"
-                merging="no"
-                [ -f "$d/.git/MERGE_HEAD" ] && merging="yes"
-                dirty=$(cd "$d" && git status --porcelain 2>/dev/null | wc -l | tr -d " ")
-                echo "$name|$merging|$dirty"
-            done
-        ' 2>/dev/null) || true
+    # Phase 1: Snapshot container + host state (single docker run)
+    local _mi_snap_dir
+    _mi_snap_dir=$(mktemp -d)
+    snapshot_session_state "$volume" "$session_name" "$target_branch" "$_mi_snap_dir"
 
-    # Build lookup maps
     declare -A _merge_status _dirty_file_count
-    while IFS='|' read -r _mn _mm _md; do
+    for _mif in "$_mi_snap_dir"/*; do
+        [[ -f "$_mif" ]] || continue
+        local _mn
+        _mn=$(grep "^repo_name=" "$_mif" 2>/dev/null | tail -1 | cut -d= -f2-)
         [[ -z "$_mn" ]] && continue
-        _merge_status[$_mn]="$_mm"
-        _dirty_file_count[$_mn]="${_md:-0}"
-    done <<< "$_merge_scan"
+        _merge_status[$_mn]=$(grep "^merging=" "$_mif" 2>/dev/null | tail -1 | cut -d= -f2-)
+        _dirty_file_count[$_mn]=$(grep "^dirty_count=" "$_mif" 2>/dev/null | tail -1 | cut -d= -f2-)
+    done
+    rm -rf "$_mi_snap_dir"
 
     # Phase 2: Host-side filtering (NO docker)
     # Classify each repo: skip, dirty, merge-in-progress, or merge candidate
@@ -2548,8 +2538,12 @@ _extract_multi_project_direct() {
                     [ -z "$name" ] && continue
                     safe=$(echo "$name" | tr "/" "_")
                     cd "/session/$name" 2>/dev/null || continue
-                    ref=$(git rev-parse "$AT_REF" 2>/dev/null || echo HEAD)
-                    git bundle create "/tmp/${safe}.bundle" "$ref" 2>/dev/null && \
+                    # Checkout the target ref if not HEAD, then bundle HEAD.
+                    # git bundle needs a ref name (not a bare SHA) to create a valid bundle.
+                    if [ "$AT_REF" != "HEAD" ]; then
+                        git checkout "$AT_REF" 2>/dev/null || true
+                    fi
+                    git bundle create "/tmp/${safe}.bundle" HEAD 2>/dev/null && \
                         mv "/tmp/${safe}.bundle" "/bundles/${safe}.bundle" 2>/dev/null
                 done < /bundles/.to-bundle
             ' 2>/dev/null || true
@@ -3645,20 +3639,20 @@ session_repair() {
         warn "Session has a running container — some repairs may not take effect until restart"
     fi
 
-    # 8. Check for uncommitted changes in session repos
-    local _dirty_scan
-    _dirty_scan=$(docker run --rm --entrypoint sh \
-        -e HOME=/tmp \
-        -v "$volume:/session:ro" "$git_image" \
-        -c '
-            git config --global --add safe.directory "*"
-            for d in /session/*/ /session/*/*/; do
-                [ -d "$d/.git" ] || continue
-                name="${d#/session/}"; name="${name%/}"
-                count=$(cd "$d" && git status --porcelain 2>/dev/null | wc -l | tr -d " ")
-                [ "$count" -gt 0 ] && echo "$name|$count"
-            done
-        ' 2>/dev/null) || true
+    # 8. Check for uncommitted changes in session repos (via snapshot)
+    local _repair_snap_dir
+    _repair_snap_dir=$(mktemp -d)
+    snapshot_session_state "$volume" "$session" "" "$_repair_snap_dir"
+
+    local _dirty_scan=""
+    for _rsf in "$_repair_snap_dir"/*; do
+        [[ -f "$_rsf" ]] || continue
+        local _rname _rdc
+        _rname=$(grep "^repo_name=" "$_rsf" 2>/dev/null | tail -1 | cut -d= -f2-)
+        _rdc=$(grep "^dirty_count=" "$_rsf" 2>/dev/null | tail -1 | cut -d= -f2-)
+        [[ -n "$_rname" && -n "$_rdc" && "$_rdc" -gt 0 ]] && _dirty_scan+="${_rname}|${_rdc}"$'\n'
+    done
+    rm -rf "$_repair_snap_dir"
 
     if [[ -n "$_dirty_scan" ]]; then
         local _dirty_count=0

@@ -28,30 +28,20 @@ _pull_reconcile_preview() {
     projects=$(parse_session_projects "$config_content")
     [[ -n "$repo_filter" ]] && projects=$(augment_projects_from_volume "$volume" "$projects" "$repo_filter")
 
-    # Get session scan (dirty/merge status)
-    local _util_image="${GIT_UTIL_IMAGE:-alpine/git}"
-    local _merge_scan
-    _merge_scan=$(docker run --rm --entrypoint sh \
-        -e HOME=/tmp \
-        -v "$volume:/session:ro" "$_util_image" \
-        -c '
-            git config --global --add safe.directory "*"
-            for d in /session/*/ /session/*/*/; do
-                [ -d "$d/.git" ] || continue
-                name="${d#/session/}"; name="${name%/}"
-                merging="no"
-                [ -f "$d/.git/MERGE_HEAD" ] && merging="yes"
-                dirty=$(cd "$d" && git status --porcelain 2>/dev/null | wc -l | tr -d " ")
-                echo "$name|$merging|$dirty"
-            done
-        ' 2>/dev/null) || true
+    # Snapshot container + host state (single docker run)
+    local _rc_snap_dir
+    _rc_snap_dir=$(mktemp -d)
+    snapshot_session_state "$volume" "$session_name" "$target_branch" "$_rc_snap_dir" "$repo_filter"
 
     declare -A _merge_status _dirty_count
-    while IFS='|' read -r _sname _smerge _sdirty; do
+    for _rcf in "$_rc_snap_dir"/*; do
+        [[ -f "$_rcf" ]] || continue
+        local _sname
+        _sname=$(grep "^repo_name=" "$_rcf" 2>/dev/null | tail -1 | cut -d= -f2-)
         [[ -z "$_sname" ]] && continue
-        _merge_status[$_sname]="$_smerge"
-        _dirty_count[$_sname]="$_sdirty"
-    done <<< "$_merge_scan"
+        _merge_status[$_sname]=$(grep "^merging=" "$_rcf" 2>/dev/null | tail -1 | cut -d= -f2-)
+        _dirty_count[$_sname]=$(grep "^dirty_count=" "$_rcf" 2>/dev/null | tail -1 | cut -d= -f2-)
+    done
 
     # Dry-run session->main merge (same detection as pull --verify)
     local _preview_dir
@@ -104,15 +94,9 @@ _pull_reconcile_preview() {
                             # Check if target-ahead commits are all benign squash-merges
                             local _skip_external=false
                             if [[ -n "$_skip_target_ahead" && "$_skip_target_ahead" != "0" ]]; then
-                                local _skip_log
-                                _skip_log=$(git -C "$proj_path" log --oneline "$session_name".."$target_branch" 2>/dev/null | head -5)
-                                while IFS= read -r _skip_line; do
-                                    [[ -z "$_skip_line" ]] && continue
-                                    if ! echo "$_skip_line" | grep -qE "^[0-9a-f]+ ${session_name} → "; then
-                                        _skip_external=true
-                                        break
-                                    fi
-                                done <<< "$_skip_log"
+                                local _skip_ext_ahead
+                                _skip_ext_ahead=$(_pull_result_get "$_rc_snap_dir" "$proj_name" "external_ahead")
+                                [[ -n "$_skip_ext_ahead" && "$_skip_ext_ahead" -gt 0 ]] && _skip_external=true
                             fi
                             if ! $_skip_external; then
                                 _up_to_date=$((_up_to_date + 1))
@@ -169,9 +153,9 @@ _pull_reconcile_preview() {
                 _would_conflict=$((_would_conflict + 1))
                 _rev_conflict_repos+=("$proj_name")
                 _rev_conflict_files+=("${_out_files:-?}")
-                # Diffstat
+                # Diffstat (squash-aware)
                 local _stat
-                _stat=$(git -C "$proj_path" diff --stat "$target_branch".."$session_name" 2>/dev/null)
+                _stat=$(snapshot_diff "$_rc_snap_dir" "$proj_name" "outbound" "stat")
                 if [[ -n "$_stat" ]]; then
                     echo "$_stat" | sed '$d' | sed 's/^/      /'
                     echo "      $(echo "$_stat" | tail -1)"
@@ -190,26 +174,24 @@ _pull_reconcile_preview() {
         _target_ahead=$(_pull_result_get "$_preview_dir" "$proj_name" "target_ahead")
         if [[ -n "$_target_ahead" && "$_target_ahead" != "0" ]]; then
             # Check if all ahead commits are our own squash-merges (benign)
-            local _ahead_log _rc_external=0
-            _ahead_log=$(git -C "$proj_path" log --oneline "$session_name".."$target_branch" 2>/dev/null | head -5)
-            while IFS= read -r _ahead_line; do
-                [[ -z "$_ahead_line" ]] && continue
-                if ! echo "$_ahead_line" | grep -qE "^[0-9a-f]+ ${session_name} → "; then
-                    _rc_external=$((_rc_external + 1))
-                fi
-            done <<< "$_ahead_log"
+            local _rc_external=0
+            local _rc_ext_ahead
+            _rc_ext_ahead=$(_pull_result_get "$_rc_snap_dir" "$proj_name" "external_ahead")
+            [[ -n "$_rc_ext_ahead" ]] && _rc_external=$_rc_ext_ahead
 
             if [[ $_rc_external -gt 0 ]]; then
                 echo -e "    ${DIM}· ${target_branch} has ${_target_ahead} commit(s) not in session:${NC}"
+                local _rc_ahead_log
+                _rc_ahead_log=$(git -C "$proj_path" log --oneline "$session_name".."$target_branch" 2>/dev/null | head -5)
                 while IFS= read -r _ahead_line; do
                     [[ -n "$_ahead_line" ]] && echo "      $_ahead_line"
-                done <<< "$_ahead_log"
+                done <<< "$_rc_ahead_log"
                 local _risk_stat
-                _risk_stat=$(git -C "$proj_path" diff --stat "$session_name".."$target_branch" 2>/dev/null | tail -1)
+                _risk_stat=$(snapshot_diff "$_rc_snap_dir" "$proj_name" "inbound" "summary")
                 [[ -n "$_risk_stat" ]] && echo -e "      ${DIM}$_risk_stat${NC}"
             else
                 local _rc_squash_stat
-                _rc_squash_stat=$(git -C "$proj_path" diff --stat "$session_name".."$target_branch" 2>/dev/null | tail -1)
+                _rc_squash_stat=$(snapshot_diff "$_rc_snap_dir" "$proj_name" "inbound" "summary")
                 if [[ -n "$_rc_squash_stat" ]]; then
                     echo -e "    ${DIM}${target_branch} +${_target_ahead} (prior squash-merge): $_rc_squash_stat${NC}"
                 else
@@ -220,7 +202,7 @@ _pull_reconcile_preview() {
         echo ""
     done <<< "$projects"
 
-    rm -rf "$_preview_dir"
+    rm -rf "$_rc_snap_dir" "$_preview_dir"
 
     # Summary
     [[ $_up_to_date -gt 0 ]] && info "$_up_to_date repo(s) up to date (hidden)"

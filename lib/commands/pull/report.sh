@@ -119,13 +119,22 @@ _pull_report() {
             _rel_path=$(python3 -c "import os; print(os.path.relpath('$_abs_path', '$_cwd'))" 2>/dev/null || echo "${_abs_path/#$HOME/~}")
         fi
 
-        # Discovered (not extracted) → own bucket
-        if [[ "$_ext_status" == "discovered" ]]; then
-            _discovered_lines+=("$_rel_path")
+        # Discovered (extract: false) → own bucket with new-work indicator
+        local _extract_enabled
+        _extract_enabled=$(_pull_result_get "$result_dir" "$_repo" "extract_enabled")
+        if [[ "$_extract_enabled" == "false" || "$_ext_status" == "discovered" ]]; then
+            local _container_head_d _session_head_d
+            _container_head_d=$(_pull_result_get "$result_dir" "$_repo" "container_head")
+            _session_head_d=$(_pull_result_get "$result_dir" "$_repo" "session_head")
+            local _disc_info="not extracted"
+            if [[ -n "$_container_head_d" && "$_container_head_d" != "$_session_head_d" ]]; then
+                _disc_info="new work in container, not extracted"
+            fi
+            _discovered_lines+=("$_rel_path — $_disc_info")
             continue
         fi
 
-        # Read pre-extraction status (set by detect_pre_extract_status in cmd_pull)
+        # Read pre-extraction status (set by snapshot_session_state)
         local _pre_status _pre_new_commits
         _pre_status=$(_pull_result_get "$result_dir" "$_repo" "pre_status")
         _pre_new_commits=$(_pull_result_get "$result_dir" "$_repo" "pre_new_commits")
@@ -145,9 +154,8 @@ _pull_report() {
             if $_merge_is_noop; then
                 # Check if target has external (non-squash) commits ahead
                 local _ext_ahead=0
-                if [[ -n "$_rpt_ta" && "$_rpt_ta" != "0" && -n "$_abs_path" && -d "$_abs_path" ]]; then
-                    _ext_ahead=$(count_external_ahead "$_abs_path" "$session_name" "$target_branch")
-                fi
+                _ext_ahead=$(_pull_result_get "$result_dir" "$_repo" "external_ahead")
+                [[ -z "$_ext_ahead" ]] && _ext_ahead=0
                 if [[ "$_ext_ahead" -eq 0 ]]; then
                     _is_quiet=true
                     _unchanged=$((_unchanged + 1))
@@ -195,18 +203,16 @@ _pull_report() {
             OK)
                 case "$_merge_detail" in
                     "already up to date"|"up to date"*)
+                        # Merge says nothing to do — don't count as "ready".
+                        # If there were new commits, show informational line but don't inflate ready count.
                         if [[ "$_pre_new_commits" -gt 0 ]]; then
-                            _ready_lines+=("$_rel_path — new changes extracted, already in ${target_branch}|${_hash_line}")
-                            _ready=$((_ready + 1))
-                        else
-                            _unchanged=$((_unchanged + 1))
+                            _ready_lines+=("$_rel_path — extracted, ${_merge_detail}|${_hash_line}")
                         fi
+                        _unchanged=$((_unchanged + 1))
                         ;;
                     *)
                         local _rdiff=""
-                        if [[ -n "$_abs_path" && -d "$_abs_path" ]]; then
-                            _rdiff=$(git -C "$_abs_path" diff --stat "$target_branch".."$session_name" 2>/dev/null | tail -1)
-                        fi
+                        _rdiff=$(snapshot_diff "$result_dir" "$_repo" "outbound" "summary")
                         local _new_info=""
                         [[ "$_pre_new_commits" -gt 0 ]] && _new_info="new changes, "
                         _ready_lines+=("$_rel_path — ${_new_info}${_merge_detail}${_rdiff:+ | $_rdiff}|${_hash_line}")
@@ -242,17 +248,17 @@ _pull_report() {
         esac
 
         # Count target-ahead (for the hint in diffstat, not rendered here)
-        if [[ -n "$_rpt_ta" && "$_rpt_ta" != "0" && -n "$_abs_path" && -d "$_abs_path" ]]; then
+        if [[ -n "$_rpt_ta" && "$_rpt_ta" != "0" ]]; then
             local _ext_ahead
-            _ext_ahead=$(count_external_ahead "$_abs_path" "$session_name" "$target_branch")
-            [[ "$_ext_ahead" -gt 0 ]] && _target_ahead_count=$((_target_ahead_count + 1))
+            _ext_ahead=$(_pull_result_get "$result_dir" "$_repo" "external_ahead")
+            [[ -n "$_ext_ahead" && "$_ext_ahead" -gt 0 ]] && _target_ahead_count=$((_target_ahead_count + 1))
         fi
     done
 
     # ── Pass 2: render ──
 
     local _has_content=false
-    [[ $_ready -gt 0 || $_skipped -gt 0 || $_conflicts -gt 0 || ${#_attention_lines[@]} -gt 0 || ${#_discovered_lines[@]} -gt 0 ]] && _has_content=true
+    [[ $_ready -gt 0 || ${#_ready_lines[@]} -gt 0 || $_skipped -gt 0 || $_conflicts -gt 0 || ${#_attention_lines[@]} -gt 0 || ${#_discovered_lines[@]} -gt 0 ]] && _has_content=true
 
     if ! $_has_content; then
         # When --repo filter is active, show each matched repo by name

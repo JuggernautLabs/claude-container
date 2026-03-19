@@ -53,18 +53,9 @@ _pull_discuss_prompt() {
             case "$_merge_detail" in
                 "already up to date"|"up to date"*)
                     local _has_ext=false
-                    if [[ -n "$_target_ahead" && "$_target_ahead" != "0" ]]; then
-                        local _dp_proj_path
-                        _dp_proj_path=$(echo "$projects" | grep "^${_repo}|" | head -1 | cut -d'|' -f2)
-                        if [[ -n "$_dp_proj_path" && -d "$_dp_proj_path" ]]; then
-                            local _dp_log
-                            _dp_log=$(git -C "$_dp_proj_path" log --oneline "$session_name".."$target_branch" 2>/dev/null | head -5)
-                            while IFS= read -r _dp_line; do
-                                [[ -z "$_dp_line" ]] && continue
-                                echo "$_dp_line" | grep -qE "^[0-9a-f]+ ${session_name} → " || _has_ext=true
-                            done <<< "$_dp_log"
-                        fi
-                    fi
+                    local _dp_ext_ahead
+                    _dp_ext_ahead=$(_pull_result_get "$result_dir" "$_repo" "external_ahead")
+                    [[ -n "$_dp_ext_ahead" && "$_dp_ext_ahead" -gt 0 ]] && _has_ext=true
                     $_has_ext || continue
                     ;;
                 "") [[ -z "$_merge_status" ]] && continue ;;
@@ -80,21 +71,21 @@ _pull_discuss_prompt() {
         prompt+=$'\n'"  merge: ${_merge_status:-?} — ${_merge_detail:-?}"
         [[ -n "$_conflict_files" ]] && prompt+=$'\n'"  conflict files: $_conflict_files"
 
-        # Inline diffstat (session -> target)
-        if [[ -n "$_proj_path" && -d "$_proj_path" ]]; then
-            local _ds
-            _ds=$(git -C "$_proj_path" diff --stat "$target_branch".."$session_name" 2>/dev/null)
-            [[ -n "$_ds" ]] && prompt+=$'\n'"  session → ${target_branch} diff:"$'\n'"$(echo "$_ds" | sed 's/^/    /')"
-        fi
+        # Inline diffstat (session -> target, squash-aware)
+        local _ds
+        _ds=$(snapshot_diff "$result_dir" "$_repo" "outbound" "stat")
+        [[ -n "$_ds" ]] && prompt+=$'\n'"  session → ${target_branch} diff:"$'\n'"$(echo "$_ds" | sed 's/^/    /')"
 
-        # Target-ahead info
-        if [[ -n "$_target_ahead" && "$_target_ahead" != "0" && -n "$_proj_path" && -d "$_proj_path" ]]; then
+        # Target-ahead info (inbound)
+        if [[ -n "$_target_ahead" && "$_target_ahead" != "0" ]]; then
             prompt+=$'\n'"  ${target_branch} is ${_target_ahead} commit(s) ahead of session:"
-            local _al
-            _al=$(git -C "$_proj_path" log --oneline "$session_name".."$target_branch" 2>/dev/null | head -10)
-            [[ -n "$_al" ]] && prompt+=$'\n'"$(echo "$_al" | sed 's/^/    /')"
+            if [[ -n "$_proj_path" && -d "$_proj_path" ]]; then
+                local _al
+                _al=$(git -C "$_proj_path" log --oneline "$session_name".."$target_branch" 2>/dev/null | head -10)
+                [[ -n "$_al" ]] && prompt+=$'\n'"$(echo "$_al" | sed 's/^/    /')"
+            fi
             local _rs
-            _rs=$(git -C "$_proj_path" diff --stat "$session_name".."$target_branch" 2>/dev/null)
+            _rs=$(snapshot_diff "$result_dir" "$_repo" "inbound" "stat")
             [[ -n "$_rs" ]] && prompt+=$'\n'"  ${target_branch}-only diff:"$'\n'"$(echo "$_rs" | sed 's/^/    /')"
         fi
     done

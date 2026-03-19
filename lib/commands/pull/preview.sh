@@ -14,55 +14,24 @@ _pull_status() {
         return 1
     fi
 
-    # Get container HEADs (single docker run)
-    local _session_heads
-    _session_heads=$(get_session_heads "$volume")
+    # Snapshot all state
+    local _status_dir
+    _status_dir=$(mktemp -d)
+    trap "rm -rf '$_status_dir'" RETURN
 
-    if [[ -z "$_session_heads" ]]; then
+    snapshot_session_state "$volume" "$session_name" "" "$_status_dir" "$repo_filter"
+
+    # Check if any repos were found
+    local _any_repos=false
+    for _sf in "$_status_dir"/*; do
+        [[ -f "$_sf" ]] && _any_repos=true && break
+    done
+    if ! $_any_repos; then
         info "No repos found in session"
         return 0
     fi
 
-    # Read config for project list and paths
-    local config_content
-    config_content=$(read_session_config "$volume")
-    local projects=""
-    if [[ -n "$config_content" ]] && command -v yq &>/dev/null; then
-        projects=$(parse_session_projects "$config_content")
-    fi
-    [[ -n "$repo_filter" ]] && projects=$(augment_projects_from_volume "$volume" "$projects" "$repo_filter")
-
-    # Build session HEAD lookup
-    declare -A _head_map
-    while IFS='|' read -r _sname _shead; do
-        [[ -z "$_sname" ]] && continue
-        _head_map[$_sname]="$_shead"
-    done <<< "$_session_heads"
-
     local _up_to_date=0 _changed=0 _diverged=0 _not_extracted=0
-
-    # Iterate repos
-    local -a _repos_to_check=()
-    if [[ -n "$projects" ]]; then
-        while IFS='|' read -r _pname _ppath; do
-            [[ -z "$_pname" ]] && continue
-            _repos_to_check+=("$_pname|$_ppath")
-        done <<< "$projects"
-    fi
-    # Also check session repos not in config
-    for _sname in "${!_head_map[@]}"; do
-        local _found=false
-        for _entry in "${_repos_to_check[@]}"; do
-            [[ "${_entry%%|*}" == "$_sname" ]] && _found=true && break
-        done
-        if ! $_found; then
-            local _host_path=""
-            if [[ -n "$projects" ]]; then
-                _host_path=$(resolve_repo_host_path "$_sname" "$projects")
-            fi
-            _repos_to_check+=("$_sname|$_host_path")
-        fi
-    done
 
     # Header
     _rule "status: ${session_name}"
@@ -70,17 +39,20 @@ _pull_status() {
 
     local _first_repo=true
 
-    for _entry in "${_repos_to_check[@]}"; do
-        local _name="${_entry%%|*}"
-        local _path="${_entry#*|}"
+    for _sf in "$_status_dir"/*; do
+        [[ -f "$_sf" ]] || continue
+        local _name
+        _name=$(_pull_result_get "$_status_dir" "$(basename "$_sf")" "repo_name")
+        # result files use repo_name key but filename has slashes→underscores
+        # re-read using the actual filename as the "repo" key won't work — grep by key
+        _name=$(grep "^repo_name=" "$_sf" 2>/dev/null | tail -1 | cut -d= -f2-)
+        [[ -z "$_name" ]] && continue
 
-        # Apply repo filter
-        repo_matches_filter "$_name" "$repo_filter" || continue
-
-        local _s_head="${_head_map[$_name]:-}"
-        if [[ -z "$_s_head" ]]; then
-            continue  # repo not in container
-        fi
+        local _s_head _session_head _path _container_known
+        _s_head=$(grep "^container_head=" "$_sf" 2>/dev/null | tail -1 | cut -d= -f2-)
+        _session_head=$(grep "^session_head=" "$_sf" 2>/dev/null | tail -1 | cut -d= -f2-)
+        _path=$(grep "^host_path=" "$_sf" 2>/dev/null | tail -1 | cut -d= -f2-)
+        _container_known=$(grep "^container_known=" "$_sf" 2>/dev/null | tail -1 | cut -d= -f2-)
 
         local _short_c="${_s_head:0:7}"
 
@@ -92,12 +64,6 @@ _pull_status() {
             echo -e "    ${YELLOW}!${NC} host path missing"
             _not_extracted=$((_not_extracted + 1))
             continue
-        fi
-
-        # Compare with host session branch
-        local _h_head=""
-        if git -C "$_path" show-ref --verify --quiet "refs/heads/$session_name" 2>/dev/null; then
-            _h_head=$(git -C "$_path" rev-parse "refs/heads/$session_name" 2>/dev/null)
         fi
 
         # Also show target branch HEAD if it exists
@@ -114,26 +80,36 @@ _pull_status() {
         # Hashes on their own dim line
         local _hash_parts=()
         _hash_parts+=("container:${_short_c}")
-        [[ -n "$_h_head" ]] && _hash_parts+=("session:${_h_head:0:7}")
+        [[ -n "$_session_head" ]] && _hash_parts+=("session:${_session_head:0:7}")
         [[ -n "$_t_head" ]] && _hash_parts+=("main:${_t_head:0:7}")
         echo -e "    ${DIM}${_hash_parts[*]}${NC}"
 
-        if [[ -z "$_h_head" ]]; then
+        # Check extract: false (discovered repo)
+        local _extract_en
+        _extract_en=$(grep "^extract_enabled=" "$_sf" 2>/dev/null | tail -1 | cut -d= -f2-)
+        if [[ "$_extract_en" == "false" ]]; then
+            echo -e "    ${YELLOW}○${NC} extract: false ${DIM}(pull --extract to enable)${NC}"
+            _not_extracted=$((_not_extracted + 1))
+            continue
+        fi
+
+        if [[ -z "$_session_head" ]]; then
             echo -e "    ${YELLOW}!${NC} not yet extracted"
             _not_extracted=$((_not_extracted + 1))
-        elif [[ "$_s_head" == "$_h_head" ]]; then
+        elif [[ "$_s_head" == "$_session_head" ]]; then
             echo -e "    ${GREEN}✓${NC} up to date"
             _up_to_date=$((_up_to_date + 1))
-        elif git -C "$_path" merge-base --is-ancestor "$_h_head" "$_s_head" 2>/dev/null; then
+        elif git -C "$_path" merge-base --is-ancestor "$_session_head" "$_s_head" 2>/dev/null; then
             local _ahead
-            _ahead=$(git -C "$_path" rev-list --count "$_h_head".."$_s_head" 2>/dev/null || echo "?")
+            _ahead=$(git -C "$_path" rev-list --count "$_session_head".."$_s_head" 2>/dev/null || echo "?")
             echo -e "    ${BLUE}→${NC} container ahead by $_ahead commit(s)"
             _changed=$((_changed + 1))
-        elif git -C "$_path" merge-base --is-ancestor "$_s_head" "$_h_head" 2>/dev/null; then
+        elif git -C "$_path" merge-base --is-ancestor "$_s_head" "$_session_head" 2>/dev/null; then
             local _ahead
-            _ahead=$(git -C "$_path" rev-list --count "$_s_head".."$_h_head" 2>/dev/null || echo "?")
+            _ahead=$(git -C "$_path" rev-list --count "$_s_head".."$_session_head" 2>/dev/null || echo "?")
             local _ext_ahead
-            _ext_ahead=$(count_external_ahead "$_path" "$session_name" "$session_name")
+            _ext_ahead=$(grep "^external_ahead=" "$_sf" 2>/dev/null | tail -1 | cut -d= -f2-)
+            [[ -z "$_ext_ahead" ]] && _ext_ahead=0
             if [[ "$_ext_ahead" -eq 0 ]]; then
                 echo -e "    ${GREEN}✓${NC} up to date ${DIM}(squashed)${NC}"
                 _up_to_date=$((_up_to_date + 1))
@@ -143,11 +119,11 @@ _pull_status() {
             fi
         else
             local _merge_base
-            _merge_base=$(git -C "$_path" merge-base "$_h_head" "$_s_head" 2>/dev/null || echo "")
+            _merge_base=$(git -C "$_path" merge-base "$_session_head" "$_s_head" 2>/dev/null || echo "")
             local _c_ahead=0 _h_ahead=0
             if [[ -n "$_merge_base" ]]; then
                 _c_ahead=$(git -C "$_path" rev-list --count "$_merge_base".."$_s_head" 2>/dev/null || echo "?")
-                _h_ahead=$(git -C "$_path" rev-list --count "$_merge_base".."$_h_head" 2>/dev/null || echo "?")
+                _h_ahead=$(git -C "$_path" rev-list --count "$_merge_base".."$_session_head" 2>/dev/null || echo "?")
             fi
 
             if [[ "$_c_ahead" == "0" && "$_h_ahead" == "0" ]]; then
@@ -155,7 +131,8 @@ _pull_status() {
                 _up_to_date=$((_up_to_date + 1))
             elif [[ "$_c_ahead" == "0" ]]; then
                 local _ext_ahead
-                _ext_ahead=$(count_external_ahead "$_path" "$session_name" "$session_name")
+                _ext_ahead=$(grep "^external_ahead=" "$_sf" 2>/dev/null | tail -1 | cut -d= -f2-)
+                [[ -z "$_ext_ahead" ]] && _ext_ahead=0
                 if [[ "$_ext_ahead" -eq 0 ]]; then
                     echo -e "    ${GREEN}✓${NC} up to date ${DIM}(squashed)${NC}"
                     _up_to_date=$((_up_to_date + 1))
@@ -237,9 +214,9 @@ _verify_diffstat() {
             esac
         fi
 
-        # Get diffstat: what session would change on target
+        # Get diffstat: what session would change on target (squash-aware)
         local _stat
-        _stat=$(git -C "$_ppath" diff --stat "$target_branch".."$session_name" 2>/dev/null)
+        _stat=$(snapshot_diff "$result_dir" "$_pname" "outbound" "stat")
         [[ -z "$_stat" ]] && continue
 
         # Parse summary line for totals
@@ -276,19 +253,13 @@ _verify_diffstat() {
         for _rfile in "$result_dir"/*; do
             [[ -f "$_rfile" ]] || continue
             [[ "$_rfile" == *.detail ]] && continue
-            local _ta_val
-            _ta_val=$(grep "^target_ahead=" "$_rfile" 2>/dev/null | tail -1 | cut -d= -f2-)
-            [[ -z "$_ta_val" || "$_ta_val" == "0" ]] && continue
             local _ta_repo_name
             _ta_repo_name=$(grep "^repo_name=" "$_rfile" 2>/dev/null | tail -1 | cut -d= -f2-)
+            [[ -z "$_ta_repo_name" ]] && continue
             repo_matches_filter "$_ta_repo_name" "$repo_filter" || continue
-            local _ta_path
-            _ta_path=$(echo "$projects" | grep "^${_ta_repo_name}|" | head -1 | cut -d'|' -f2)
-            if [[ -n "$_ta_path" && -d "$_ta_path" ]]; then
-                local _ta_ext
-                _ta_ext=$(count_external_ahead "$_ta_path" "$session_name" "$target_branch")
-                [[ "$_ta_ext" -gt 0 ]] && _ta_count=$((_ta_count + 1))
-            fi
+            local _ta_ext
+            _ta_ext=$(grep "^external_ahead=" "$_rfile" 2>/dev/null | tail -1 | cut -d= -f2-)
+            [[ -n "$_ta_ext" && "$_ta_ext" -gt 0 ]] && _ta_count=$((_ta_count + 1))
         done
         if [[ $_ta_count -gt 0 ]]; then
             echo -e "${DIM}${target_branch} ahead in ${_ta_count} repo(s) — push --merge to sync${NC}"

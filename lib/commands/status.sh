@@ -84,7 +84,22 @@ _status_check() {
 
     local config=$(read_session_config "$volume")
     local projects=$(parse_session_projects "$config")
-    local heads=$(get_session_heads "$volume")
+
+    # Snapshot container state
+    local _sc_snap_dir
+    _sc_snap_dir=$(mktemp -d)
+    snapshot_session_state "$volume" "$session_name" "$check_branch" "$_sc_snap_dir"
+
+    # Build heads from snapshot
+    local heads=""
+    for _scf in "$_sc_snap_dir"/*; do
+        [[ -f "$_scf" ]] || continue
+        local _sc_name _sc_head
+        _sc_name=$(grep "^repo_name=" "$_scf" 2>/dev/null | tail -1 | cut -d= -f2-)
+        _sc_head=$(grep "^container_head=" "$_scf" 2>/dev/null | tail -1 | cut -d= -f2-)
+        [[ -n "$_sc_name" && -n "$_sc_head" ]] && heads+="${_sc_name}|${_sc_head}"$'\n'
+    done
+    rm -rf "$_sc_snap_dir"
 
     if [[ -z "$heads" ]]; then
         warn "No git repos found in session volume"
@@ -196,7 +211,22 @@ _status_verify() {
     # Read config and scan volume using shared discovery functions
     local config=$(read_session_config "$volume")
     local projects=$(parse_session_projects "$config")
-    local heads=$(get_session_heads "$volume")
+
+    # Snapshot container state
+    local _sv_snap_dir
+    _sv_snap_dir=$(mktemp -d)
+    snapshot_session_state "$volume" "$session_name" "$target_branch" "$_sv_snap_dir"
+
+    # Build heads from snapshot
+    local heads=""
+    for _svf in "$_sv_snap_dir"/*; do
+        [[ -f "$_svf" ]] || continue
+        local _sv_name _sv_head
+        _sv_name=$(grep "^repo_name=" "$_svf" 2>/dev/null | tail -1 | cut -d= -f2-)
+        _sv_head=$(grep "^container_head=" "$_svf" 2>/dev/null | tail -1 | cut -d= -f2-)
+        [[ -n "$_sv_name" && -n "$_sv_head" ]] && heads+="${_sv_name}|${_sv_head}"$'\n'
+    done
+    rm -rf "$_sv_snap_dir"
 
     if [[ -z "$heads" ]]; then
         warn "No git repos found in session volume"

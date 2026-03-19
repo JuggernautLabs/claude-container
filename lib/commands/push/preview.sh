@@ -45,33 +45,13 @@ _push_preview() {
         fi
     fi
 
-    # Phase 1: Scan session for dirty/merge state (1 docker run)
-    local _util_image="${GIT_UTIL_IMAGE:-alpine/git}"
-    local _scan
-    _scan=$(docker run --rm --entrypoint sh \
-        -e HOME=/tmp \
-        -v "$volume:/session:ro" "$_util_image" \
-        -c '
-            git config --global --add safe.directory "*"
-            for d in /session/*/ /session/*/*/; do
-                [ -d "$d/.git" ] || continue
-                name="${d#/session/}"; name="${name%/}"
-                merging="no"
-                [ -f "$d/.git/MERGE_HEAD" ] && merging="yes"
-                dirty=$(cd "$d" && git status --porcelain 2>/dev/null | wc -l | tr -d " ")
-                echo "$name|$merging|$dirty"
-            done
-        ' 2>/dev/null) || true
+    # Snapshot all container + host state (single docker run)
+    local _pv_snap_dir
+    _pv_snap_dir=$(mktemp -d)
+    snapshot_session_state "$volume" "$session_name" "$target_branch" "$_pv_snap_dir" "$repo_filter"
 
-    declare -A _pv_merge _pv_dirty
-    while IFS='|' read -r _sn _sm _sd; do
-        [[ -z "$_sn" ]] && continue
-        _pv_merge[$_sn]="$_sm"
-        _pv_dirty[$_sn]="${_sd:-0}"
-    done <<< "$_scan"
-
-    # Phase 2+3: Host-side filter + ancestry check
-    local -a _candidates=()
+    # Phase 2+3: classify repos from snapshot
+    local -a _needs_merge=()
     local -a _skip_repos=()
     local -a _problem_repos=()
     local _up_to_date=0
@@ -79,6 +59,12 @@ _push_preview() {
     while IFS='|' read -r proj_name proj_path; do
         [[ -z "$proj_name" ]] && continue
         repo_matches_filter "$proj_name" "$repo_filter" || continue
+
+        # Read snapshot data
+        local _pv_merging _pv_dirty _pv_container_head
+        _pv_merging=$(_pull_result_get "$_pv_snap_dir" "$proj_name" "merging")
+        _pv_dirty=$(_pull_result_get "$_pv_snap_dir" "$proj_name" "dirty_count")
+        _pv_container_head=$(_pull_result_get "$_pv_snap_dir" "$proj_name" "container_head")
 
         if [[ ! -d "$proj_path" ]]; then
             _skip_repos+=("$proj_name|path not found")
@@ -88,69 +74,38 @@ _push_preview() {
             _skip_repos+=("$proj_name|no '$target_branch' branch")
             continue
         fi
-        if [[ "${_pv_merge[$proj_name]:-no}" == "yes" ]]; then
+        if [[ "${_pv_merging:-no}" == "yes" ]]; then
             _problem_repos+=("$proj_name|merge in progress in container")
             continue
         fi
-        if [[ "${_pv_dirty[$proj_name]:-0}" -gt 0 ]]; then
-            _problem_repos+=("$proj_name|${_pv_dirty[$proj_name]} uncommitted file(s) in container worktree")
+        if [[ "${_pv_dirty:-0}" -gt 0 ]]; then
+            _problem_repos+=("$proj_name|${_pv_dirty} uncommitted file(s) in container worktree")
+            continue
+        fi
+
+        # Check if container HEAD is missing (repo not in container)
+        if [[ -z "$_pv_container_head" ]]; then
+            _skip_repos+=("$proj_name|not in container")
             continue
         fi
 
         local _host_head
         _host_head=$(git -C "$proj_path" rev-parse "refs/heads/$target_branch" 2>/dev/null || echo "")
         [[ -z "$_host_head" ]] && { _skip_repos+=("$proj_name|cannot resolve HEAD"); continue; }
-        _candidates+=("$proj_name|$proj_path|$_host_head")
+
+        # Ancestry check using local git (container HEAD is in snapshot, check if host_head is ancestor)
+        local _container_known
+        _container_known=$(_pull_result_get "$_pv_snap_dir" "$proj_name" "container_known")
+        if [[ "$_container_known" == "true" ]] && git -C "$proj_path" merge-base --is-ancestor "$_host_head" "$_pv_container_head" 2>/dev/null; then
+            _up_to_date=$((_up_to_date + 1))
+        else
+            local _host_count
+            _host_count=$(git -C "$proj_path" rev-list --count "$session_name".."$target_branch" 2>/dev/null || echo "?")
+            _needs_merge+=("$proj_name|$_host_count")
+        fi
     done <<< "$projects"
 
-    # Batch ancestry check (1 docker run)
-    local -a _needs_merge=()
-    if [[ ${#_candidates[@]} -gt 0 ]]; then
-        local _ancestry_input=""
-        declare -A _candidate_paths
-        for _c in "${_candidates[@]}"; do
-            local _cn _cp _ch
-            IFS='|' read -r _cn _cp _ch <<< "$_c"
-            _ancestry_input+="${_cn}|${_ch}"$'\n'
-            _candidate_paths[$_cn]="$_cp"
-        done
-
-        local _ancestry_out
-        _ancestry_out=$(printf '%s' "$_ancestry_input" | docker run --rm -i --entrypoint sh \
-            -e HOME=/tmp \
-            -v "$volume:/session:ro" "$_util_image" \
-            -c '
-                git config --global --add safe.directory "*"
-                while IFS="|" read -r name host_head; do
-                    [ -z "$name" ] && continue
-                    [ ! -d "/session/$name/.git" ] && { echo "$name|error"; continue; }
-                    cd "/session/$name"
-                    session_head=$(git rev-parse HEAD 2>/dev/null)
-                    if git merge-base --is-ancestor "$host_head" HEAD 2>/dev/null; then
-                        echo "$name|up_to_date|$session_head"
-                    else
-                        ahead=$(git rev-list --count HEAD.."$host_head" 2>/dev/null || echo "?")
-                        echo "$name|needs_merge|$ahead|$session_head"
-                    fi
-                done
-            ' 2>/dev/null) || true
-
-        while IFS='|' read -r _an _as _extra1 _extra2; do
-            [[ -z "$_an" ]] && continue
-            if [[ "$_as" == "up_to_date" ]]; then
-                _up_to_date=$((_up_to_date + 1))
-            elif [[ "$_as" == "needs_merge" ]]; then
-                local _host_count="?"
-                local _hp="${_candidate_paths[$_an]}"
-                if [[ -n "$_hp" ]]; then
-                    _host_count=$(git -C "$_hp" rev-list --count "$session_name".."$target_branch" 2>/dev/null || echo "?")
-                fi
-                _needs_merge+=("$_an|$_host_count")
-            else
-                _skip_repos+=("$_an|ancestry check failed")
-            fi
-        done <<< "$_ancestry_out"
-    fi
+    rm -rf "$_pv_snap_dir"
 
     # Render repos
     if [[ ${#_needs_merge[@]} -gt 0 ]]; then

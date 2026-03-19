@@ -324,6 +324,277 @@ discover_and_register() {
 #   $2 - config content (YAML string)
 #   $3 - repo_filter (comma-separated, may be empty — empty means all)
 # Returns: writes updated config to volume
+# Snapshot ALL session state in one shot: one docker run + local git ops.
+# Writes per-repo data to result dir via _pull_result_set.
+# This is the single source of truth — no other function should docker-run to read container state.
+#
+# Arguments:
+#   $1 - volume name (e.g. "claude-session-foo")
+#   $2 - session_name (branch name used for extraction)
+#   $3 - target_branch (branch to merge into, may be empty)
+#   $4 - output_dir (result dir for _pull_result_set)
+#   $5 - repo_filter (comma-separated partial names, may be empty)
+# Reads config from volume to resolve host paths.
+snapshot_session_state() {
+    local volume="$1"
+    local session_name="$2"
+    local target_branch="$3"
+    local output_dir="$4"
+    local repo_filter="${5:-}"
+    local git_image="${GIT_UTIL_IMAGE:-alpine/git}"
+
+    # Read config for host path resolution + extract flags
+    local _snap_cfg
+    _snap_cfg=$(read_session_config "$volume")
+    local _snap_projects=""
+    if [[ -n "$_snap_cfg" ]]; then
+        _snap_projects=$(parse_session_projects "$_snap_cfg")
+    fi
+    if [[ -n "$repo_filter" ]]; then
+        _snap_projects=$(augment_projects_from_volume "$volume" "$_snap_projects" "$repo_filter")
+    fi
+
+    # Build extract flag lookup from full config
+    declare -A _snap_extract_flags
+    if [[ -n "$_snap_cfg" ]]; then
+        local _snap_full
+        _snap_full=$(parse_session_projects_full "$_snap_cfg")
+        if [[ -n "$_snap_full" ]]; then
+            while IFS='|' read -r _ef_name _ef_path _ef_extract; do
+                [[ -z "$_ef_name" ]] && continue
+                _snap_extract_flags[$_ef_name]="${_ef_extract:-true}"
+            done <<< "$_snap_full"
+        fi
+    fi
+
+    # Step A: One docker run reads ALL container state
+    local _container_scan
+    _container_scan=$(docker run --rm --entrypoint sh \
+        -e HOME=/tmp \
+        -v "$volume:/session:ro" "$git_image" \
+        -c '
+            git config --global --add safe.directory "*"
+            for d in /session/*/ /session/*/*/; do
+                [ -d "$d/.git" ] || continue
+                name="${d#/session/}"; name="${name%/}"
+                head=$(cd "$d" && git rev-parse HEAD 2>/dev/null | head -1)
+                # Skip empty repos (no commits) where rev-parse returns literal "HEAD"
+                case "$head" in
+                    [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]*) ;;
+                    *) continue ;;
+                esac
+                dirty=$(cd "$d" && git status --porcelain 2>/dev/null | wc -l | tr -d " ")
+                merging="no"; [ -f "$d/.git/MERGE_HEAD" ] && merging="yes"
+                gitsize=$(du -sm "$d/.git" 2>/dev/null | cut -f1)
+                echo "$name|$head|$dirty|$merging|${gitsize:-0}"
+            done
+        ' 2>/dev/null) || true
+
+    [[ -z "$_container_scan" ]] && return 0
+
+    # Step B+C: Per-repo local git ops + filter
+    while IFS='|' read -r _name _head _dirty _merging _gitsize; do
+        [[ -z "$_name" ]] && continue
+
+        # Step C: Apply repo filter
+        repo_matches_filter "$_name" "$repo_filter" || continue
+
+        # Write container state
+        _pull_result_set "$output_dir" "$_name" "repo_name" "$_name"
+        _pull_result_set "$output_dir" "$_name" "container_head" "$_head"
+        _pull_result_set "$output_dir" "$_name" "dirty_count" "$_dirty"
+        _pull_result_set "$output_dir" "$_name" "merging" "$_merging"
+        _pull_result_set "$output_dir" "$_name" "git_size_mb" "$_gitsize"
+
+        # Extract flag from config (false = discovered repo, not yet promoted)
+        local _extract_flag="${_snap_extract_flags[$_name]:-true}"
+        _pull_result_set "$output_dir" "$_name" "extract_enabled" "$_extract_flag"
+
+        # Resolve host path
+        local _path=""
+        if [[ -n "$_snap_projects" ]]; then
+            _path=$(echo "$_snap_projects" | grep "^${_name}|" | head -1 | cut -d'|' -f2)
+        fi
+        if [[ -z "$_path" ]]; then
+            _path=$(resolve_repo_host_path "$_name" "$_snap_projects")
+        fi
+        _pull_result_set "$output_dir" "$_name" "host_path" "$_path"
+
+        # Skip local git ops if host path doesn't exist
+        if [[ -z "$_path" || ! -d "$_path" ]]; then
+            _pull_result_set "$output_dir" "$_name" "container_known" "false"
+            continue
+        fi
+
+        # Host session branch HEAD
+        local _session_head=""
+        if git -C "$_path" show-ref --verify --quiet "refs/heads/$session_name" 2>/dev/null; then
+            _session_head=$(git -C "$_path" rev-parse "refs/heads/$session_name" 2>/dev/null)
+        fi
+        _pull_result_set "$output_dir" "$_name" "session_head" "${_session_head:-}"
+
+        # Host target branch HEAD
+        local _target_head=""
+        if [[ -n "$target_branch" ]]; then
+            _target_head=$(git -C "$_path" rev-parse "refs/heads/$target_branch" 2>/dev/null || echo "")
+            _pull_result_set "$output_dir" "$_name" "target_head" "${_target_head:-}"
+        fi
+
+        # Squash-base ref
+        if [[ -n "$session_name" ]]; then
+            local _squash_base
+            _squash_base=$(git -C "$_path" rev-parse --verify "refs/claude-container/squash-base/${session_name}" 2>/dev/null || echo "")
+            _pull_result_set "$output_dir" "$_name" "squash_base" "${_squash_base:-}"
+        fi
+
+        # Host dirty state
+        local _host_dirty
+        _host_dirty=$(git -C "$_path" status --porcelain 2>/dev/null | head -1)
+        _pull_result_set "$output_dir" "$_name" "host_dirty" "$([[ -n "$_host_dirty" ]] && echo true || echo false)"
+
+        # Is container HEAD known on host?
+        local _container_known=false
+        git -C "$_path" cat-file -t "$_head" &>/dev/null && _container_known=true
+        _pull_result_set "$output_dir" "$_name" "container_known" "$_container_known"
+
+        # External commits ahead on target (non-squash)
+        if [[ -n "$target_branch" && -n "$_target_head" && -n "$_session_head" ]]; then
+            local _ext_ahead
+            _ext_ahead=$(count_external_ahead "$_path" "$session_name" "$target_branch")
+            _pull_result_set "$output_dir" "$_name" "external_ahead" "$_ext_ahead"
+        else
+            _pull_result_set "$output_dir" "$_name" "external_ahead" "0"
+        fi
+
+        # Is container's new work already in target?
+        # True when container HEAD is ancestor of target or tree-identical.
+        # Consumers use this to avoid "ready to merge" when there's nothing to do.
+        local _container_in_target=false
+        if [[ -n "$target_branch" && -n "$_target_head" ]] && $_container_known; then
+            if git -C "$_path" merge-base --is-ancestor "$_head" "$_target_head" 2>/dev/null; then
+                _container_in_target=true
+            elif git -C "$_path" diff --quiet "$_head" "$_target_head" -- 2>/dev/null; then
+                _container_in_target=true
+            fi
+        fi
+        _pull_result_set "$output_dir" "$_name" "container_in_target" "$_container_in_target"
+
+        # Pre-extraction status (replaces detect_pre_extract_status)
+        if [[ -z "$_session_head" ]]; then
+            _pull_result_set "$output_dir" "$_name" "pre_status" "not_extracted"
+            _pull_result_set "$output_dir" "$_name" "pre_new_commits" "0"
+        elif [[ "$_head" == "$_session_head" ]]; then
+            _pull_result_set "$output_dir" "$_name" "pre_status" "up_to_date"
+            _pull_result_set "$output_dir" "$_name" "pre_new_commits" "0"
+        elif git -C "$_path" merge-base --is-ancestor "$_session_head" "$_head" 2>/dev/null; then
+            local _nc
+            _nc=$(git -C "$_path" rev-list --count "$_session_head".."$_head" 2>/dev/null || echo "0")
+            _pull_result_set "$output_dir" "$_name" "pre_status" "ahead"
+            _pull_result_set "$output_dir" "$_name" "pre_new_commits" "$_nc"
+        elif $_container_known; then
+            if git -C "$_path" diff --quiet "$_session_head" "$_head" -- 2>/dev/null; then
+                _pull_result_set "$output_dir" "$_name" "pre_status" "rebased"
+                _pull_result_set "$output_dir" "$_name" "pre_new_commits" "0"
+            else
+                _pull_result_set "$output_dir" "$_name" "pre_status" "ahead"
+                _pull_result_set "$output_dir" "$_name" "pre_new_commits" "1"
+            fi
+        else
+            _pull_result_set "$output_dir" "$_name" "pre_status" "ahead"
+            _pull_result_set "$output_dir" "$_name" "pre_new_commits" "1"
+        fi
+
+        # Backward compat: write pre_session_head / pre_target_head aliases
+        _pull_result_set "$output_dir" "$_name" "pre_session_head" "${_session_head:-}"
+        [[ -n "$_target_head" ]] && _pull_result_set "$output_dir" "$_name" "pre_target_head" "$_target_head"
+    done <<< "$_container_scan" || true
+}
+
+# Compute the diff between the session branch and a comparison branch for one repo,
+# accounting for squash-base. All callers should use this instead of raw `git diff`.
+#
+# When a squash-base exists, the "new work" diff is squash_base..session (what the container
+# added since last sync), not target..session (which double-counts already-squashed content).
+# The "incoming" diff (what target has that session doesn't) uses the same base.
+#
+# Arguments:
+#   $1 - result_dir (snapshot dir with per-repo state)
+#   $2 - repo_name
+#   $3 - direction: "outbound" (session→target) or "inbound" (target→session)
+#   $4 - format: "stat" (--stat), "summary" (last line of --stat), "names" (--name-only),
+#                "count" (file count only), "full" (full diff)
+# Output: diff output on stdout, empty if nothing to diff
+# Returns: 0 if diff produced output, 1 if nothing to diff
+snapshot_diff() {
+    local result_dir="$1"
+    local repo_name="$2"
+    local direction="${3:-outbound}"
+    local format="${4:-stat}"
+
+    local _path _session_head _target_head _squash_base _container_known
+    _path=$(_pull_result_get "$result_dir" "$repo_name" "host_path")
+    _session_head=$(_pull_result_get "$result_dir" "$repo_name" "session_head")
+    _target_head=$(_pull_result_get "$result_dir" "$repo_name" "target_head")
+    _squash_base=$(_pull_result_get "$result_dir" "$repo_name" "squash_base")
+    _container_known=$(_pull_result_get "$result_dir" "$repo_name" "container_known")
+
+    [[ -z "$_path" || ! -d "$_path" ]] && return 1
+    [[ -z "$_session_head" ]] && return 1
+
+    # Determine the right base for comparison
+    # With squash-base: compare from the last sync point (avoids double-counting squashed content)
+    # Without: compare the trees directly (target..session or session..target)
+    local _from _to
+
+    if [[ "$direction" == "outbound" ]]; then
+        # session → target: what would merging session into target change?
+        if [[ -n "$_squash_base" ]] && \
+           git -C "$_path" merge-base --is-ancestor "$_squash_base" "$_session_head" 2>/dev/null; then
+            # squash-base is valid — diff shows new work since last squash
+            _from="$_squash_base"
+            _to="$_session_head"
+        elif [[ -n "$_target_head" ]]; then
+            _from="$_target_head"
+            _to="$_session_head"
+        else
+            return 1
+        fi
+    else
+        # target → session: what does target have that session doesn't?
+        if [[ -n "$_target_head" && -n "$_session_head" ]]; then
+            _from="$_session_head"
+            _to="$_target_head"
+        else
+            return 1
+        fi
+    fi
+
+    # Check refs exist
+    git -C "$_path" cat-file -t "$_from" &>/dev/null || return 1
+    git -C "$_path" cat-file -t "$_to" &>/dev/null || return 1
+
+    # Trees identical → no diff
+    git -C "$_path" diff --quiet "$_from" "$_to" -- 2>/dev/null && return 1
+
+    case "$format" in
+        stat)
+            git -C "$_path" diff --stat "$_from".."$_to" 2>/dev/null
+            ;;
+        summary)
+            git -C "$_path" diff --stat "$_from".."$_to" 2>/dev/null | tail -1
+            ;;
+        names)
+            git -C "$_path" diff --name-only "$_from".."$_to" 2>/dev/null
+            ;;
+        count)
+            git -C "$_path" diff --name-only "$_from".."$_to" 2>/dev/null | wc -l | tr -d ' '
+            ;;
+        full)
+            git -C "$_path" diff "$_from".."$_to" 2>/dev/null
+            ;;
+    esac
+}
+
 promote_discovered_repos() {
     local volume="$1"
     local config_content="$2"
