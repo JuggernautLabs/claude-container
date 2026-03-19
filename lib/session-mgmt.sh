@@ -2526,7 +2526,7 @@ _extract_multi_project_direct() {
         for _bname in "${_need_bundle[@]}"; do
             local _bsize="${_session_size_map[$_bname]:-0}"
             if [[ "$_bsize" -gt 10 ]]; then
-                warn "  $_bname has ${_bsize}MB .git — bundling may be slow"
+                note "  $_bname has ${_bsize}MB .git — bundling may be slow"
             fi
         done
         info "Bundling ${#_need_bundle[@]} changed repo(s)..."

@@ -52,15 +52,19 @@ _pull_report() {
         fi
     done
 
-    # Header
-    if [[ -n "$target_branch" ]]; then
-        _rule "pull: ${session_name} → ${target_branch}"
-    else
-        _rule "pull: ${session_name}"
-    fi
-    echo ""
-
     local _first_repo=true
+    local _header_shown=false
+    _ensure_header() {
+        if ! $_header_shown; then
+            if [[ -n "$target_branch" ]]; then
+                _rule "pull: ${session_name} → ${target_branch}"
+            else
+                _rule "pull: ${session_name}"
+            fi
+            echo ""
+            _header_shown=true
+        fi
+    }
 
     for _repo in "${_repo_names[@]}"; do
         local _ext_status _ext_commits _ext_files _ext_detail
@@ -76,6 +80,7 @@ _pull_report() {
 
         # Never hide discovered repos — always show them with actionable hint
         if [[ "$_ext_status" == "discovered" ]]; then
+            _ensure_header
             $_first_repo || echo ""
             _first_repo=false
             echo -e "  ${BLUE}$_repo${NC}"
@@ -139,6 +144,7 @@ _pull_report() {
         local _short_target="${_target_head:0:7}"
 
         # Blank line between repos
+        _ensure_header
         $_first_repo || echo ""
         _first_repo=false
 
@@ -284,9 +290,11 @@ _pull_report() {
         fi
     done
 
-    # Footer
-    echo ""
-    _rule
+    # Footer (only if header was shown — skip frame when all repos hidden)
+    if $_header_shown; then
+        echo ""
+        _rule
+    fi
 
     # Summary line
     local _summary_parts=()

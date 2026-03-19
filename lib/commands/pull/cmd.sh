@@ -118,7 +118,7 @@ cmd_pull() {
         return 1
     fi
 
-    # Dry-run requires a branch
+    # Dry-run and verify require a branch (nothing to preview/confirm without a merge target)
     if $dry_run && [[ -z "$branch" ]]; then
         error "--dry-run requires a target branch"
         echo "Usage: claude-container pull -s <session> <branch> --dry-run"
