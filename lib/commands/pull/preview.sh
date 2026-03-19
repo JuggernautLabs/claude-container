@@ -198,6 +198,20 @@ _verify_diffstat() {
         git -C "$_ppath" show-ref --verify --quiet "refs/heads/$session_name" 2>/dev/null || continue
         git -C "$_ppath" show-ref --verify --quiet "refs/heads/$target_branch" 2>/dev/null || continue
 
+        # Skip repos whose merge was skipped or had no meaningful result
+        if [[ -n "$result_dir" ]]; then
+            local _diff_merge_status
+            _diff_merge_status=$(_pull_result_get "$result_dir" "$_pname" "merge_status")
+            case "$_diff_merge_status" in
+                SKIP|CONFLICT) continue ;;
+            esac
+            local _diff_merge_detail
+            _diff_merge_detail=$(_pull_result_get "$result_dir" "$_pname" "merge_detail")
+            case "$_diff_merge_detail" in
+                "already up to date"|"up to date"*) continue ;;
+            esac
+        fi
+
         # Get diffstat: what session would change on target
         local _stat
         _stat=$(git -C "$_ppath" diff --stat "$target_branch".."$session_name" 2>/dev/null)
