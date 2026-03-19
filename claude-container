@@ -1302,7 +1302,7 @@ if $USE_GIT_SESSION; then
             if [[ -n "$VERIFY_MERGE" ]]; then
                 # --verify: ask before merging
                 echo ""
-                printf "Merge into '%s'? [(s)ession only / y / N] " "$MERGE_INTO_BRANCH_CHECK"
+                printf "Merge into '%s'? [y/N] " "$MERGE_INTO_BRANCH_CHECK"
                 read -r _verify_answer
                 case "$_verify_answer" in
                     [yY]|[yY][eE][sS])

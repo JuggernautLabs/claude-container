@@ -22,6 +22,7 @@ cmd_pull() {
     local discuss=false
     local show_prompt=false
     local extract_discovered=false
+    local enable_session_only=false
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -77,6 +78,10 @@ cmd_pull() {
                 ;;
             --show-prompt)
                 show_prompt=true
+                shift
+                ;;
+            --enable-session-only)
+                enable_session_only=true
                 shift
                 ;;
             --help|-h)
@@ -230,7 +235,11 @@ cmd_pull() {
 
             if $_has_mergeable; then
                 echo ""
-                printf "Merge into '%s'? [(s)ession only / y / N] " "$branch"
+                if $enable_session_only; then
+                    printf "Merge into '%s'? [(s)ession only / y / N] " "$branch"
+                else
+                    printf "Merge into '%s'? [y/N] " "$branch"
+                fi
                 local _answer
                 read -r _answer
                 case "$_answer" in

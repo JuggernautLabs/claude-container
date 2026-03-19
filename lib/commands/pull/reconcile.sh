@@ -316,7 +316,7 @@ _pull_reconcile() {
             info "Dry-run merge into '$target_branch':"
             session_auto_merge "$session_name" "$target_branch" true
             echo ""
-            printf "Merge into '%s'? [(s)ession only / y / N] " "$target_branch"
+            printf "Merge into '%s'? [y/N] " "$target_branch"
             local _answer
             read -r _answer
             case "$_answer" in
