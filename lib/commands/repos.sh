@@ -102,31 +102,101 @@ _repos_list() {
         return 1
     fi
 
+    # Snapshot gives us everything — container HEAD, host state, diffs
+    local _rl_snap_dir
+    _rl_snap_dir=$(mktemp -d)
+    snapshot_session_state "$volume" "$session_name" "" "$_rl_snap_dir" "$repo_filter"
+
     local projects_full
     projects_full=$(parse_session_projects_full "$config_content")
+
+    local _cwd
+    _cwd=$(pwd)
+
+    _rule "repos: ${session_name}"
+    echo ""
 
     local count=0 total=0 discovered=0
     while IFS='|' read -r proj_name proj_path proj_extract; do
         [[ -z "$proj_name" ]] && continue
         total=$((total + 1))
         repo_matches_filter "$proj_name" "$repo_filter" || continue
-        if [[ "$proj_extract" == "false" ]]; then
-            echo -e "  ${YELLOW}○${NC} ${BLUE}$proj_name${NC}  ${DIM}$proj_path${NC}  ${YELLOW}(discovered, not extracted)${NC}"
+
+        # Display path (relative to cwd)
+        local _rel_path="$proj_name"
+        if [[ -n "$proj_path" ]]; then
+            _rel_path=$(python3 -c "import os; print(os.path.relpath('$proj_path', '$_cwd'))" 2>/dev/null || echo "${proj_path/#$HOME/~}")
+        fi
+
+        # Read snapshot state
+        local _c_head _s_head _dirty _merging _path_ok _extract_en
+        _c_head=$(_pull_result_get "$_rl_snap_dir" "$proj_name" "container_head")
+        _s_head=$(_pull_result_get "$_rl_snap_dir" "$proj_name" "session_head")
+        _dirty=$(_pull_result_get "$_rl_snap_dir" "$proj_name" "dirty_count")
+        _merging=$(_pull_result_get "$_rl_snap_dir" "$proj_name" "merging")
+        _extract_en=$(_pull_result_get "$_rl_snap_dir" "$proj_name" "extract_enabled")
+
+        # Header line
+        if [[ "$_extract_en" == "false" || "$proj_extract" == "false" ]]; then
+            echo -e "  ${YELLOW}○${NC} ${BLUE}$proj_name${NC}  ${DIM}(extract: false)${NC}"
             discovered=$((discovered + 1))
         else
-            echo -e "  ${BLUE}$proj_name${NC}  ${DIM}$proj_path${NC}"
+            echo -e "  ${BLUE}$proj_name${NC}"
         fi
+
+        # Path line
+        if [[ -d "$proj_path" ]]; then
+            echo -e "    ${DIM}path: $_rel_path${NC}"
+        else
+            echo -e "    ${DIM}path: $_rel_path${NC}  ${YELLOW}(not found)${NC}"
+        fi
+
+        # Hashes
+        local _hash_parts=()
+        [[ -n "$_c_head" ]] && _hash_parts+=("container:${_c_head:0:7}")
+        [[ -n "$_s_head" ]] && _hash_parts+=("session:${_s_head:0:7}")
+        if [[ ${#_hash_parts[@]} -gt 0 ]]; then
+            echo -e "    ${DIM}${_hash_parts[*]}${NC}"
+        fi
+
+        # Status indicators
+        local _status_parts=()
+        if [[ -z "$_c_head" ]]; then
+            _status_parts+=("not in container")
+        elif [[ -z "$_s_head" ]]; then
+            _status_parts+=("not yet extracted")
+        elif [[ "$_c_head" == "$_s_head" ]]; then
+            _status_parts+=("synced")
+        else
+            _status_parts+=("container ahead")
+        fi
+        [[ "${_dirty:-0}" -gt 0 ]] && _status_parts+=("$_dirty dirty file(s)")
+        [[ "$_merging" == "yes" ]] && _status_parts+=("merge in progress")
+
+        local _status_line
+        _status_line=$(IFS=', '; echo "${_status_parts[*]}")
+        if [[ "$_status_line" == "synced" ]]; then
+            echo -e "    ${GREEN}✓${NC} $_status_line"
+        elif [[ "$_status_line" == *"ahead"* || "$_status_line" == *"dirty"* || "$_status_line" == *"merge"* ]]; then
+            echo -e "    ${YELLOW}!${NC} $_status_line"
+        else
+            echo -e "    ${DIM}$_status_line${NC}"
+        fi
+
+        echo ""
         count=$((count + 1))
     done <<< "$projects_full"
 
-    echo ""
+    rm -rf "$_rl_snap_dir"
+
+    _rule
     if [[ -n "$repo_filter" ]]; then
         info "$count matching, $total total in session '$session_name'"
     else
         info "$total repo(s) in session '$session_name'"
     fi
     if [[ $discovered -gt 0 ]]; then
-        echo -e "${DIM}$discovered discovered repo(s) — use 'repos discover' or 'pull --extract' to extract${NC}"
+        echo -e "${DIM}$discovered discovered repo(s) — use 'repos discover' or 'pull --extract' to enable${NC}"
     fi
 }
 
