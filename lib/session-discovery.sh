@@ -87,10 +87,24 @@ resolve_repo_host_path() {
     local _repo_basename="${repo_name##*/}"
     local _org_prefix="${repo_name%%/*}"
 
+    if [[ "$_org_prefix" != "$_repo_basename" ]]; then
+        # Has org prefix (e.g. "hypermemetic/plexus-core") — match by org
+        while IFS='|' read -r _pname _ppath; do
+            [[ -z "$_ppath" ]] && continue
+            if [[ "$_pname" == "$_org_prefix"/* ]]; then
+                echo "$(dirname "$_ppath")/$_repo_basename"
+                return 0
+            fi
+        done <<< "$projects"
+    fi
+
+    # No org prefix or no org match — infer as sibling of any config project.
+    # Check if repo exists as a sibling directory of any known project.
     while IFS='|' read -r _pname _ppath; do
         [[ -z "$_ppath" ]] && continue
-        if [[ "$_pname" == "$_org_prefix"/* ]]; then
-            echo "$(dirname "$_ppath")/$_repo_basename"
+        local _sibling_candidate="$(dirname "$_ppath")/$_repo_basename"
+        if [[ -d "$_sibling_candidate" ]] && [[ -d "$_sibling_candidate/.git" || -f "$_sibling_candidate/.git" ]]; then
+            echo "$_sibling_candidate"
             return 0
         fi
     done <<< "$projects"
