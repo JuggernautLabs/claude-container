@@ -11,7 +11,7 @@ _pull_report() {
     local volume="claude-session-${session_name}"
 
     # Collect all repos that have result files
-    local _pulled=0 _unchanged=0 _needs_attention=0 _conflicts=0 _target_ahead_count=0
+    local _pulled=0 _unchanged=0 _needs_attention=0 _conflicts=0 _skipped=0 _target_ahead_count=0
 
     # Read config to iterate repos in order, augmenting with volume-only repos for unmatched filters
     local config_content
@@ -221,6 +221,7 @@ _pull_report() {
                     ;;
                 SKIP)
                     echo -e "    merge     ${YELLOW}!${NC} skipped${_merge_detail:+ — ${_merge_detail}}"
+                    _skipped=$((_skipped + 1))
                     ;;
                 CONFLICT)
                     echo -e "    merge     ${RED}✗${NC} conflict${_conflict_files:+ ($_conflict_files)}"
@@ -300,6 +301,9 @@ _pull_report() {
     local _summary_parts=()
     if [[ $_pulled -gt 0 ]]; then
         _summary_parts+=("${_pulled} merged")
+    fi
+    if [[ $_skipped -gt 0 ]]; then
+        _summary_parts+=("${_skipped} skipped")
     fi
     if [[ $_conflicts -gt 0 ]]; then
         _summary_parts+=("${_conflicts} conflict(s)")
