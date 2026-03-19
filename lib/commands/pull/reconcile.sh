@@ -26,6 +26,7 @@ _pull_reconcile_preview() {
     fi
     local projects
     projects=$(parse_session_projects "$config_content")
+    [[ -n "$repo_filter" ]] && projects=$(augment_projects_from_volume "$volume" "$projects" "$repo_filter")
 
     # Get session scan (dirty/merge status)
     local _util_image="${GIT_UTIL_IMAGE:-alpine/git}"
@@ -156,7 +157,7 @@ _pull_reconcile_preview() {
                         _would_merge=$((_would_merge + 1))
                         ;;
                     "already up to date"|"up to date"*)
-                        echo -e "    session → ${target_branch}:  — no modifications needed"
+                        echo -e "    session → ${target_branch}:  — nothing to merge"
                         ;;
                     *)
                         echo -e "    session → ${target_branch}:  ${GREEN}✓${NC} $_out_detail"
@@ -315,12 +316,20 @@ _pull_reconcile() {
             info "Dry-run merge into '$target_branch':"
             session_auto_merge "$session_name" "$target_branch" true
             echo ""
-            printf "Merge into '%s'? [y/N] " "$target_branch"
+            printf "Merge into '%s'? [(s)ession only / y / N] " "$target_branch"
             local _answer
             read -r _answer
             case "$_answer" in
                 [yY]|[yY][eE][sS])
                     info "Merging..."
+                    ;;
+                [sS])
+                    info "Session branches extracted, merge skipped."
+                    # Clean up marker
+                    local git_image="${IMAGE_NAME:-$DEFAULT_IMAGE}"
+                    docker run --rm -v "$volume:/session" "$git_image" \
+                        rm -f /session/.merge-into-branch 2>/dev/null || true
+                    return 0
                     ;;
                 *)
                     info "Aborted. Session branches extracted but not merged into $target_branch."

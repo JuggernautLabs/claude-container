@@ -102,6 +102,15 @@ if [[ $# -gt 0 ]] && [[ ! "$1" =~ ^- ]]; then
     fi
 fi
 
+# Helper: enforce mutual exclusion on action flags
+_set_action() {
+    if [[ -n "$ACTION" ]]; then
+        error "Cannot combine --$1 with --$ACTION"
+        exit 1
+    fi
+    ACTION="$1"
+}
+
 # Parse arguments
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -195,35 +204,35 @@ while [[ $# -gt 0 ]]; do
         # Note: --extract, --sync, --refresh, --merge-into are deprecated in favor of push/pull/status subcommands
         --extract)
             warn "Deprecated: use 'pull' subcommand instead (e.g., 'claude-container pull -s <session>')"
-            ACTION="extract"
+            _set_action "extract"
             shift
             ;;
         --delete)
-            ACTION="delete"
+            _set_action "delete"
             shift
             ;;
         --repair)
-            ACTION="repair"
+            _set_action "repair"
             shift
             ;;
         --restart)
-            ACTION="restart"
+            _set_action "restart"
             shift
             ;;
         --import)
-            ACTION="import"
+            _set_action "import"
             IMPORT_SOURCE="$2"
             shift 2
             ;;
         --sync)
             warn "Deprecated: use 'push --rebase' instead (e.g., 'claude-container push -s <session> ${2:-main} --rebase')"
-            ACTION="sync"
+            _set_action "sync"
             SYNC_BRANCH="${2:-main}"
             shift 2
             ;;
         --refresh)
             warn "Deprecated: use 'push' subcommand instead (e.g., 'claude-container push -s <session> [branch]')"
-            ACTION="refresh"
+            _set_action "refresh"
             # Optional branch argument (default: session name)
             if [[ -n "${2:-}" ]] && [[ ! "$2" =~ ^- ]]; then
                 REFRESH_BRANCH="$2"
@@ -239,7 +248,7 @@ while [[ $# -gt 0 ]]; do
             ;;
         --merge-into)
             warn "Deprecated: use 'push --merge' instead (e.g., 'claude-container push -s <session> $2 --merge')"
-            ACTION="merge-into"
+            _set_action "merge-into"
             MERGE_INTO_BRANCH="$2"
             shift 2
             ;;
@@ -268,15 +277,15 @@ while [[ $# -gt 0 ]]; do
 
         # Actions without session requirement
         --sessions|--list-sessions)
-            ACTION="list"
+            _set_action "list"
             shift
             ;;
         --cleanup)
-            ACTION="cleanup"
+            _set_action "cleanup"
             shift
             ;;
         --cleanup-unused)
-            ACTION="cleanup-unused"
+            _set_action "cleanup-unused"
             shift
             ;;
 
@@ -1312,7 +1321,7 @@ if $USE_GIT_SESSION; then
             if [[ -n "$VERIFY_MERGE" ]]; then
                 # --verify: ask before merging
                 echo ""
-                printf "Merge into '%s'? [y/N] " "$MERGE_INTO_BRANCH_CHECK"
+                printf "Merge into '%s'? [(s)ession only / y / N] " "$MERGE_INTO_BRANCH_CHECK"
                 read -r _verify_answer
                 case "$_verify_answer" in
                     [yY]|[yY][eE][sS])
@@ -1320,6 +1329,10 @@ if $USE_GIT_SESSION; then
                         session_auto_merge "$SESSION_NAME" "$MERGE_INTO_BRANCH_CHECK" false "" true "$_EXIT_RESULT_DIR" || true
                         echo ""
                         _pull_report "$SESSION_NAME" "$MERGE_INTO_BRANCH_CHECK" "$_EXIT_RESULT_DIR"
+                        ;;
+                    [sS])
+                        info "Session branches extracted, merge skipped."
+                        info "To merge later: claude-container pull -s $SESSION_NAME $MERGE_INTO_BRANCH_CHECK"
                         ;;
                     *)
                         info "Aborted. Session branches extracted but not merged."

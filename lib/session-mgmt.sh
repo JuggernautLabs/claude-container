@@ -464,9 +464,9 @@ session_restart() {
 
     # Find and stop any running container for this session
     local running
-    running=$(docker ps -q --filter "name=claude-dev-" 2>/dev/null || true)
+    running=$(docker ps -q --filter "volume=claude-session-${session}" 2>/dev/null || true)
     if [[ -n "$running" ]]; then
-        info "Stopping running container..."
+        info "Stopping running container for session '$session'..."
         docker stop $running >/dev/null 2>&1 || true
     fi
 

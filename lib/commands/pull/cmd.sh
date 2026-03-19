@@ -230,12 +230,17 @@ cmd_pull() {
 
             if $_has_mergeable; then
                 echo ""
-                printf "Merge into '%s'? [y/N] " "$branch"
+                printf "Merge into '%s'? [(s)ession only / y / N] " "$branch"
                 local _answer
                 read -r _answer
                 case "$_answer" in
                     [yY]|[yY][eE][sS])
                         info "Merging..."
+                        ;;
+                    [sS])
+                        info "Session branches extracted, merge skipped."
+                        info "To merge later: claude-container pull -s $session_name $branch"
+                        return 0
                         ;;
                     *)
                         info "Aborted. Session branches extracted but not merged."
