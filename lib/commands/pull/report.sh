@@ -175,6 +175,20 @@ _pull_report() {
             continue
         fi
 
+        # Build hash line for this repo (container / session / target)
+        local _container_head _pre_session_head _pre_target_head
+        _container_head=$(_pull_result_get "$result_dir" "$_repo" "container_head")
+        _pre_session_head=$(_pull_result_get "$result_dir" "$_repo" "pre_session_head")
+        _pre_target_head=$(_pull_result_get "$result_dir" "$_repo" "pre_target_head")
+        local _hash_line=""
+        local _hp=()
+        [[ -n "$_container_head" ]] && _hp+=("container:${_container_head:0:7}")
+        [[ -n "$_pre_session_head" ]] && _hp+=("session:${_pre_session_head:0:7}")
+        if [[ -n "$_pre_target_head" && -n "$target_branch" ]]; then
+            _hp+=("${target_branch}:${_pre_target_head:0:7}")
+        fi
+        [[ ${#_hp[@]} -gt 0 ]] && _hash_line="${_hp[*]}"
+
         # Merge classification (every repo lands in exactly one bucket)
         # _pre_new_commits tells us if extraction pulled new work from the container
         case "$_merge_status" in
@@ -182,7 +196,7 @@ _pull_report() {
                 case "$_merge_detail" in
                     "already up to date"|"up to date"*)
                         if [[ "$_pre_new_commits" -gt 0 ]]; then
-                            _ready_lines+=("$_rel_path — ${_pre_new_commits} new commits extracted, already in ${target_branch}")
+                            _ready_lines+=("$_rel_path — new changes extracted, already in ${target_branch}|${_hash_line}")
                             _ready=$((_ready + 1))
                         else
                             _unchanged=$((_unchanged + 1))
@@ -194,16 +208,16 @@ _pull_report() {
                             _rdiff=$(git -C "$_abs_path" diff --stat "$target_branch".."$session_name" 2>/dev/null | tail -1)
                         fi
                         local _new_info=""
-                        [[ "$_pre_new_commits" -gt 0 ]] && _new_info="${_pre_new_commits} new commits, "
-                        _ready_lines+=("$_rel_path — ${_new_info}${_merge_detail}${_rdiff:+ | $_rdiff}")
+                        [[ "$_pre_new_commits" -gt 0 ]] && _new_info="new changes, "
+                        _ready_lines+=("$_rel_path — ${_new_info}${_merge_detail}${_rdiff:+ | $_rdiff}|${_hash_line}")
                         _ready=$((_ready + 1))
                         ;;
                 esac
                 ;;
             SKIP)
                 local _skip_info=""
-                [[ "$_pre_new_commits" -gt 0 ]] && _skip_info="${_pre_new_commits} new commits, "
-                _skip_lines+=("$_rel_path — ${_skip_info}${_merge_detail}")
+                [[ "$_pre_new_commits" -gt 0 ]] && _skip_info="new changes, "
+                _skip_lines+=("$_rel_path — ${_skip_info}${_merge_detail}|${_hash_line}")
                 _skipped=$((_skipped + 1))
                 ;;
             CONFLICT)
@@ -308,7 +322,11 @@ _pull_report() {
     if [[ ${#_ready_lines[@]} -gt 0 ]]; then
         echo ""
         for _rl in "${_ready_lines[@]}"; do
-            echo -e "  ${GREEN}✓${NC} ${_rl}"
+            local _rl_text="${_rl%%|*}"
+            local _rl_hashes="${_rl#*|}"
+            [[ "$_rl_hashes" == "$_rl" ]] && _rl_hashes=""
+            echo -e "  ${GREEN}✓${NC} ${_rl_text}"
+            [[ -n "$_rl_hashes" ]] && echo -e "    ${DIM}${_rl_hashes}${NC}"
         done
     fi
 
@@ -317,7 +335,11 @@ _pull_report() {
         echo ""
         echo "  skipped:"
         for _sl in "${_skip_lines[@]}"; do
-            echo -e "    ${DIM}${_sl}${NC}"
+            local _sl_text="${_sl%%|*}"
+            local _sl_hashes="${_sl#*|}"
+            [[ "$_sl_hashes" == "$_sl" ]] && _sl_hashes=""
+            echo -e "    ${DIM}${_sl_text}${NC}"
+            [[ -n "$_sl_hashes" ]] && echo -e "      ${DIM}${_sl_hashes}${NC}"
         done
     fi
 

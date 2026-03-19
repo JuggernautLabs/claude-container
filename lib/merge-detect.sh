@@ -288,21 +288,21 @@ detect_pre_extract_status() {
             _pull_result_set "$result_dir" "$repo_name" "pre_new_commits" "$_nc"
         else
             # Different SHAs but not ancestor — rebased or diverged
-            local _mb
-            _mb=$(git -C "$host_path" merge-base "$session_head" "$container_head" 2>/dev/null || echo "")
-            if [[ -n "$_mb" ]]; then
-                local _c_ahead _h_ahead
-                _c_ahead=$(git -C "$host_path" rev-list --count "$_mb".."$container_head" 2>/dev/null || echo "0")
-                _h_ahead=$(git -C "$host_path" rev-list --count "$_mb".."$session_head" 2>/dev/null || echo "0")
-                if [[ "$_c_ahead" == "0" && "$_h_ahead" == "0" ]]; then
+            # Container HEAD may not exist in host repo (only in Docker volume).
+            # If we can resolve it, diff. If not, assume new work.
+            if git -C "$host_path" cat-file -t "$container_head" &>/dev/null; then
+                # Container commit exists on host — check content
+                if git -C "$host_path" diff --quiet "$session_head" "$container_head" -- 2>/dev/null; then
                     _pull_result_set "$result_dir" "$repo_name" "pre_status" "rebased"
+                    _pull_result_set "$result_dir" "$repo_name" "pre_new_commits" "0"
                 else
-                    _pull_result_set "$result_dir" "$repo_name" "pre_status" "rebased"
+                    _pull_result_set "$result_dir" "$repo_name" "pre_status" "ahead"
+                    _pull_result_set "$result_dir" "$repo_name" "pre_new_commits" "1"
                 fi
-                _pull_result_set "$result_dir" "$repo_name" "pre_new_commits" "$_c_ahead"
             else
-                _pull_result_set "$result_dir" "$repo_name" "pre_status" "diverged"
-                _pull_result_set "$result_dir" "$repo_name" "pre_new_commits" "0"
+                # Container commit not on host — definitely has new work
+                _pull_result_set "$result_dir" "$repo_name" "pre_status" "ahead"
+                _pull_result_set "$result_dir" "$repo_name" "pre_new_commits" "1"
             fi
         fi
     else
