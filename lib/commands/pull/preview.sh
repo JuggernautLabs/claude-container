@@ -14,9 +14,6 @@ _pull_status() {
         return 1
     fi
 
-    info "Checking session '$session_name'..."
-    echo ""
-
     # Get container HEADs (single docker run)
     local _session_heads
     _session_heads=$(get_session_heads "$volume")
@@ -67,6 +64,12 @@ _pull_status() {
         fi
     done
 
+    # Header
+    _rule "status: ${session_name}"
+    echo ""
+
+    local _first_repo=true
+
     for _entry in "${_repos_to_check[@]}"; do
         local _name="${_entry%%|*}"
         local _path="${_entry#*|}"
@@ -81,13 +84,14 @@ _pull_status() {
             continue  # repo not in container
         fi
 
-        # Build hash display line
         local _short_c="${_s_head:0:7}"
-        local _hash_line="  container:${_short_c}"
 
         if [[ -z "$_path" || ! -d "$_path" ]]; then
-            echo -e "  ${BLUE}$_name${NC}  ${_hash_line}"
-            echo -e "    status:   ${YELLOW}!${NC} host path missing"
+            $_first_repo || echo ""
+            _first_repo=false
+            echo -e "  ${BLUE}$_name${NC}"
+            echo -e "    ${DIM}container:${_short_c}${NC}"
+            echo -e "    ${YELLOW}!${NC} host path missing"
             _not_extracted=$((_not_extracted + 1))
             continue
         fi
@@ -97,31 +101,40 @@ _pull_status() {
         if git -C "$_path" show-ref --verify --quiet "refs/heads/$session_name" 2>/dev/null; then
             _h_head=$(git -C "$_path" rev-parse "refs/heads/$session_name" 2>/dev/null)
         fi
-        local _short_h="${_h_head:0:7}"
-        [[ -n "$_h_head" ]] && _hash_line="${_hash_line}  session:${_short_h}"
 
         # Also show target branch HEAD if it exists
         local _t_head=""
         _t_head=$(git -C "$_path" rev-parse "refs/heads/main" 2>/dev/null || echo "")
-        [[ -n "$_t_head" ]] && _hash_line="${_hash_line}  main:${_t_head:0:7}"
 
-        echo -e "  ${BLUE}$_name${NC}  ${_hash_line}"
+        # Blank line between repos
+        $_first_repo || echo ""
+        _first_repo=false
+
+        # Repo name
+        echo -e "  ${BLUE}$_name${NC}"
+
+        # Hashes on their own dim line
+        local _hash_parts=()
+        _hash_parts+=("container:${_short_c}")
+        [[ -n "$_h_head" ]] && _hash_parts+=("session:${_h_head:0:7}")
+        [[ -n "$_t_head" ]] && _hash_parts+=("main:${_t_head:0:7}")
+        echo -e "    ${DIM}${_hash_parts[*]}${NC}"
 
         if [[ -z "$_h_head" ]]; then
-            echo -e "    status:   ${YELLOW}!${NC} not yet extracted"
+            echo -e "    ${YELLOW}!${NC} not yet extracted"
             _not_extracted=$((_not_extracted + 1))
         elif [[ "$_s_head" == "$_h_head" ]]; then
-            echo -e "    status:   ${GREEN}✓${NC} up to date"
+            echo -e "    ${GREEN}✓${NC} up to date"
             _up_to_date=$((_up_to_date + 1))
         elif git -C "$_path" merge-base --is-ancestor "$_h_head" "$_s_head" 2>/dev/null; then
             local _ahead
             _ahead=$(git -C "$_path" rev-list --count "$_h_head".."$_s_head" 2>/dev/null || echo "?")
-            echo -e "    status:   ${BLUE}→${NC} container ahead by $_ahead commit(s)"
+            echo -e "    ${BLUE}→${NC} container ahead by $_ahead commit(s)"
             _changed=$((_changed + 1))
         elif git -C "$_path" merge-base --is-ancestor "$_s_head" "$_h_head" 2>/dev/null; then
             local _ahead
             _ahead=$(git -C "$_path" rev-list --count "$_s_head".."$_h_head" 2>/dev/null || echo "?")
-            echo -e "    status:   ${BLUE}←${NC} host ahead by $_ahead commit(s)"
+            echo -e "    ${DIM}← host ahead by $_ahead commit(s)${NC}"
             _changed=$((_changed + 1))
         else
             local _merge_base
@@ -131,18 +144,20 @@ _pull_status() {
                 _c_ahead=$(git -C "$_path" rev-list --count "$_merge_base".."$_s_head" 2>/dev/null || echo "?")
                 _h_ahead=$(git -C "$_path" rev-list --count "$_merge_base".."$_h_head" 2>/dev/null || echo "?")
             fi
-            echo -e "    status:   ${YELLOW}!${NC} diverged (container +${_c_ahead}, host +${_h_ahead})"
+            echo -e "    ${YELLOW}!${NC} diverged (container +${_c_ahead}, host +${_h_ahead})"
             _diverged=$((_diverged + 1))
         fi
     done
 
-    # Summary
+    # Footer
     echo ""
+    _rule
+
     local _parts=()
-    [[ $_up_to_date -gt 0 ]] && _parts+=("$_up_to_date up to date")
-    [[ $_changed -gt 0 ]] && _parts+=("$_changed changed")
-    [[ $_diverged -gt 0 ]] && _parts+=("$_diverged diverged")
-    [[ $_not_extracted -gt 0 ]] && _parts+=("$_not_extracted not extracted")
+    [[ $_up_to_date -gt 0 ]] && _parts+=("${_up_to_date} up to date")
+    [[ $_changed -gt 0 ]] && _parts+=("${_changed} changed")
+    [[ $_diverged -gt 0 ]] && _parts+=("${_diverged} diverged")
+    [[ $_not_extracted -gt 0 ]] && _parts+=("${_not_extracted} not extracted")
 
     if [[ ${#_parts[@]} -gt 0 ]]; then
         local _line

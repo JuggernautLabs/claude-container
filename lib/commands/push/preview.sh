@@ -9,9 +9,6 @@ _push_preview() {
     local repo_filter="${3:-}"
     local volume="claude-session-${session_name}"
 
-    info "Push preview: '$target_branch' → session '$session_name'"
-    echo ""
-
     local config_content
     config_content=$(read_session_config "$volume")
     if [[ -z "$config_content" ]]; then
@@ -25,6 +22,10 @@ _push_preview() {
         projects=$(augment_projects_from_volume "$volume" "$projects" "$repo_filter")
     fi
 
+    # Header
+    _rule "push: ${target_branch} → ${session_name}"
+    echo ""
+
     # Show discovered (extract: false) repos
     local _disc_full
     _disc_full=$(parse_session_projects_full "$config_content")
@@ -36,9 +37,9 @@ _push_preview() {
             _disc_repos+=("$_dn")
         done <<< "$_disc_full"
         if [[ ${#_disc_repos[@]} -gt 0 ]]; then
-            echo "  Discovered (not extracted):"
             for _dr in "${_disc_repos[@]}"; do
-                echo -e "    ${YELLOW}○${NC} $_dr — new in session (not extracted)"
+                echo -e "  ${BLUE}$_dr${NC}"
+                echo -e "    ${YELLOW}○${NC} new in session (not extracted)"
             done
             echo ""
         fi
@@ -139,11 +140,9 @@ _push_preview() {
             if [[ "$_as" == "up_to_date" ]]; then
                 _up_to_date=$((_up_to_date + 1))
             elif [[ "$_as" == "needs_merge" ]]; then
-                # Count commits on host side (reliable — doesn't need fetch)
                 local _host_count="?"
                 local _hp="${_candidate_paths[$_an]}"
                 if [[ -n "$_hp" ]]; then
-                    # Count commits on target that session branch doesn't have
                     _host_count=$(git -C "$_hp" rev-list --count "$session_name".."$target_branch" 2>/dev/null || echo "?")
                 fi
                 _needs_merge+=("$_an|$_host_count")
@@ -153,49 +152,49 @@ _push_preview() {
         done <<< "$_ancestry_out"
     fi
 
-    # Render preview
+    # Render repos
     if [[ ${#_needs_merge[@]} -gt 0 ]]; then
-        echo "  Will merge (${#_needs_merge[@]}):"
         for _entry in "${_needs_merge[@]}"; do
             local _mn _mc
             IFS='|' read -r _mn _mc <<< "$_entry"
-            # Get host-side commit info
             local _mpath
             _mpath=$(echo "$projects" | grep "^${_mn}|" | head -1 | cut -d'|' -f2)
             local _short_head=""
             [[ -n "$_mpath" ]] && _short_head=$(git -C "$_mpath" log --oneline -1 "$target_branch" 2>/dev/null)
-            echo -e "    ${GREEN}✓${NC} $_mn  ${DIM}${_mc} commit(s) from ${target_branch}${NC}"
-            [[ -n "$_short_head" ]] && echo -e "      ${DIM}latest: $_short_head${NC}"
+            echo -e "  ${BLUE}$_mn${NC}"
+            echo -e "    ${GREEN}✓${NC} ${_mc} commit(s) from ${target_branch}"
+            [[ -n "$_short_head" ]] && echo -e "    ${DIM}latest: $_short_head${NC}"
         done
         echo ""
     fi
 
     if [[ ${#_problem_repos[@]} -gt 0 ]]; then
-        echo "  Problems (${#_problem_repos[@]}):"
         for _entry in "${_problem_repos[@]}"; do
             local _pn _pd
             IFS='|' read -r _pn _pd <<< "$_entry"
-            echo -e "    ${YELLOW}!${NC} $_pn — $_pd"
+            echo -e "  ${BLUE}$_pn${NC}"
+            echo -e "    ${YELLOW}!${NC} $_pd"
         done
         echo ""
     fi
 
     if [[ ${#_skip_repos[@]} -gt 0 ]]; then
-        echo "  Skipped (${#_skip_repos[@]}):"
         for _entry in "${_skip_repos[@]}"; do
             local _sn _sd
             IFS='|' read -r _sn _sd <<< "$_entry"
-            echo -e "    ${DIM}$_sn — $_sd${NC}"
+            echo -e "  ${DIM}$_sn — $_sd${NC}"
         done
         echo ""
     fi
 
+    # Footer
+    _rule
+
     if [[ $_up_to_date -gt 0 ]]; then
-        echo -e "${DIM}$_up_to_date repo(s) already up to date — no modifications${NC}"
+        echo -e "${DIM}${_up_to_date} already up to date${NC}"
     fi
 
     if [[ ${#_needs_merge[@]} -eq 0 && ${#_problem_repos[@]} -eq 0 ]]; then
-        echo ""
         info "Nothing to merge — session is up to date with '$target_branch'"
     fi
 
