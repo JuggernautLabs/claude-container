@@ -3497,60 +3497,104 @@ session_auto_merge() {
 # Repair corrupted session config (fixes paths with ||true| suffix)
 # Usage: session_repair <session_name>
 session_repair() {
-    local session_name="$1"
-    local volume="claude-session-${session_name}"
-    local git_image="${IMAGE_NAME:-$DEFAULT_IMAGE}"
-
-    if [[ -z "$session_name" ]]; then
-        error "Usage: session_repair <session_name>"
+    local session="$1"
+    if [[ -z "$session" ]]; then
+        error "Session name required"
         return 1
     fi
 
-    # Verify session exists
-    if ! docker volume inspect "$volume" &>/dev/null; then
-        error "Session not found: $session_name"
+    local volume="claude-session-${session}"
+    local config_dir="${SESSIONS_CONFIG_DIR:-$HOME/.config/claude-container/sessions}"
+    local git_image="${GIT_UTIL_IMAGE:-alpine/git}"
+    local all_ok=true
+
+    echo "Repairing session: $session"
+    echo ""
+
+    # 1. Check session volume exists
+    if docker volume inspect "$volume" &>/dev/null; then
+        success "Session volume exists"
+    else
+        error "Session volume missing: $volume"
+        echo "  Cannot repair a session without its primary volume."
         return 1
     fi
 
-    info "Checking session config..."
+    # 2. Check auxiliary volumes (state, cargo, npm, pip)
+    for aux_type in state cargo npm pip; do
+        local aux_vol="claude-${aux_type}-${session}"
+        if docker volume inspect "$aux_vol" &>/dev/null; then
+            success "${aux_type} volume exists"
+        else
+            warn "${aux_type} volume missing — creating"
+            docker volume create "$aux_vol" >/dev/null
+            success "${aux_type} volume created"
+        fi
+    done
 
-    # Check if config has corrupted paths
-    local config_content
-    config_content=$(read_session_config "$volume")
-
-    if [[ -z "$config_content" ]]; then
-        info "No .claude-projects.yml found (single-project session)"
-        return 0
-    fi
-
-    if ! echo "$config_content" | grep -q '||'; then
-        info "Config appears valid (no ||true| corruption detected)"
-        return 0
-    fi
-
-    info "Found corrupted paths, repairing..."
-
-    # Fix the config by removing ||...| suffix from paths
+    # 3. Fix permissions on all volumes
+    info "Fixing volume permissions..."
     local host_uid
     host_uid=$(get_host_uid)
-
     docker run --rm \
-        --user "$host_uid:$host_uid" \
-        -v "$volume:/session" \
-        "$git_image" \
-        sh -c "sed -i 's/||[^|]*|$//' /session/.claude-projects.yml"
+        -v "claude-cargo-${session}:/cargo" \
+        -v "claude-npm-${session}:/npm" \
+        -v "claude-pip-${session}:/pip" \
+        -v "claude-state-${session}:/state" \
+        alpine sh -c "chown -R ${host_uid}:${host_uid} /cargo /npm /pip /state 2>/dev/null || true"
+    success "Volume permissions fixed"
 
-    # Verify the fix
-    local fixed_content
-    fixed_content=$(read_session_config "$volume")
-
-    if echo "$fixed_content" | grep -q '||'; then
-        error "Repair incomplete - some paths may still be corrupted"
-        return 1
+    # 4. Check config file in volume
+    local config_content
+    config_content=$(docker run --rm -v "$volume:/session:ro" "$git_image" \
+        cat /session/.claude-projects.yml 2>/dev/null || true)
+    if [[ -n "$config_content" ]]; then
+        # Check for path corruption (existing repair logic)
+        if echo "$config_content" | grep -q '||[^|]*|$'; then
+            warn "Config has corrupted paths — repairing"
+            docker run --rm -v "$volume:/session" "$git_image" \
+                sh -c "sed -i 's/||[^|]*|$//' /session/.claude-projects.yml"
+            success "Config paths repaired"
+        else
+            success "Config file valid"
+        fi
+    else
+        warn "No config file found in session volume"
+        all_ok=false
     fi
 
-    success "Config repaired successfully"
+    # 5. Check session metadata on host
+    if [[ -f "$config_dir/${session}.env" ]]; then
+        success "Session metadata exists"
+    else
+        warn "Session metadata missing — session will use defaults on next start"
+        all_ok=false
+    fi
+
+    # 6. Clean up stale containers
+    local stale_ctrs
+    stale_ctrs=$(docker ps -aq --filter "volume=$volume" --filter "status=exited" 2>/dev/null || true)
+    if [[ -n "$stale_ctrs" ]]; then
+        local stale_count
+        stale_count=$(echo "$stale_ctrs" | wc -l | tr -d ' ')
+        info "Removing $stale_count stale container(s)..."
+        echo "$stale_ctrs" | xargs docker rm -f >/dev/null 2>&1 || true
+        success "Stale containers removed"
+    else
+        success "No stale containers"
+    fi
+
+    # 7. Check for running container
+    local running_ctrs
+    running_ctrs=$(docker ps -q --filter "volume=$volume" 2>/dev/null || true)
+    if [[ -n "$running_ctrs" ]]; then
+        warn "Session has a running container — some repairs may not take effect until restart"
+    fi
+
     echo ""
-    echo "Fixed config:"
-    echo "$fixed_content" | head -20
+    if $all_ok; then
+        success "Session '$session' is healthy"
+    else
+        warn "Session '$session' repaired with warnings (see above)"
+    fi
 }

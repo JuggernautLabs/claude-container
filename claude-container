@@ -64,6 +64,8 @@ AUTO_MERGE_BRANCH=""  # Target branch for auto-merge (default: main)
 CLONE_FROM=""         # Clone volumes from existing session (--clone-from)
 DIRTY_SESSION=false   # Capture host uncommitted changes into session (--dirty)
 EXPOSE_PORTS=()       # Ports to expose (--port)
+EPHEMERAL=false       # --ephemeral: destroy container on exit (old default)
+REBUILD_CONTAINER=false  # --rebuild: force-remove existing container and create fresh
 
 # Tracking booleans for CLI-set flags (for session metadata override logic)
 NO_CONFIG_SET=false
@@ -275,6 +277,15 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
 
+        --ephemeral)
+            EPHEMERAL=true
+            shift
+            ;;
+        --rebuild)
+            REBUILD_CONTAINER=true
+            shift
+            ;;
+
         # Actions without session requirement
         --sessions|--list-sessions)
             _set_action "list"
@@ -368,6 +379,8 @@ Options:
   --no-config              Skip auto-discovery of .claude-projects.yml
   --dirty                  Capture uncommitted host changes into session as WIP commit
   --port, -p <port>        Expose a port (e.g., --port 3000, --port 8080:80). Persisted.
+  --ephemeral              Destroy container on exit (non-persistent)
+  --rebuild                Force-remove existing container and create fresh
   --no-run                 Set up session but don't start container
   --verify, -v             Verify container setup works
   --version, -V            Show version
@@ -557,6 +570,7 @@ if [[ -n "$SESSION_NAME" ]] && [[ -f "$SESSIONS_CONFIG_DIR/${SESSION_NAME}.env" 
             RUN_AS_ROOTISH) $RUN_AS_ROOTISH_SET  || RUN_AS_ROOTISH="$_meta_value" ;;
             ENABLE_DOCKER)  $ENABLE_DOCKER_SET   || ENABLE_DOCKER="$_meta_value" ;;
             DOCKERFILE)     $DOCKERFILE_SET      || DOCKERFILE="$_meta_value" ;;
+            EPHEMERAL)      EPHEMERAL="$_meta_value" ;;
             EXPOSE_PORT)    _saved_ports+=("$_meta_value") ;;
         esac
     done < "$SESSIONS_CONFIG_DIR/${SESSION_NAME}.env"
@@ -778,6 +792,7 @@ RUN_AS_USER=$RUN_AS_USER
 RUN_AS_ROOTISH=$RUN_AS_ROOTISH
 ENABLE_DOCKER=$ENABLE_DOCKER
 DOCKERFILE=${DOCKERFILE:-}
+EPHEMERAL=$EPHEMERAL
 EOF
     # Append port mappings (multi-value, one per line)
     for _port in "${EXPOSE_PORTS[@]}"; do
@@ -802,10 +817,19 @@ if [[ -n "$SESSION_NAME" && -f "$SESSIONS_CONFIG_DIR/${SESSION_NAME}.env" ]]; th
     touch "$SESSIONS_CONFIG_DIR/${SESSION_NAME}.env"
 fi
 
+# Determine container name (must be set before DOCKER_ARGS)
+CONTAINER_NAME="claude-dev-$$"
+if $USE_GIT_SESSION && ! $EPHEMERAL && [[ -n "$SESSION_NAME" ]]; then
+    CONTAINER_NAME="claude-session-ctr-${SESSION_NAME}"
+fi
+
 # Build docker run command
-DOCKER_ARGS=(
-    "--rm"
-    "--name" "claude-dev-$$"
+DOCKER_ARGS=()
+if $EPHEMERAL || ! $USE_GIT_SESSION; then
+    DOCKER_ARGS+=("--rm")
+fi
+DOCKER_ARGS+=(
+    "--name" "$CONTAINER_NAME"
     "-w" "/workspace"
 )
 
@@ -980,7 +1004,33 @@ if [[ ${#EXPOSE_PORTS[@]} -gt 0 ]]; then
 fi
 echo ""
 
-# Run container with entrypoint script
+# Container reuse logic for persistent (non-ephemeral) session containers
+_CONTAINER_REUSED=false
+if $USE_GIT_SESSION && ! $EPHEMERAL && [[ -n "$SESSION_NAME" ]]; then
+    _existing_ctr=$(docker ps -aq --filter "name=^${CONTAINER_NAME}$" 2>/dev/null || true)
+
+    if [[ -n "$_existing_ctr" ]] && $REBUILD_CONTAINER; then
+        info "Removing existing container for rebuild..."
+        docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
+        _existing_ctr=""
+    fi
+
+    if [[ -n "$_existing_ctr" ]]; then
+        _ctr_running=$(docker ps -q --filter "name=^${CONTAINER_NAME}$" 2>/dev/null || true)
+        if [[ -n "$_ctr_running" ]]; then
+            warn "Container already running for session '$SESSION_NAME'"
+            info "Attaching to running container..."
+            docker attach "$CONTAINER_NAME" || true
+        else
+            info "Resuming container for session '$SESSION_NAME'..."
+            docker start -ai "$CONTAINER_NAME" || true
+        fi
+        _CONTAINER_REUSED=true
+    fi
+fi
+
+# Run container with entrypoint script (skip if reusing existing container)
+if ! $_CONTAINER_REUSED; then
 docker run "${DOCKER_ARGS[@]}" "$IMAGE_NAME" /bin/bash -c '
     set -e
 
@@ -1212,6 +1262,7 @@ FINSCRIPT
         exec bash -c "HOME=/home/developer claude $CLAUDE_CMD_ARGS"
     fi
 '
+fi  # end: if ! $_CONTAINER_REUSED
 
 # Session exit message
 if $USE_GIT_SESSION; then
