@@ -538,7 +538,7 @@ snapshot_session_state() {
 #   $4 - format: "stat" (--stat), "summary" (last line of --stat), "names" (--name-only),
 #                "count" (file count only), "full" (full diff)
 # Output: diff output on stdout, empty if nothing to diff
-# Returns: 0 if diff produced output, 1 if nothing to diff
+# Returns: always 0 (safe under set -e). Empty stdout means no diff.
 snapshot_diff() {
     local result_dir="$1"
     local repo_name="$2"
@@ -552,8 +552,8 @@ snapshot_diff() {
     _squash_base=$(_pull_result_get "$result_dir" "$repo_name" "squash_base")
     _container_known=$(_pull_result_get "$result_dir" "$repo_name" "container_known")
 
-    [[ -z "$_path" || ! -d "$_path" ]] && return 1
-    [[ -z "$_session_head" ]] && return 1
+    [[ -z "$_path" || ! -d "$_path" ]] && return 0
+    [[ -z "$_session_head" ]] && return 0
 
     # Determine the right base for comparison
     # With squash-base: compare from the last sync point (avoids double-counting squashed content)
@@ -571,7 +571,7 @@ snapshot_diff() {
             _from="$_target_head"
             _to="$_session_head"
         else
-            return 1
+            return 0
         fi
     else
         # target → session: what does target have that session doesn't?
@@ -579,16 +579,16 @@ snapshot_diff() {
             _from="$_session_head"
             _to="$_target_head"
         else
-            return 1
+            return 0
         fi
     fi
 
     # Check refs exist
-    git -C "$_path" cat-file -t "$_from" &>/dev/null || return 1
-    git -C "$_path" cat-file -t "$_to" &>/dev/null || return 1
+    git -C "$_path" cat-file -t "$_from" &>/dev/null || return 0
+    git -C "$_path" cat-file -t "$_to" &>/dev/null || return 0
 
     # Trees identical → no diff
-    git -C "$_path" diff --quiet "$_from" "$_to" -- 2>/dev/null && return 1
+    git -C "$_path" diff --quiet "$_from" "$_to" -- 2>/dev/null && return 0
 
     case "$format" in
         stat)
