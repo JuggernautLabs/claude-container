@@ -960,6 +960,14 @@ if $USE_GIT_SESSION && ! $EPHEMERAL && [[ -n "$SESSION_NAME" ]]; then
     if [[ -n "$_existing_ctr" ]]; then
         _ctr_running=$(docker ps -q --filter "name=^${CONTAINER_NAME}$" 2>/dev/null || true)
         if [[ -n "$_ctr_running" ]]; then
+            # If we're launching for a specific task (reconcile, rebase, etc.),
+            # don't attach to a running interactive session — stdin would be shared.
+            if [[ -n "${AGENT_TASK:-}" && "${AGENT_TASK}" != "work" ]]; then
+                error "Container already running for session '$SESSION_NAME'"
+                error "Cannot launch '$AGENT_TASK' while session is active."
+                echo "  Stop the running session first, or run from a session that isn't active."
+                exit 1
+            fi
             warn "Container already running for session '$SESSION_NAME'"
             info "Attaching to running container..."
             docker attach "$CONTAINER_NAME" || true
