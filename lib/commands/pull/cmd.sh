@@ -230,8 +230,8 @@ cmd_pull() {
     # Extract with result tracking (skip entirely on --dry-run — snapshot has all the data)
     if ! $dry_run; then
         extract_args+=(--result-dir "$_pull_result_dir")
-        # Suppress extraction noise when --verify — the report speaks for itself
-        if $verify && [[ -n "$branch" ]]; then
+        # Suppress extraction noise when verify — the report speaks for itself
+        if $verify; then
             extract_args+=(--quiet)
         fi
         session_extract "${extract_args[@]}"

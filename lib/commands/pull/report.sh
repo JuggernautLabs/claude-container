@@ -239,7 +239,7 @@ _pull_report() {
                     local _einfo=""
                     [[ -n "$_ext_commits" && "$_ext_commits" != "0" ]] && _einfo="${_ext_commits} commits"
                     [[ -n "$_ext_files" && "$_ext_files" != "0" ]] && _einfo="${_einfo:+$_einfo, }${_ext_files} files"
-                    _ready_lines+=("$_rel_path — extracted${_einfo:+ ($_einfo)}")
+                    _ready_lines+=("$_rel_path — extracted${_einfo:+ ($_einfo)}|${_hash_line}")
                     _ready=$((_ready + 1))
                 else
                     _unchanged=$((_unchanged + 1))
