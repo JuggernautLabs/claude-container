@@ -22,13 +22,15 @@ _push_report() {
     projects=$(parse_session_projects "$config_content")
     [[ -n "$repo_filter" ]] && projects=$(augment_projects_from_volume "$volume" "$projects" "$repo_filter")
 
-    # Get post-merge session state via snapshot
+    # Extract first so host session branches reflect the merge result
+    session_extract "$session_name" --force > /dev/null 2>&1 || true
+
+    # Snapshot AFTER extract — now host session branches are current
     local _post_snap_dir
     _post_snap_dir=$(mktemp -d)
     snapshot_session_state "$volume" "$session_name" "$source_branch" "$_post_snap_dir" "$repo_filter"
 
-    # Check each repo: is host branch now an ancestor of session HEAD?
-    local _merged=0 _skipped=0
+    local _merged=0 _still_diverged=0
 
     echo ""
     _rule "push: ${source_branch} → ${session_name}"
@@ -43,35 +45,37 @@ _push_report() {
         _host_head=$(git -C "$proj_path" rev-parse "refs/heads/$source_branch" 2>/dev/null || echo "")
         [[ -z "$_host_head" ]] && continue
 
-        local _post_head
+        local _post_head _post_session
         _post_head=$(_pull_result_get "$_post_snap_dir" "$proj_name" "container_head")
+        _post_session=$(_pull_result_get "$_post_snap_dir" "$proj_name" "session_head")
         [[ -z "$_post_head" ]] && continue
         local _post_short="${_post_head:0:7}"
 
-        # Check ancestry: is host branch HEAD now in session?
-        local _still_ahead
-        _still_ahead=$(git -C "$proj_path" rev-list --count "$session_name".."$source_branch" 2>/dev/null || echo "0")
-
-        if [[ "$_still_ahead" -eq 0 ]]; then
+        # Check: does the container now have main's content?
+        local _container_known
+        _container_known=$(_pull_result_get "$_post_snap_dir" "$proj_name" "container_known")
+        if [[ "$_container_known" == "true" ]] && git -C "$proj_path" merge-base --is-ancestor "$_host_head" "$_post_head" 2>/dev/null; then
+            echo -e "  ${GREEN}✓${NC} $proj_name  ${DIM}session:${_post_short}${NC}"
+            _merged=$((_merged + 1))
+        elif [[ "$_post_head" == "$_host_head" ]] || [[ "$_post_session" == "$_host_head" ]]; then
             echo -e "  ${GREEN}✓${NC} $proj_name  ${DIM}session:${_post_short}${NC}"
             _merged=$((_merged + 1))
         else
-            echo -e "  ${DIM}·${NC} $proj_name  ${DIM}${_still_ahead} still ahead${NC}"
-            _skipped=$((_skipped + 1))
+            echo -e "  ${DIM}·${NC} $proj_name  ${DIM}still diverged${NC}"
+            _still_diverged=$((_still_diverged + 1))
         fi
     done <<< "$projects"
 
     rm -rf "$_post_snap_dir"
 
-    # Extract silently to sync host session branches
-    session_extract "$session_name" --force > /dev/null 2>&1
-
     # Footer
     echo ""
     _rule
-    if [[ $_skipped -eq 0 ]]; then
+    if [[ $_still_diverged -eq 0 ]]; then
         success "$_merged merged from ${source_branch}"
     else
-        warn "Merged with issues — $_skipped repo(s) may need attention"
+        warn "$_merged merged, $_still_diverged still diverged"
+        echo -e "${DIM}Diverged repos: container has merged content but history differs from host.${NC}"
+        echo -e "${DIM}Run 'pull -s $session_name $source_branch' to sync back to host.${NC}"
     fi
 }
