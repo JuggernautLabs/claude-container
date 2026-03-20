@@ -89,7 +89,7 @@ cmd_watch() {
     echo ""
 
     # Run the command once on startup
-    _watch_run_cmd "${user_cmd[@]}"
+    _watch_run_cmd "${user_cmd[@]}" || true
 
     # Poll loop
     local _queued=false
@@ -118,7 +118,7 @@ cmd_watch() {
             _ts=$(date +%H:%M:%S)
             echo ""
             info "[$_ts] Change detected: ${_changed_repos[*]}"
-            _watch_run_cmd "${user_cmd[@]}"
+            _watch_run_cmd "${user_cmd[@]}" || true
 
             # After command finishes, check if more changes arrived during execution.
             # Keep draining until stable.

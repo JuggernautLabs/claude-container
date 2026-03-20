@@ -356,8 +356,8 @@ _reconcile_process_next() {
     echo ""
 
     # Phase 2: Auto-merge into target
-    session_auto_merge "$session_name" "$target_branch"
-    local rc=$?
+    local rc=0
+    session_auto_merge "$session_name" "$target_branch" || rc=$?
 
     if [[ $rc -eq 2 ]]; then
         # Conflicts — need container resolution

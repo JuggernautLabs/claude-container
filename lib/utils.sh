@@ -124,7 +124,7 @@ find_worktree_for_branch() {
                 fi
             fi
         fi
-    done
+    done || true
 }
 
 # Spinner for long operations

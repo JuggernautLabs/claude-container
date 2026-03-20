@@ -417,11 +417,11 @@ _pull_stash_dirty() {
 
         info "  $proj_name: stashing uncommitted work"
 
-        git -C "$proj_path" checkout -b "$stash_branch" >/dev/null 2>&1
-        git -C "$proj_path" add -A >/dev/null 2>&1
-        git -C "$proj_path" commit -m "WIP: stashed by reconcile (session: $session_name)" --no-verify >/dev/null 2>&1
+        git -C "$proj_path" checkout -b "$stash_branch" >/dev/null 2>&1 || { warn "  $proj_name: stash failed (checkout)"; continue; }
+        git -C "$proj_path" add -A >/dev/null 2>&1 || true
+        git -C "$proj_path" commit -m "WIP: stashed by reconcile (session: $session_name)" --no-verify >/dev/null 2>&1 || true
         if [[ -n "$current_branch" ]]; then
-            git -C "$proj_path" checkout "$current_branch" >/dev/null 2>&1
+            git -C "$proj_path" checkout "$current_branch" >/dev/null 2>&1 || true
         fi
 
         stash_count=$((stash_count + 1))
