@@ -315,11 +315,35 @@ cmd_pull() {
         # Real merge
         session_auto_merge "$session_name" "$branch" false "$repo_filter" "$squash" "$_pull_result_dir" || _merge_rc=$?
 
-        # Show final report with actual results
+        # Show final report with actual merge results
         echo ""
         _pull_report "$session_name" "$branch" "$_pull_result_dir" "$repo_filter"
-        echo ""
-        _verify_diffstat "$session_name" "$branch" "$_pull_result_dir" "$repo_filter" || true
+
+        # Summary of what actually happened
+        local _merged_count=0 _merge_detail_line=""
+        for _mrf in "$_pull_result_dir"/*; do
+            [[ -f "$_mrf" ]] || continue
+            [[ "$_mrf" == *.detail ]] && continue
+            local _mr_name _mr_detail
+            _mr_name=$(grep "^repo_name=" "$_mrf" 2>/dev/null | tail -1 | cut -d= -f2-)
+            [[ -z "$_mr_name" ]] && continue
+            repo_matches_filter "$_mr_name" "$repo_filter" || continue
+            _mr_detail=$(grep "^merge_detail=" "$_mrf" 2>/dev/null | tail -1 | cut -d= -f2-)
+            case "$_mr_detail" in
+                "squash-merged"*|"fast-forward"*|"merged"*|"created"*)
+                    _merged_count=$((_merged_count + 1))
+                    _merge_detail_line="$_mr_name: $_mr_detail"
+                    ;;
+            esac
+        done
+        if [[ $_merged_count -gt 0 ]]; then
+            echo ""
+            if [[ $_merged_count -eq 1 ]]; then
+                success "$_merge_detail_line"
+            else
+                success "$_merged_count repo(s) merged into $branch"
+            fi
+        fi
     else
         # Extract-only: just show extraction report
         echo ""
