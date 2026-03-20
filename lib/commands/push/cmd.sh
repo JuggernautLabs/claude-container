@@ -14,7 +14,7 @@ cmd_push() {
     local target_as=""
     local strategy="ff"  # ff, merge, rebase, serve
     local force=false
-    local verify=false
+    local verify=true
     local dry_run=false
     local discuss=false
     local repo_filter=""
@@ -66,7 +66,11 @@ cmd_push() {
                 shift
                 ;;
             --verify)
-                verify=true
+                verify=true  # explicit (already default)
+                shift
+                ;;
+            --no-verify)
+                verify=false
                 shift
                 ;;
             --dry-run)

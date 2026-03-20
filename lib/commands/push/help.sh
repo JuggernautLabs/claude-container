@@ -19,7 +19,8 @@ Options:
   --ff                     Fast-forward from host branch (default)
   --merge                  Merge host branch into session
   --rebase                 Rebase session onto host branch
-  --verify                 Preview what merge would do and confirm before proceeding
+  --no-verify              Skip confirmation prompts (merge immediately)
+  --verify                 Preview and confirm before proceeding (default)
   --dry-run                Preview only, don't execute
   --discuss                Preview + launch Claude to discuss merge state
   --force, -f              Force operation

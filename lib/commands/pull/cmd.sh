@@ -18,7 +18,7 @@ cmd_pull() {
     local dry_run=false
     local squash=true
     local status_only=false
-    local verify=false
+    local verify=true
     local discuss=false
     local show_prompt=false
     local extract_discovered=false
@@ -65,7 +65,11 @@ cmd_pull() {
                 shift
                 ;;
             --verify)
-                verify=true
+                verify=true  # explicit (already default)
+                shift
+                ;;
+            --no-verify)
+                verify=false
                 shift
                 ;;
             --discuss)

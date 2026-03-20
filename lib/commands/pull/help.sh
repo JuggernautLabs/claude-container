@@ -21,7 +21,8 @@ Options:
   --squash                 Squash-merge (default). Tracks prior squashes so repeat pulls
                            only merge new commits — no conflicts from squash history.
   --no-squash              Regular merge. Preserves full session commit history on target.
-  --verify                 Extract and show results, then ask before merging
+  --no-verify              Skip confirmation prompts (extract and merge immediately)
+  --verify                 Show results and ask before merging (default)
   --discuss                Like --verify, but also launches Claude to discuss the diff
   --extract                Extract repos discovered in session (created by agent).
                            Use with --repo to extract specific repos, or alone for all.
