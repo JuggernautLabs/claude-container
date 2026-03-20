@@ -273,9 +273,9 @@ _pull_reconcile() {
     _reconcile_result_dir=$(mktemp -d)
     info "Extracting session branches..."
     if [[ "$force" == "true" ]]; then
-        session_extract "$session_name" --force --result-dir "$_reconcile_result_dir"
+        session_extract "$session_name" --force --result-dir "$_reconcile_result_dir" --quiet
     else
-        session_extract "$session_name" --result-dir "$_reconcile_result_dir"
+        session_extract "$session_name" --result-dir "$_reconcile_result_dir" --quiet
     fi
 
     # Phase 2: Stash dirty worktrees on host
@@ -288,49 +288,25 @@ _pull_reconcile() {
     #   0 = conflicts/dirty, needs container with Claude
     info "Phase 3: Merging '$target_branch' into session..."
     if ! session_merge_into "$session_name" "$target_branch"; then
-        # Clean merge — extract resolved state and auto-merge into target
-        info "Clean merge — extracting and merging into '$target_branch'..."
-        session_extract "$session_name" --force
+        # Clean merge — use the unified pull flow (snapshot + report)
+        info "Clean merge — pulling into '$target_branch'..."
         echo ""
 
-        if [[ "$verify" == "true" ]]; then
-            # Show dry-run before merging
-            info "Dry-run merge into '$target_branch':"
-            session_auto_merge "$session_name" "$target_branch" true
-            echo ""
-            printf "Merge into '%s'? [y/N] " "$target_branch"
-            local _answer
-            read -r _answer
-            case "$_answer" in
-                [yY]|[yY][eE][sS])
-                    info "Merging..."
-                    ;;
-                [sS])
-                    info "Session branches extracted, merge skipped."
-                    # Clean up marker
-                    local git_image="${IMAGE_NAME:-$DEFAULT_IMAGE}"
-                    docker run --rm -v "$volume:/session" "$git_image" \
-                        rm -f /session/.merge-into-branch 2>/dev/null || true
-                    return 0
-                    ;;
-                *)
-                    info "Aborted. Session branches extracted but not merged into $target_branch."
-                    # Clean up marker
-                    local git_image="${IMAGE_NAME:-$DEFAULT_IMAGE}"
-                    docker run --rm -v "$volume:/session" "$git_image" \
-                        rm -f /session/.merge-into-branch 2>/dev/null || true
-                    return 0
-                    ;;
-            esac
-        fi
-
-        session_auto_merge "$session_name" "$target_branch"
-
-        # Clean up the .merge-into-branch marker (session_merge_into wrote it)
+        # Clean up merge-into marker before pull (it's not a conflict)
         local git_image="${IMAGE_NAME:-$DEFAULT_IMAGE}"
         docker run --rm -v "$volume:/session" "$git_image" \
-            rm -f /session/.merge-into-branch 2>/dev/null || true
-        return 0
+            rm -f /session/.merge-into-branch /session/.merge-into-summary /session/.merge-into-mounts 2>/dev/null || true
+
+        # Delegate to the unified pull flow — it handles snapshot, extract, report, verify
+        local _pull_args=("$session_name" "$target_branch")
+        _pull_args+=(--force)
+        if [[ "$verify" == "true" ]]; then
+            _pull_args+=(--verify)
+        else
+            _pull_args+=(--no-verify)
+        fi
+        cmd_pull --session "${_pull_args[@]}"
+        return $?
     fi
 
     # Conflicts detected — session_merge_into already wrote:
