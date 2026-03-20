@@ -203,8 +203,7 @@ cmd_pull() {
             _pull_reconcile_preview "$session_name" "$branch" "$repo_filter" "$show_prompt"
             return $?
         fi
-        # Reconcile uses legacy (non-unified) output
-        _pull_reconcile "$session_name" "$branch" "$force" "$verify"
+        _pull_reconcile "$session_name" "$branch" "$force" "$verify" "$repo_filter"
         return $?
     fi
 

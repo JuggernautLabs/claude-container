@@ -260,6 +260,7 @@ _pull_reconcile() {
     local target_branch="$2"
     local force="$3"
     local verify="${4:-false}"
+    local repo_filter="${5:-}"
     local volume="claude-session-${session_name}"
 
     # Verify session exists
@@ -272,11 +273,10 @@ _pull_reconcile() {
     local _reconcile_result_dir
     _reconcile_result_dir=$(mktemp -d)
     info "Extracting session branches..."
-    if [[ "$force" == "true" ]]; then
-        session_extract "$session_name" --force --result-dir "$_reconcile_result_dir" --quiet
-    else
-        session_extract "$session_name" --result-dir "$_reconcile_result_dir" --quiet
-    fi
+    local _rc_extract_args=("$session_name" --result-dir "$_reconcile_result_dir" --quiet)
+    [[ "$force" == "true" ]] && _rc_extract_args+=(--force)
+    [[ -n "$repo_filter" ]] && _rc_extract_args+=(--repo "$repo_filter")
+    session_extract "${_rc_extract_args[@]}"
 
     # Phase 2: Stash dirty worktrees on host
     _pull_stash_dirty "$session_name" "$target_branch"
@@ -300,6 +300,7 @@ _pull_reconcile() {
         # Delegate to the unified pull flow — it handles snapshot, extract, report, verify
         local _pull_args=("$session_name" "$target_branch")
         _pull_args+=(--force)
+        [[ -n "$repo_filter" ]] && _pull_args+=(--repo "$repo_filter")
         if [[ "$verify" == "true" ]]; then
             _pull_args+=(--verify)
         else
@@ -320,7 +321,7 @@ _pull_reconcile() {
 
         # Show the reconcile preview (reuse dry-run output)
         echo ""
-        _pull_reconcile_preview "$session_name" "$target_branch" "" "false"
+        _pull_reconcile_preview "$session_name" "$target_branch" "$repo_filter" "false"
 
         # Show Claude's prompt
         local _pre_prompt
