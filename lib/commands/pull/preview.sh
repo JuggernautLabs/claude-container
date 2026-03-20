@@ -94,8 +94,22 @@ _pull_status() {
         fi
 
         if [[ -z "$_session_head" ]]; then
-            echo -e "    ${YELLOW}!${NC} not yet extracted"
-            _not_extracted=$((_not_extracted + 1))
+            # No session branch on host — check if content is already there
+            local _cit_status _target_h
+            _cit_status=$(grep "^container_in_target=" "$_sf" 2>/dev/null | tail -1 | cut -d= -f2-)
+            _target_h=$(grep "^target_head=" "$_sf" 2>/dev/null | tail -1 | cut -d= -f2-)
+            local _main_h=""
+            [[ -n "$_path" ]] && _main_h=$(git -C "$_path" rev-parse HEAD 2>/dev/null || echo "")
+            if [[ "$_s_head" == "$_main_h" ]]; then
+                echo -e "    ${GREEN}✓${NC} up to date ${DIM}(no session branch, container matches host)${NC}"
+                _up_to_date=$((_up_to_date + 1))
+            elif [[ "$_cit_status" == "true" ]]; then
+                echo -e "    ${GREEN}✓${NC} up to date ${DIM}(no session branch, content already in target)${NC}"
+                _up_to_date=$((_up_to_date + 1))
+            else
+                echo -e "    ${YELLOW}!${NC} not extracted ${DIM}(run: pull -s ${session_name} to create session branch)${NC}"
+                _not_extracted=$((_not_extracted + 1))
+            fi
         elif [[ "$_s_head" == "$_session_head" ]]; then
             echo -e "    ${GREEN}✓${NC} up to date"
             _up_to_date=$((_up_to_date + 1))
