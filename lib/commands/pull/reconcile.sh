@@ -379,11 +379,34 @@ _pull_reconcile() {
             sh -c "echo 1 > /session/.merge-verify" 2>/dev/null || true
     fi
 
+    # Check if a container is running — warn before stopping it
+    local _ctr_name="claude-session-ctr-${session_name}"
+    local _ctr_running
+    _ctr_running=$(docker ps -q --filter "name=^${_ctr_name}$" 2>/dev/null || true)
+    if [[ -n "$_ctr_running" && "$verify" != "true" ]]; then
+        # Without --verify, gate 1 didn't ask. Warn now.
+        echo ""
+        warn "Session '$session_name' has a running container."
+        echo "  It must be stopped to launch conflict resolution."
+        printf "Stop running container and proceed? [y/N] "
+        local _stop_answer
+        read -r _stop_answer
+        case "$_stop_answer" in
+            [yY]|[yY][eE][sS]) ;;
+            *)
+                info "Aborted. Merge state preserved in session volume."
+                info "To resume: claude-container pull -s $session_name $target_branch --reconcile"
+                return 0
+                ;;
+        esac
+    fi
+
     # Exec back into claude-container to launch container for resolution
     info "Launching container for conflict resolution..."
     echo ""
     export AGENT_TASK="resolve-conflicts"
-    exec "$0" --session "$session_name" --auto-merge
+    export FORCE_CONTAINER_REPLACE=1
+    exec "$0" --session "$session_name" --auto-merge --force-reconcile
 }
 
 _pull_stash_dirty() {

@@ -217,8 +217,26 @@ cmd_push() {
                 # Conflicts — launch container for Claude
                 echo ""
                 warn "Merge has conflicts — launching container for Claude to resolve."
+                # Check for running container
+                local _push_ctr
+                _push_ctr=$(docker ps -q --filter "name=^claude-session-ctr-${session_name}$" 2>/dev/null || true)
+                if [[ -n "$_push_ctr" ]]; then
+                    warn "Session '$session_name' has a running container."
+                    echo "  It must be stopped to launch conflict resolution."
+                    printf "Stop running container and proceed? [y/N] "
+                    local _push_stop
+                    read -r _push_stop
+                    case "$_push_stop" in
+                        [yY]|[yY][eE][sS]) ;;
+                        *)
+                            info "Aborted. Merge state preserved in session volume."
+                            return 0
+                            ;;
+                    esac
+                fi
                 export AGENT_TASK="resolve-conflicts"
-                exec "$0" --session "$session_name" --auto-merge
+                export FORCE_CONTAINER_REPLACE=1
+                exec "$0" --session "$session_name" --auto-merge --force-reconcile
             fi
 
             # Clean merge — show post-merge report
@@ -231,8 +249,25 @@ cmd_push() {
             session_sync "$session_name" "$rebase_branch"
             # session_sync stores .sync-branch marker and returns to main script
             # for container startup (conflicts need Claude). Exec back.
+            local _rebase_ctr
+            _rebase_ctr=$(docker ps -q --filter "name=^claude-session-ctr-${session_name}$" 2>/dev/null || true)
+            if [[ -n "$_rebase_ctr" ]]; then
+                warn "Session '$session_name' has a running container."
+                echo "  It must be stopped to launch rebase conflict resolution."
+                printf "Stop running container and proceed? [y/N] "
+                local _rebase_stop
+                read -r _rebase_stop
+                case "$_rebase_stop" in
+                    [yY]|[yY][eE][sS]) ;;
+                    *)
+                        info "Aborted."
+                        return 0
+                        ;;
+                esac
+            fi
             export AGENT_TASK="rebase-conflicts"
-            exec "$0" --session "$session_name"
+            export FORCE_CONTAINER_REPLACE=1
+            exec "$0" --session "$session_name" --force-reconcile
             ;;
     esac
 }

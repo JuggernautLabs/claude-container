@@ -234,6 +234,10 @@ while [[ $# -gt 0 ]]; do
                 shift
             fi
             ;;
+        --force-reconcile)
+            export FORCE_CONTAINER_REPLACE=1
+            shift
+            ;;
         --clone-from)
             CLONE_FROM="$2"
             shift 2
@@ -961,14 +965,20 @@ if $USE_GIT_SESSION && ! $EPHEMERAL && [[ -n "$SESSION_NAME" ]]; then
         _ctr_running=$(docker ps -q --filter "name=^${CONTAINER_NAME}$" 2>/dev/null || true)
         if [[ -n "$_ctr_running" ]]; then
             # If we're launching for a specific task (reconcile, rebase, etc.),
-            # stop the running container first — docker attach would share stdin.
-            # The session volume is preserved; user can restart after the task.
+            # we can't attach — stdin would be shared. Need explicit permission to stop.
             if [[ -n "${AGENT_TASK:-}" && "${AGENT_TASK}" != "work" ]]; then
-                warn "Stopping running container for '$AGENT_TASK' task..."
-                docker stop -t 5 "$CONTAINER_NAME" >/dev/null 2>&1 || true
-                docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
-                _existing_ctr=""
-                # Fall through to create a new container below
+                if [[ "${FORCE_CONTAINER_REPLACE:-}" == "1" ]]; then
+                    warn "Stopping running container for '$AGENT_TASK' task..."
+                    docker stop -t 5 "$CONTAINER_NAME" >/dev/null 2>&1 || true
+                    docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
+                    _existing_ctr=""
+                    # Fall through to create a new container below
+                else
+                    error "Session '$SESSION_NAME' has a running container."
+                    echo "  The container must be stopped to launch '$AGENT_TASK'."
+                    echo "  Re-run with --force-reconcile to stop it and proceed."
+                    exit 1
+                fi
             else
                 warn "Container already running for session '$SESSION_NAME'"
                 info "Attaching to running container..."
