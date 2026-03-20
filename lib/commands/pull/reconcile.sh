@@ -338,9 +338,43 @@ _pull_reconcile() {
     #   .merge-into-summary (Claude's initial prompt with fin instructions)
     #   .merge-into-mounts  (dirty projects needing host mounts)
 
-    # If --verify, write marker so the exit handler knows to prompt
     if [[ "$verify" == "true" ]]; then
+        # Gate 1: Show what Claude will do before launching the container
         local git_image="${IMAGE_NAME:-$DEFAULT_IMAGE}"
+
+        # Show the reconcile preview (reuse dry-run output)
+        echo ""
+        _pull_reconcile_preview "$session_name" "$target_branch" "" "false"
+
+        # Show Claude's prompt
+        local _pre_prompt
+        _pre_prompt=$(docker run --rm -v "$volume:/session:ro" "$git_image" \
+            cat /session/.merge-into-summary 2>/dev/null || echo "")
+        if [[ -n "$_pre_prompt" ]]; then
+            echo ""
+            _rule "Claude's prompt"
+            echo ""
+            echo "$_pre_prompt"
+            echo ""
+            _rule
+        fi
+
+        echo ""
+        printf "Launch container for Claude to resolve? [y/N] "
+        local _launch_answer
+        read -r _launch_answer
+        case "$_launch_answer" in
+            [yY]|[yY][eE][sS])
+                info "Launching..."
+                ;;
+            *)
+                info "Aborted. Merge state preserved in session volume."
+                info "To resume: claude-container pull -s $session_name $target_branch --reconcile"
+                return 0
+                ;;
+        esac
+
+        # Write verify marker so the exit handler asks before merging (gate 2)
         docker run --rm -v "$volume:/session" "$git_image" \
             sh -c "echo 1 > /session/.merge-verify" 2>/dev/null || true
     fi
