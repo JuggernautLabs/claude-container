@@ -93,15 +93,22 @@ _push_preview() {
         _host_head=$(git -C "$proj_path" rev-parse "refs/heads/$target_branch" 2>/dev/null || echo "")
         [[ -z "$_host_head" ]] && { _skip_repos+=("$proj_name|cannot resolve HEAD"); continue; }
 
-        # Ancestry check using local git (container HEAD is in snapshot, check if host_head is ancestor)
-        local _container_known
+        # Ancestry check: is host HEAD already in container? (up to date)
+        # Or is container HEAD ancestor of host? (can ff)
+        # Or neither? (diverged — ff won't work)
+        local _container_known _session_head_pv
         _container_known=$(_pull_result_get "$_pv_snap_dir" "$proj_name" "container_known")
+        _session_head_pv=$(_pull_result_get "$_pv_snap_dir" "$proj_name" "session_head")
         if [[ "$_container_known" == "true" ]] && git -C "$proj_path" merge-base --is-ancestor "$_host_head" "$_pv_container_head" 2>/dev/null; then
             _up_to_date=$((_up_to_date + 1))
-        else
+        elif [[ -n "$_session_head_pv" ]] && git -C "$proj_path" merge-base --is-ancestor "$_session_head_pv" "$_host_head" 2>/dev/null; then
+            # Session is ancestor of host — can fast-forward
             local _host_count
             _host_count=$(git -C "$proj_path" rev-list --count "$session_name".."$target_branch" 2>/dev/null || echo "?")
             _needs_merge+=("$proj_name|$_host_count")
+        else
+            # Diverged — ff won't work
+            _problem_repos+=("$proj_name|diverged — use push --merge or --rebase")
         fi
     done <<< "$projects"
 

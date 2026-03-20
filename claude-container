@@ -94,13 +94,13 @@ if [[ $# -gt 0 ]] && [[ ! "$1" =~ ^- ]]; then
         for _f in "$SCRIPT_DIR/lib/commands/${_subcmd}"/*.sh; do
             source "$_f"
         done
-        local _subcmd_rc=0
+        _subcmd_rc=0
         "cmd_${_subcmd}" "$@" || _subcmd_rc=$?
         exit $_subcmd_rc
     elif [[ -f "$SCRIPT_DIR/lib/commands/${_subcmd}.sh" ]]; then
         shift
         source "$SCRIPT_DIR/lib/commands/${_subcmd}.sh"
-        local _subcmd_rc=0
+        _subcmd_rc=0
         "cmd_${_subcmd}" "$@" || _subcmd_rc=$?
         exit $_subcmd_rc
     fi
