@@ -1,131 +1,59 @@
-# SYNC-1: Bidirectional Session Sync
+# SYNC-1: Epic Overview — Bidirectional Session Sync
 
 ## Goal
 
 One command — `claude-container sync` — that makes host and container identical. It handles all divergence cases, asks the user what to do when ambiguous, and leaves both sides consistent when done.
 
-## Mental Model
+## Current State
+
+The `sync` command exists on `feat/sync` with classification, plan display, and execution for pull and push paths. Reconcile path delegates to existing `session_merge_into`.
+
+## Case Coverage
+
+| Case | Container | Host | Detection | Sync Action | Status |
+|------|-----------|------|-----------|-------------|--------|
+| **Identical** | HEAD == main HEAD | same | direct SHA compare | skip | ✓ done |
+| **Squash identical** | different SHA | different SHA | `git diff --quiet` shows no content diff | skip | ✓ done |
+| **Container ahead (linear)** | commits after main | main is ancestor | `merge-base --is-ancestor` | extract + squash-merge into main | ✓ done |
+| **Container ahead (unknown)** | commits not on host | `cat-file` fails | `container_known=false` | extract (bundle) + merge | ✓ done |
+| **Host ahead (linear)** | main is ancestor | commits after container | `merge-base --is-ancestor` reverse | ff push into container | ✓ done |
+| **Host ahead (squash artifacts)** | ancestor of main | main has squash commits | `external_ahead=0` + content differs | push (real new work after squash) | SYNC-2 |
+| **Host ahead (squash only)** | ancestor of main | only squash commits ahead | `external_ahead=0` + `diff --quiet` | skip (squash_identical) | ✓ done |
+| **Diverged (true)** | both have unique commits | content differs | neither is ancestor + `diff` not quiet | reconcile: merge main into container, then pull back | SYNC-3 |
+| **Diverged (conflict)** | both changed same files | merge fails | `session_merge_into` returns 0 (conflicts) | warn, suggest `pull --reconcile` | SYNC-3 |
+| **Container dirty** | uncommitted files | — | `dirty_count > 0` | warn, skip | ✓ done |
+| **Container merging** | MERGE_HEAD exists | — | `merging=yes` | warn, skip | SYNC-4 |
+| **Host dirty** | — | uncommitted files | `host_dirty=true` | warn, skip | ✓ done |
+| **Container only** | repo exists | no host path | `host_path` empty or missing | clone from container | SYNC-5 |
+| **Host only** | no repo | repo exists | `container_head` empty | push to container | SYNC-5 |
+| **Extract disabled** | exists | exists | `extract_enabled=false` | skip with hint | ✓ done |
+| **Rebased** | different SHA | different SHA | not ancestor but `diff --quiet` on session head | classified as squash_identical | ✓ done |
+
+## Gaps
+
+| Gap | Scenario | What happens now | What should happen | Ticket |
+|-----|----------|-----------------|-------------------|--------|
+| Container only + no host dir | Container created a repo, host path doesn't exist | `clone_from_container` action set but `execute_sync` doesn't implement it | Should extract/clone to inferred host path | SYNC-5 |
+| Host only | Host has repo not in container config | `push_to_container` action set but `execute_sync` doesn't implement it | Should `session_add_repo` | SYNC-5 |
+| Partial reconcile failure | Some repos reconcile clean, some conflict | All reconcile repos go through `session_merge_into` which operates on ALL repos | Should scope merge-into to filtered repos | SYNC-3 |
+| Reconcile + running container | Diverged repo needs merge but container is active | Falls through to `session_merge_into` which may hit the running container | Should warn/stop like reconcile does | SYNC-4 |
+
+## Dependency DAG
 
 ```
-host main ←──── sync ────→ container HEAD
-                 ↕
-          always converge
+SYNC-2 (squash edge cases)     ──┐
+SYNC-3 (reconcile integration) ──┼──→ SYNC-6 (watch + auto-sync)
+SYNC-4 (container state guards) ─┤
+SYNC-5 (repo add/clone)         ─┘
 ```
 
-`sync` is NOT pull-then-push or push-then-pull. It's a single operation that:
-1. Reads both sides (snapshot)
-2. Classifies each repo's state
-3. Determines the action per repo
-4. Asks the user when ambiguous
-5. Executes all actions
-6. Verifies both sides match
+SYNC-2 through SYNC-5 can be done in parallel. SYNC-6 depends on all of them.
 
-## Per-Repo State Classification
+## Tickets
 
-Every repo falls into exactly one of these states:
-
-| State | Container | Host | Action |
-|-------|-----------|------|--------|
-| `identical` | HEAD == main HEAD | — | Nothing |
-| `container_ahead` | Has commits host doesn't | Host is ancestor | Pull: extract + merge |
-| `host_ahead` | Is ancestor of host | Host has commits | Push: ff into container |
-| `diverged` | Both have unique commits | Neither is ancestor | Reconcile: merge in container, then pull |
-| `container_only` | Has repo | No host repo | Clone from container |
-| `host_only` | No repo | Has repo | Push into container |
-| `container_dirty` | Uncommitted changes | — | Warn, skip (or commit first) |
-| `host_dirty` | — | Uncommitted changes | Warn, skip (or stash) |
-
-The `diverged` case is the hard one. This is where squash-merge history creates false divergence — container and host have different commit histories but possibly identical content.
-
-## Squash-Aware Divergence
-
-After a squash-merge, `session..main` shows the squash commit as "ahead" even though the content is identical. `sync` must distinguish:
-
-- **True divergence**: both sides changed different files → needs reconcile
-- **Squash artifact**: content is identical but histories differ → nothing to do
-- **Partial divergence**: squash happened + new work on one side → only sync the new work
-
-The snapshot already has `container_in_target`, `external_ahead`, and `squash_base` — use these.
-
-## Command Interface
-
-```bash
-# Sync all repos
-claude-container sync -s myproj main
-
-# Sync specific repos
-claude-container sync -s myproj main --repo gamma
-
-# Preview only
-claude-container sync -s myproj main --dry-run
-
-# Skip confirmation (automation)
-claude-container sync -s myproj main --no-verify
-
-# With watch (detect changes, auto-sync)
-claude-container watch -s myproj --repo gamma -- claude-container sync -s myproj main --repo gamma --no-verify
-```
-
-## Execution Flow
-
-```
-1. snapshot_session_state()         ← one docker run
-2. classify_repo_sync_state()      ← per-repo, from snapshot
-3. show_sync_plan()                ← render plan, ask user
-4. execute_sync()                  ← per action type:
-   ├─ identical:       skip
-   ├─ container_ahead: session_extract + session_auto_merge
-   ├─ host_ahead:      session_refresh (ff into container)
-   ├─ diverged:        session_merge_into + session_extract + session_auto_merge
-   ├─ container_only:  extract (creates host repo)
-   └─ host_only:       session_add_repo (pushes into container)
-5. verify_sync()                   ← re-snapshot, confirm both sides match
-```
-
-## Key Design Decisions
-
-### 1. Diverged repos need user intent
-
-When both sides changed, `sync` can't guess which side wins. Options:
-- **Merge** (default): merge host into container, then pull result back
-- **Container wins**: force-extract, overwriting host changes
-- **Host wins**: force-push, overwriting container changes
-
-The verify prompt shows the divergence and asks. For automation (watch), a policy flag like `--on-diverge merge|container|host` controls behavior.
-
-### 2. Sync is atomic per-repo, not per-session
-
-Each repo syncs independently. If gamma succeeds but synapse fails, gamma stays synced and synapse gets reported as failed. No all-or-nothing.
-
-### 3. Sync uses existing primitives
-
-No new docker operations. `sync` orchestrates:
-- `snapshot_session_state` (read state)
-- `snapshot_diff` (show changes)
-- `session_extract` (container → host)
-- `session_auto_merge` (merge into target)
-- `session_refresh` (host → container ff)
-- `session_merge_into` (host → container merge)
-
-### 4. Sync report matches the unified UI
-
-Uses `_pull_result_set/get`, `_rule()`, hash lines, `snapshot_diff` — same visual style as pull/push.
-
-## Files
-
-| File | Purpose |
-|------|---------|
-| `lib/commands/sync/cmd.sh` | Entry point, flag parsing |
-| `lib/commands/sync/classify.sh` | Per-repo state classification from snapshot |
-| `lib/commands/sync/plan.sh` | Render sync plan, verify prompt |
-| `lib/commands/sync/execute.sh` | Execute actions per classification |
-| `lib/commands/sync/report.sh` | Post-sync verification report |
-
-## Blocked By
-
-Nothing — all primitives exist from v1.0.
-
-## Unlocks
-
-- Watch + sync for continuous bidirectional sync
-- `--on-diverge` policy for fully automated sync
+- SYNC-1 — this overview
+- SYNC-2 — squash edge cases in push path
+- SYNC-3 — reconcile integration with scoped merge-into
+- SYNC-4 — container state guards (merging, running container)
+- SYNC-5 — container-only and host-only repo handling
+- SYNC-6 — watch + auto-sync with divergence policy
