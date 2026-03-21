@@ -30,12 +30,32 @@ while [[ $# -gt 0 ]]; do
             LINK_DIR="$2"
             shift 2
             ;;
+        --revert)
+            # Revert: point symlink back at the repo (live development mode)
+            _link=$(readlink "$(which claude-container 2>/dev/null)" 2>/dev/null || true)
+            if [[ -n "$_link" ]]; then
+                _link_dir=$(dirname "$_link")
+                _link_dir=$(dirname "$_link_dir")  # go up from the binary
+                # Actually just find the symlink and repoint it
+                for _ld in "$HOME/.hypermemetic-infra/scripts" "$HOME/.local/bin" "$HOME/bin"; do
+                    if [[ -L "$_ld/claude-container" ]]; then
+                        rm -f "$_ld/claude-container"
+                        ln -s "$REPO_DIR/claude-container" "$_ld/claude-container"
+                        echo "Reverted: $_ld/claude-container → $REPO_DIR/claude-container"
+                        exit 0
+                    fi
+                done
+            fi
+            echo "No symlink found to revert"
+            exit 1
+            ;;
         --help|-h)
-            echo "Usage: ./install.sh [--prefix <dir>] [--link-dir <dir>]"
+            echo "Usage: ./install.sh [--prefix <dir>] [--link-dir <dir>] [--revert]"
             echo ""
             echo "Options:"
             echo "  --prefix <dir>    Install location (default: ~/.local/share/claude-container)"
             echo "  --link-dir <dir>  Symlink location (default: auto-detect from PATH)"
+            echo "  --revert          Point symlink back at repo (live dev mode)"
             exit 0
             ;;
         *)

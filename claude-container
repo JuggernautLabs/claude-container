@@ -50,6 +50,7 @@ SESSION_NAME=""
 SESSION_NAME_SET=false
 USE_GIT_SESSION=true  # Default: use git-based session isolation
 CONTINUE_SESSION=false
+START_HERE=false
 RUN_AS_USER=false
 RUN_AS_ROOTISH=true  # Default: run as user with passwordless sudo for package installs
 NO_RUN=false
@@ -146,6 +147,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --continue|-c)
             CONTINUE_SESSION=true
+            shift
+            ;;
+        --start-here)
+            START_HERE=true
             shift
             ;;
         --token|-t)
@@ -957,8 +962,8 @@ if [[ ${#EXPOSE_PORTS[@]} -gt 0 ]]; then
 fi
 echo ""
 
-# Resolve main project from cwd — match current directory against session config
-if $USE_GIT_SESSION && [[ -n "$SESSION_NAME" ]]; then
+# --start-here: resolve cwd to a project and rebuild container to start there
+if $START_HERE && $USE_GIT_SESSION && [[ -n "$SESSION_NAME" ]]; then
     _cwd_main=""
     _session_cfg=$(docker run --rm --entrypoint sh \
         -v "$GIT_SESSION_VOLUME:/session:ro" "${GIT_UTIL_IMAGE:-alpine/git}" \
@@ -967,20 +972,24 @@ if $USE_GIT_SESSION && [[ -n "$SESSION_NAME" ]]; then
         _cwd=$(pwd)
         while IFS='|' read -r _pname _ppath; do
             [[ -z "$_ppath" ]] && continue
-            # Exact match or cwd is inside the project path
             if [[ "$_cwd" == "$_ppath" || "$_cwd" == "$_ppath"/* ]]; then
                 _cwd_main="$_pname"
                 break
             fi
         done <<< "$(echo "$_session_cfg" | yq eval '.projects | to_entries | .[] | .key + "|" + .value.path' - 2>/dev/null)" || true
     fi
-    # Update .main-project in the volume
     if [[ -n "$_cwd_main" ]]; then
         docker run --rm --entrypoint sh \
             --user "$(id -u):$(id -u)" \
             -v "$GIT_SESSION_VOLUME:/session" \
             "${GIT_UTIL_IMAGE:-alpine/git}" \
             -c "echo '$_cwd_main' > /session/.main-project" 2>/dev/null || true
+        info "Start here: $_cwd_main"
+        # Remove stopped container so docker run re-reads .main-project
+        docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
+    else
+        warn "Current directory doesn't match any project in session '$SESSION_NAME'"
+        info "Container will start in /workspace"
     fi
 fi
 
