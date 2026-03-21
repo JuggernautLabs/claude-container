@@ -1035,8 +1035,8 @@ if $USE_GIT_SESSION && ! $EPHEMERAL && [[ -n "$SESSION_NAME" ]]; then
         else
             # Check for corrupted mounts before resuming (Docker Desktop can leave
             # directories where files should be, e.g. token mounts)
-            local _mount_ok=true
-            local _mounts
+            _mount_ok=true
+            _mounts=""
             _mounts=$(docker inspect --format '{{range .Mounts}}{{.Source}}|{{.Type}}{{"\n"}}{{end}}' "$CONTAINER_NAME" 2>/dev/null || true)
             while IFS='|' read -r _msrc _mtype; do
                 [[ -z "$_msrc" ]] && continue
