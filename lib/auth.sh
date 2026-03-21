@@ -34,6 +34,13 @@ inject_token_securely() {
     chmod 700 "$token_dir"
 
     TOKEN_TMPFILE="$token_dir/token-$$"
+
+    # Clean up stale token paths — Docker Desktop can leave directories
+    # instead of files if a container exits during mount setup
+    if [[ -d "$TOKEN_TMPFILE" ]]; then
+        rm -rf "$TOKEN_TMPFILE"
+    fi
+
     echo -n "$token" > "$TOKEN_TMPFILE"
     chmod 600 "$TOKEN_TMPFILE"
 
