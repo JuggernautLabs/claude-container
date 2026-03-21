@@ -19,6 +19,23 @@ Docker socket            ──>   Optional, explicit opt-in
 
 **Why an embedded agent**: Containment (mistakes are recoverable), persistence (conversation history survives across invocations), integration (full access to dev tools inside container), and safety (explicit extraction required to affect host).
 
+## Subcommands
+
+| Subcommand | Purpose |
+|------------|---------|
+| `pull` | Extract session changes to host repos (container to host) |
+| `push` | Push host changes into session (host to container) |
+| `status` | Check sync state between session and host (read-only) |
+| `watch` | Watch session for changes and auto-extract |
+| `repos` | Show repos in a session with container state from snapshot |
+| `list` | List all sessions (with optional `--sizes` for disk usage) |
+| `remove` | Remove repos from a session |
+| `serve` | Push a host branch into session under a different name |
+| `reconcile` | Merge multiple sessions into a target branch sequentially |
+| `image` | Show or manage the Docker image for a session |
+
+Subcommands are dispatched by matching the first positional argument against files/directories in `lib/commands/`. Each subcommand sources its own module and calls `cmd_<name>`.
+
 ## Session Lifecycle
 
 ```
@@ -172,11 +189,11 @@ claude-container push -s <session> [branch] [options]
 
 **Fast-forward (`--ff`, default)**: Fast-forward session repos from a host branch. No container launch needed. Per-repo: add host as `_host` remote, fetch target branch, compare HEADs. Same HEAD skips, ancestor fast-forwards, diverged warns.
 
-**Merge (`--merge`)**: Merge a host branch into each session repo. Single `alpine/git` scan checks merge-in-progress and dirty status. Host-side ancestor check skips already-up-to-date repos. Per-repo merge via docker run. If conflicts: write markers (`.merge-into-branch`, `.merge-into-summary`, `.merge-into-mounts`), launch container for Claude to resolve.
+**Merge (`--merge`)**: Merge a host branch into each session repo. Single utility image scan checks merge-in-progress and dirty status. Host-side ancestor check skips already-up-to-date repos. Per-repo merge via docker run. If conflicts: write markers (`.merge-into-branch`, `.merge-into-summary`, `.merge-into-mounts`), launch container for Claude to resolve. The utility image defaults to `alpine/git` but is configurable via the `GIT_UTIL_IMAGE` environment variable.
 
 **Rebase (`--rebase`)**: Rebase session branches onto a host branch. Executes `git rebase upstream/{branch}` per repo. Conflicts launch the container with `.sync-branch` marker.
 
-**Serve (`--as`)**: Push host branch into session under a different branch name.
+**Serve** (`serve` subcommand): Make a host branch available inside the session volume for the agent to fetch and merge at its own pace.
 
 On diverge (ff mode):
 ```
@@ -218,6 +235,12 @@ Exit handler:
 Claude receives a structured prompt: `OK` (merged cleanly), `CONFLICT` (resolve markers), `DIRTY` (uncommitted changes, host repo mounted read-only at `/host/{repo-name}`), or `SKIP` (no target branch).
 
 The `fin` command (installed at `/usr/local/bin/fin`) writes a description to `/workspace/.reconcile-complete` and kills PID 1 to terminate the container. The exit handler detects the marker and performs extraction + merge.
+
+### Session Snapshot
+
+All container state reading is centralized in `snapshot_session_state()` (`lib/session-discovery.sh`). One `docker run` scans every repo for HEAD, dirty state, merge status, and `.git` size. Local git ops then compute host-side state (session branch, target branch, squash-base, ancestry). Results are written per-repo to a temp dir via `_pull_result_set()`.
+
+All commands (`pull`, `push`, `status`, `reconcile`, `repos`) read from the snapshot. Diffs are computed via `snapshot_diff()` which accounts for squash-base to avoid double-counting already-squashed content.
 
 ### Multi-Session Reconcile
 

@@ -368,6 +368,12 @@ The squash-base ref (`refs/claude-container/squash-base/<session>`) tracks what 
 - **Isolation**: Changes stay in volumes until explicitly extracted
 - **Workspace trust**: Auto-accepted inside containers (safe -- isolated environment)
 
+## Known Issues
+
+1. **reconcile.sh argument bugs**: `resolve_repo_host_path` and `check_repo_sync_status` in `reconcile.sh` are called with wrong arguments. The reconcile discovery flow (scanning all sessions for unmerged work) produces incorrect host paths and wrong sync classifications. Affects `claude-container reconcile --discover`.
+
+2. **Test suite mostly broken**: 3 of 4 test scripts reference removed CLI flags (`--extract`, `--sync`, `--merge-into`, `merge` subcommand). Only `test-agent-layer.sh` passes.
+
 ## License
 
 MIT
