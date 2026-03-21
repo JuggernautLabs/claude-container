@@ -957,6 +957,33 @@ if [[ ${#EXPOSE_PORTS[@]} -gt 0 ]]; then
 fi
 echo ""
 
+# Resolve main project from cwd — match current directory against session config
+if $USE_GIT_SESSION && [[ -n "$SESSION_NAME" ]]; then
+    _cwd_main=""
+    _session_cfg=$(docker run --rm --entrypoint sh \
+        -v "$GIT_SESSION_VOLUME:/session:ro" "${GIT_UTIL_IMAGE:-alpine/git}" \
+        -c 'cat /session/.claude-projects.yml' 2>/dev/null || true)
+    if [[ -n "$_session_cfg" ]] && command -v yq &>/dev/null; then
+        _cwd=$(pwd)
+        while IFS='|' read -r _pname _ppath; do
+            [[ -z "$_ppath" ]] && continue
+            # Exact match or cwd is inside the project path
+            if [[ "$_cwd" == "$_ppath" || "$_cwd" == "$_ppath"/* ]]; then
+                _cwd_main="$_pname"
+                break
+            fi
+        done <<< "$(echo "$_session_cfg" | yq eval '.projects | to_entries | .[] | .key + "|" + .value.path' - 2>/dev/null)" || true
+    fi
+    # Update .main-project in the volume
+    if [[ -n "$_cwd_main" ]]; then
+        docker run --rm --entrypoint sh \
+            --user "$(id -u):$(id -u)" \
+            -v "$GIT_SESSION_VOLUME:/session" \
+            "${GIT_UTIL_IMAGE:-alpine/git}" \
+            -c "echo '$_cwd_main' > /session/.main-project" 2>/dev/null || true
+    fi
+fi
+
 # Container reuse logic for persistent (non-ephemeral) session containers
 _CONTAINER_REUSED=false
 if $USE_GIT_SESSION && ! $EPHEMERAL && [[ -n "$SESSION_NAME" ]]; then
