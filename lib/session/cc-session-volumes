@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# cc-session-volumes — manage the 5 Docker volumes per session
+#
+# USAGE: cc-session-volumes <session_name> create|check|list|repair
+# INPUTS: $1 session name, $2 subcommand
+# OUTPUTS: stdout: volume names/status
+# READS: Docker volume state
+# WRITES: creates volumes (create), fixes permissions (repair)
+# DESTROYS: nothing
+
+SCRIPT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
+source "$SCRIPT_DIR/lib/core/contract.sh"
+source "$SCRIPT_DIR/lib/core/constants.sh"
+
+session="${1:-}"; action="${2:-}"
+[[ -z "$session" || -z "$action" ]] && { cc_error "Usage: cc-session-volumes <session> create|check|list|repair"; exit 1; }
+
+_volumes=( "$(cc_session_volume "$session")" "$(cc_state_volume "$session")" "$(cc_cargo_volume "$session")" "$(cc_npm_volume "$session")" "$(cc_pip_volume "$session")" )
+
+case "$action" in
+    create)
+        for vol in "${_volumes[@]}"; do
+            docker volume inspect "$vol" &>/dev/null && cc_note "exists: $vol" || { docker volume create "$vol" >/dev/null && cc_ok "created: $vol"; }
+        done ;;
+    check)
+        _m=0; for vol in "${_volumes[@]}"; do
+            docker volume inspect "$vol" &>/dev/null && echo "ok|$vol" || { echo "missing|$vol"; _m=$((_m+1)); }
+        done; [[ $_m -gt 0 ]] && exit 1 ;;
+    list) printf '%s\n' "${_volumes[@]}" ;;
+    repair)
+        _uid=$(id -u); cc_info "Fixing permissions (uid=$_uid)..."
+        docker run --rm -v "$(cc_cargo_volume "$session"):/cargo" -v "$(cc_npm_volume "$session"):/npm" -v "$(cc_pip_volume "$session"):/pip" -v "$(cc_state_volume "$session"):/state" alpine sh -c "chown -R ${_uid}:${_uid} /cargo /npm /pip /state 2>/dev/null || true"
+        cc_ok "Permissions fixed" ;;
+    *) cc_error "Unknown action: $action"; exit 1 ;;
+esac

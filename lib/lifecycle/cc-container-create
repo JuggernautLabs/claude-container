@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+# ============================================================================
+# cc-container-create — Creates a Docker container with required invariants
+# ============================================================================
+# USAGE: cc-container-create <name> <image> <script_dir> [extra docker args...]
+# INPUTS: name — container name
+#         image — Docker image to use
+#         script_dir — path to claude-container repo (for entrypoint/agent-run mounts)
+# OUTPUTS: container ID on stdout
+# READS: nothing (pure creation)
+# WRITES: creates a Docker container
+# DESTROYS: nothing (refuses if container already exists)
+# ============================================================================
+
+SCRIPT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
+source "$SCRIPT_DIR/lib/core/contract.sh"
+source "$SCRIPT_DIR/lib/core/constants.sh"
+
+# --- Args ---
+if [[ $# -lt 3 ]]; then
+    cc_error "Usage: cc-container-create <name> <image> <script_dir> [extra docker args...]"
+    exit 1
+fi
+
+name="$1"
+image="$2"
+create_script_dir="$3"
+shift 3
+extra_args=("$@")
+
+# --- Guards ---
+cc_require_docker || exit 1
+
+# Refuse if container already exists
+existing=$(docker ps -aq --filter "name=^${name}$" 2>/dev/null)
+if [[ -n "$existing" ]]; then
+    cc_error "Container already exists: $name"
+    cc_note "Remove it first with: cc-container-remove $name"
+    exit 1
+fi
+
+# Verify image exists
+cc_require_image "$image" || exit 1
+
+# Verify entrypoint and agent-run exist
+entrypoint_path="$create_script_dir/lib/container/entrypoint.sh"
+agent_run_path="$create_script_dir/lib/container/agent-run.sh"
+
+if [[ ! -f "$entrypoint_path" ]]; then
+    cc_error "Entrypoint not found: $entrypoint_path"
+    exit 1
+fi
+
+if [[ ! -f "$agent_run_path" ]]; then
+    cc_error "Agent-run not found: $agent_run_path"
+    exit 1
+fi
+
+# --- Create ---
+cc_info "Creating container: $name"
+
+container_id=$(docker create \
+    --name "$name" \
+    --user 0:0 \
+    -v "$entrypoint_path:/usr/local/bin/cc-entrypoint:ro" \
+    -v "$agent_run_path:/usr/local/bin/agent-run:ro" \
+    --entrypoint /usr/local/bin/cc-entrypoint \
+    "${extra_args[@]}" \
+    "$image" 2>&1)
+
+rc=$?
+
+if [[ $rc -ne 0 ]]; then
+    cc_error "Failed to create container: $container_id"
+    exit 1
+fi
+
+cc_ok "Container created: $name ($container_id)"
+
+# stdout: container ID only
+echo "$container_id"
+exit 0

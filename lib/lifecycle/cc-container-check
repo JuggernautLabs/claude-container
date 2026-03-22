@@ -1,0 +1,120 @@
+#!/usr/bin/env bash
+# ============================================================================
+# cc-container-check — Checks container staleness and health
+# ============================================================================
+# USAGE: cc-container-check <container> <image> <script_dir> [--continue-session] [--json]
+# INPUTS: container — container name
+#         image — expected image name
+#         script_dir — expected script directory (for entrypoint mount check)
+# OUTPUTS: human-readable status (default) or JSON (--json)
+# READS: Docker container metadata (inspect), token mount state
+# WRITES: nothing
+# DESTROYS: nothing
+# ============================================================================
+
+SCRIPT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
+source "$SCRIPT_DIR/lib/core/contract.sh"
+source "$SCRIPT_DIR/lib/core/constants.sh"
+source "$SCRIPT_DIR/lib/core/contracts.sh"
+
+# --- Args ---
+container=""
+image=""
+check_script_dir=""
+continue_session=false
+json_output=false
+
+positional=0
+for arg in "$@"; do
+    case "$arg" in
+        --continue-session) continue_session=true ;;
+        --json) json_output=true ;;
+        -*)
+            cc_error "Unknown flag: $arg"
+            exit 1
+            ;;
+        *)
+            case $positional in
+                0) container="$arg" ;;
+                1) image="$arg" ;;
+                2) check_script_dir="$arg" ;;
+            esac
+            positional=$((positional + 1))
+            ;;
+    esac
+done
+
+if [[ -z "$container" || -z "$image" || -z "$check_script_dir" ]]; then
+    cc_error "Usage: cc-container-check <container> <image> <script_dir> [--continue-session] [--json]"
+    exit 1
+fi
+
+# --- Run contracts ---
+cc_require_docker || exit 1
+cc_require_container "$container" || exit 1
+
+all_reasons=()
+action="ok"
+
+# Contract 1: container staleness
+container_result=$(contract_container "$container" "$image" "$check_script_dir" "$continue_session")
+container_rc=$?
+
+if [[ $container_rc -ne 0 ]]; then
+    action="rebuild"
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        case "$line" in
+            fail:*) all_reasons+=("${line#fail:}") ;;
+        esac
+    done <<< "$container_result"
+fi
+
+# Contract 2: token mount
+token_result=$(contract_token_mount "$container")
+token_rc=$?
+
+if [[ $token_rc -ne 0 ]]; then
+    # Token corruption is a rebuild trigger
+    [[ "$action" == "ok" ]] && action="rebuild"
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        case "$line" in
+            fail:*) all_reasons+=("${line#fail:}") ;;
+        esac
+    done <<< "$token_result"
+fi
+
+# --- Output ---
+overall_ok=true
+if [[ ${#all_reasons[@]} -gt 0 ]]; then
+    overall_ok=false
+fi
+
+if $json_output; then
+    json_reasons="["
+    for i in "${!all_reasons[@]}"; do
+        [[ $i -gt 0 ]] && json_reasons+=","
+        # Escape quotes in reason strings
+        reason="${all_reasons[$i]//\"/\\\"}"
+        json_reasons+="\"$reason\""
+    done
+    json_reasons+="]"
+
+    echo "{\"ok\":$overall_ok,\"container\":\"$container\",\"action\":\"$action\",\"reasons\":$json_reasons}"
+else
+    if $overall_ok; then
+        cc_ok "Container is current: $container"
+    else
+        cc_warn "Container is stale: $container (action: $action)"
+        for reason in "${all_reasons[@]}"; do
+            cc_note "  $reason"
+        done
+    fi
+fi
+
+if $overall_ok; then
+    exit 0
+else
+    exit 1
+fi

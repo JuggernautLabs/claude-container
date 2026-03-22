@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# cc-session-config — read/write session metadata
+# USAGE: cc-session-config <session> show|get <key>|set <key> <value>|unset <key>
+# READS: $CC_SESSIONS_DIR/<session>.env
+# WRITES: same file (set/unset)
+# DESTROYS: nothing
+
+SCRIPT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
+source "$SCRIPT_DIR/lib/core/contract.sh"
+source "$SCRIPT_DIR/lib/core/constants.sh"
+
+session="${1:-}"; action="${2:-}"; key="${3:-}"; val="${4:-}"
+[[ -z "$session" ]] && { cc_error "Usage: cc-session-config <session> show|get|set|unset"; exit 1; }
+
+mkdir -p "$CC_SESSIONS_DIR"
+_file="$CC_SESSIONS_DIR/${session}.env"
+
+case "${action:-show}" in
+    show)
+        [[ -f "$_file" ]] || { cc_note "No metadata for $session"; exit 0; }
+        while IFS='=' read -r k v; do
+            [[ -z "$k" || "$k" =~ ^# ]] && continue
+            echo "$k=$v"
+        done < "$_file" ;;
+    get)
+        [[ -z "$key" ]] && { cc_error "Usage: cc-session-config <session> get <key>"; exit 1; }
+        [[ -f "$_file" ]] || exit 1
+        grep "^${key}=" "$_file" 2>/dev/null | tail -1 | cut -d= -f2- || exit 1 ;;
+    set)
+        [[ -z "$key" || -z "$val" ]] && { cc_error "Usage: cc-session-config <session> set <key> <value>"; exit 1; }
+        if [[ -f "$_file" ]] && grep -q "^${key}=" "$_file" 2>/dev/null; then
+            _tmp=$(mktemp); sed "s|^${key}=.*|${key}=${val}|" "$_file" > "$_tmp" && mv "$_tmp" "$_file"
+        else
+            echo "${key}=${val}" >> "$_file"
+        fi
+        cc_ok "$key=$val" ;;
+    unset)
+        [[ -z "$key" ]] && { cc_error "Usage: cc-session-config <session> unset <key>"; exit 1; }
+        [[ -f "$_file" ]] || exit 0
+        _tmp=$(mktemp); grep -v "^${key}=" "$_file" > "$_tmp" && mv "$_tmp" "$_file"
+        cc_ok "Removed: $key" ;;
+    *) cc_error "Unknown action: $action"; exit 1 ;;
+esac

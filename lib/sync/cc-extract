@@ -1,0 +1,86 @@
+#!/usr/bin/env bash
+# cc-extract — Extract session branches from container to host repos
+#
+# CONTRACT:
+#   USAGE:    cc-extract <session_name> [--repo <filter>] [--force] [--quiet] [--result-dir <dir>]
+#   INPUTS:   session_name, optional repo filter, force flag, quiet flag, result dir
+#   OUTPUTS:  creates/updates session branches on host repos, result files
+#   READS:    Docker volume, host git repos
+#   WRITES:   session branches on host repos, result files in result-dir
+#   DESTROYS: nothing (force-updates branches, but that's the point)
+
+SCRIPT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
+source "$SCRIPT_DIR/lib/core/contract.sh"
+source "$SCRIPT_DIR/lib/core/constants.sh"
+source "$SCRIPT_DIR/lib/utils.sh"
+source "$SCRIPT_DIR/lib/platform.sh"
+source "$SCRIPT_DIR/lib/docker-utils.sh"
+source "$SCRIPT_DIR/lib/session-discovery.sh"
+source "$SCRIPT_DIR/lib/config.sh"
+source "$SCRIPT_DIR/lib/session-mgmt.sh"
+
+usage() {
+    cat >&2 <<EOF
+Usage: cc-extract <session_name> [--repo <filter>] [--force] [--quiet] [--result-dir <dir>]
+
+Extract session branches from a container volume to host git repos.
+
+Arguments:
+  session_name    Session name (e.g. my-session)
+
+Options:
+  --repo <filter>       Comma-separated partial repo name filter
+  --force, -f           Force-update branches even if already extracted
+  --quiet, -q           Suppress informational output
+  --result-dir <dir>    Directory for result files (default: auto-created temp dir)
+  --help, -h            Show this help
+EOF
+}
+
+# --- Arg parsing ---
+session_name=""
+repo_filter=""
+force=false
+quiet=false
+result_dir=""
+passthrough_args=()
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --help|-h) usage; exit 0 ;;
+        --repo) repo_filter="$2"; shift 2 ;;
+        --force|-f) force=true; shift ;;
+        --quiet|-q) quiet=true; shift ;;
+        --result-dir) result_dir="$2"; shift 2 ;;
+        -*)
+            cc_error "Unknown option: $1"
+            usage
+            exit 1
+            ;;
+        *)
+            if [[ -z "$session_name" ]]; then
+                session_name="$1"
+            else
+                cc_error "Unexpected argument: $1"
+                usage
+                exit 1
+            fi
+            shift
+            ;;
+    esac
+done
+
+if [[ -z "$session_name" ]]; then
+    cc_error "Missing required argument: session_name"
+    usage
+    exit 1
+fi
+
+# Build passthrough args for session_extract
+passthrough_args=()
+[[ "$force" == "true" ]] && passthrough_args+=(--force)
+[[ -n "$repo_filter" ]] && passthrough_args+=(--repo "$repo_filter")
+[[ -n "$result_dir" ]] && passthrough_args+=(--result-dir "$result_dir")
+[[ "$quiet" == "true" ]] && passthrough_args+=(--quiet)
+
+session_extract "$session_name" "${passthrough_args[@]}"

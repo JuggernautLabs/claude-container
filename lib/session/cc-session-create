@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# cc-session-create — create a session from a config file
+# USAGE: cc-session-create <session_name> <config_file> [--force]
+# READS: config file, host git repos
+# WRITES: session volume, .claude-projects.yml, .main-project, .repo-manifest
+# DESTROYS: nothing (refuses if exists unless --force)
+
+SCRIPT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
+source "$SCRIPT_DIR/lib/core/contract.sh"
+source "$SCRIPT_DIR/lib/core/constants.sh"
+source "$SCRIPT_DIR/lib/utils.sh"
+source "$SCRIPT_DIR/lib/platform.sh"
+source "$SCRIPT_DIR/lib/docker-utils.sh"
+source "$SCRIPT_DIR/lib/config.sh"
+source "$SCRIPT_DIR/lib/git-session.sh"
+
+session=""; config_file=""; force=false
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --force|-f) force=true; shift ;;
+        --help|-h) echo "Usage: cc-session-create <session> <config_file> [--force]"; exit 0 ;;
+        *) if [[ -z "$session" ]]; then session="$1"; elif [[ -z "$config_file" ]]; then config_file="$1"; fi; shift ;;
+    esac
+done
+[[ -z "$session" || -z "$config_file" ]] && { cc_error "Usage: cc-session-create <session> <config_file> [--force]"; exit 1; }
+[[ ! -f "$config_file" ]] && { cc_error "Config not found: $config_file"; exit 1; }
+
+vol=$(cc_session_volume "$session")
+if docker volume inspect "$vol" &>/dev/null && ! $force; then
+    cc_error "Session '$session' already exists (use --force to recreate)"
+    exit 1
+fi
+
+# Create volumes
+"$SCRIPT_DIR/lib/session/cc-session-volumes" "$session" create
+
+# Delegate to existing creation logic
+SESSION_NAME="$session"
+CONFIG_FILE="$config_file"
+create_multi_project_session "$session" "$config_file"
+rc=$?
+
+# Record metadata
+"$SCRIPT_DIR/lib/session/cc-session-config" "$session" set CONFIG_FILE "$config_file"
+"$SCRIPT_DIR/lib/session/cc-session-config" "$session" set CREATED "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+exit $rc

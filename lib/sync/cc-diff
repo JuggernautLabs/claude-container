@@ -1,0 +1,93 @@
+#!/usr/bin/env bash
+# cc-diff — Compute diff between session and target for one repo
+#
+# CONTRACT:
+#   USAGE:    cc-diff <result_dir> <repo_name> <direction> <format>
+#   INPUTS:   result_dir (snapshot output), repo_name, direction, format
+#   OUTPUTS:  diff output on stdout
+#   READS:    result files from snapshot, host git repos
+#   WRITES:   nothing
+#   DESTROYS: nothing
+
+SCRIPT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
+source "$SCRIPT_DIR/lib/core/contract.sh"
+source "$SCRIPT_DIR/lib/core/constants.sh"
+source "$SCRIPT_DIR/lib/utils.sh"
+source "$SCRIPT_DIR/lib/platform.sh"
+source "$SCRIPT_DIR/lib/docker-utils.sh"
+source "$SCRIPT_DIR/lib/session-discovery.sh"
+
+usage() {
+    cat >&2 <<EOF
+Usage: cc-diff <result_dir> <repo_name> <direction> <format>
+
+Compute the diff between session branch and target for one repo.
+Accounts for squash-base when present.
+
+Arguments:
+  result_dir      Directory containing snapshot result files
+  repo_name       Repository name (e.g. org/repo)
+  direction       outbound (session->target) or inbound (target->session)
+  format          stat | summary | names | count | full
+
+Options:
+  --help, -h      Show this help
+EOF
+}
+
+# --- Arg parsing ---
+result_dir=""
+repo_name=""
+direction=""
+format=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --help|-h) usage; exit 0 ;;
+        -*)
+            cc_error "Unknown option: $1"
+            usage
+            exit 1
+            ;;
+        *)
+            if [[ -z "$result_dir" ]]; then
+                result_dir="$1"
+            elif [[ -z "$repo_name" ]]; then
+                repo_name="$1"
+            elif [[ -z "$direction" ]]; then
+                direction="$1"
+            elif [[ -z "$format" ]]; then
+                format="$1"
+            else
+                cc_error "Unexpected argument: $1"
+                usage
+                exit 1
+            fi
+            shift
+            ;;
+    esac
+done
+
+if [[ -z "$result_dir" || -z "$repo_name" || -z "$direction" || -z "$format" ]]; then
+    cc_error "Missing required arguments"
+    usage
+    exit 1
+fi
+
+case "$direction" in
+    outbound|inbound) ;;
+    *)
+        cc_error "Invalid direction: $direction (must be outbound or inbound)"
+        exit 1
+        ;;
+esac
+
+case "$format" in
+    stat|summary|names|count|full) ;;
+    *)
+        cc_error "Invalid format: $format (must be stat, summary, names, count, or full)"
+        exit 1
+        ;;
+esac
+
+snapshot_diff "$result_dir" "$repo_name" "$direction" "$format"

@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+# cc-merge-into — Merge host branch INTO container repos (reverse direction)
+#
+# CONTRACT:
+#   USAGE:    cc-merge-into <session_name> <target_branch>
+#   INPUTS:   session_name, target_branch
+#   OUTPUTS:  merges host target branch into container repos
+#   READS:    host git repos, Docker volume
+#   WRITES:   modifies container git state (inside volume)
+#   DESTROYS: modifies container git state (inside volume)
+
+SCRIPT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
+source "$SCRIPT_DIR/lib/core/contract.sh"
+source "$SCRIPT_DIR/lib/core/constants.sh"
+source "$SCRIPT_DIR/lib/utils.sh"
+source "$SCRIPT_DIR/lib/platform.sh"
+source "$SCRIPT_DIR/lib/docker-utils.sh"
+source "$SCRIPT_DIR/lib/session-discovery.sh"
+source "$SCRIPT_DIR/lib/merge-detect.sh"
+source "$SCRIPT_DIR/lib/session-mgmt.sh"
+
+usage() {
+    cat >&2 <<EOF
+Usage: cc-merge-into <session_name> <target_branch>
+
+Merge host target branch INTO container repos (reverse direction).
+This updates the container's git state with changes from the host.
+
+Arguments:
+  session_name    Session name (e.g. my-session)
+  target_branch   Branch to merge into container (e.g. main)
+
+Options:
+  --help, -h      Show this help
+EOF
+}
+
+# --- Arg parsing ---
+session_name=""
+target_branch=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --help|-h) usage; exit 0 ;;
+        -*)
+            cc_error "Unknown option: $1"
+            usage
+            exit 1
+            ;;
+        *)
+            if [[ -z "$session_name" ]]; then
+                session_name="$1"
+            elif [[ -z "$target_branch" ]]; then
+                target_branch="$1"
+            else
+                cc_error "Unexpected argument: $1"
+                usage
+                exit 1
+            fi
+            shift
+            ;;
+    esac
+done
+
+if [[ -z "$session_name" || -z "$target_branch" ]]; then
+    cc_error "Missing required arguments: session_name and target_branch"
+    usage
+    exit 1
+fi
+
+session_merge_into "$session_name" "$target_branch"

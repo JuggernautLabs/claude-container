@@ -1,0 +1,81 @@
+#!/usr/bin/env bash
+# ============================================================================
+# cc-token-inject — Creates token file and outputs mount arg
+# ============================================================================
+# USAGE: cc-token-inject <token> <cache_dir>
+# INPUTS: token — OAuth token string
+#         cache_dir — directory for token file storage
+# OUTPUTS: mount arg on stdout: -v /path/token:/run/secrets/claude_token:ro
+# READS: cache_dir for stale token directories
+# WRITES: token file at <cache_dir>/token-$$
+# DESTROYS: stale token directories (safe — they're broken mount artifacts)
+# ============================================================================
+
+SCRIPT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
+source "$SCRIPT_DIR/lib/core/contract.sh"
+source "$SCRIPT_DIR/lib/core/constants.sh"
+
+# --- Args ---
+token=""
+cache_dir=""
+
+positional=0
+for arg in "$@"; do
+    case "$arg" in
+        -*) cc_error "Unknown flag: $arg"; exit 1 ;;
+        *)
+            case $positional in
+                0) token="$arg" ;;
+                1) cache_dir="$arg" ;;
+            esac
+            positional=$((positional + 1))
+            ;;
+    esac
+done
+
+if [[ -z "$token" || -z "$cache_dir" ]]; then
+    cc_error "Usage: cc-token-inject <token> <cache_dir>"
+    exit 1
+fi
+
+# --- Setup cache dir ---
+mkdir -p "$cache_dir"
+chmod 700 "$cache_dir"
+
+token_file="$cache_dir/token-$$"
+
+# --- Clean stale token directories ---
+# Docker Desktop can leave directories instead of files if a container
+# exits during mount setup. These are always broken artifacts.
+for stale in "$cache_dir"/token-*; do
+    [[ -e "$stale" ]] || continue
+    if [[ -d "$stale" ]]; then
+        cc_warn "Cleaning stale token directory: $stale"
+        rm -rf "$stale"
+    fi
+done
+
+# --- Also clean the target path if it's a directory ---
+if [[ -d "$token_file" ]]; then
+    cc_warn "Cleaning stale token directory at target: $token_file"
+    rm -rf "$token_file"
+fi
+
+# --- Write token file ---
+echo -n "$token" > "$token_file"
+chmod 600 "$token_file"
+
+# --- Verify ---
+if [[ ! -f "$token_file" ]] || [[ ! -s "$token_file" ]]; then
+    cc_error "Failed to create token file: $token_file"
+    exit 1
+fi
+
+cc_info "Token file created: $token_file"
+
+# Trap for cleanup on signals
+trap "rm -f '$token_file'" INT TERM
+
+# --- stdout: mount arg ---
+echo "-v" "$token_file:/run/secrets/claude_token:ro"
+exit 0

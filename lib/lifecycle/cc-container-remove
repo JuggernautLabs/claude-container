@@ -1,0 +1,81 @@
+#!/usr/bin/env bash
+# ============================================================================
+# cc-container-remove — Safe container removal with confirmation
+# ============================================================================
+# USAGE: cc-container-remove <container> [--force]
+# INPUTS: container — container name or ID
+# OUTPUTS: nothing on stdout (logging on stderr)
+# READS: container state
+# WRITES: nothing
+# DESTROYS: the container (AFTER confirmation or --force)
+# ============================================================================
+
+SCRIPT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
+source "$SCRIPT_DIR/lib/core/contract.sh"
+source "$SCRIPT_DIR/lib/core/constants.sh"
+source "$SCRIPT_DIR/lib/core/contracts.sh"
+
+# --- Args ---
+container=""
+force=false
+
+for arg in "$@"; do
+    case "$arg" in
+        --force) force=true ;;
+        -*) cc_error "Unknown flag: $arg"; exit 1 ;;
+        *) [[ -z "$container" ]] && container="$arg" ;;
+    esac
+done
+
+if [[ -z "$container" ]]; then
+    cc_error "Usage: cc-container-remove <container> [--force]"
+    exit 1
+fi
+
+# --- Guards ---
+cc_require_docker || exit 1
+cc_require_container "$container" || exit 1
+
+# --- Gather info for confirmation ---
+state=$(docker inspect --format '{{.State.Status}}' "$container" 2>/dev/null || echo "unknown")
+image_name=$(docker inspect --format '{{.Config.Image}}' "$container" 2>/dev/null || echo "unknown")
+created=$(docker inspect --format '{{.Created}}' "$container" 2>/dev/null || echo "unknown")
+
+details=(
+    "Container: $container"
+    "Image: $image_name"
+    "State: $state"
+    "Created: $created"
+    "Note: volumes are preserved"
+)
+
+# --- Confirm and remove ---
+if $force; then
+    CC_FORCE=1
+fi
+
+export CC_FORCE
+
+contract_destructive "Remove container?" "${details[@]}" || {
+    cc_info "Aborted"
+    exit 1
+}
+
+# Stop if running
+if [[ "$state" == "running" ]]; then
+    cc_info "Stopping container..."
+    docker stop "$container" >/dev/null 2>&1 || true
+fi
+
+# Remove
+docker rm -f "$container" >/dev/null 2>&1
+rc=$?
+
+if [[ $rc -eq 0 ]]; then
+    cc_ok "Removed container: $container"
+else
+    cc_error "Failed to remove container: $container"
+    exit 1
+fi
+
+exit 0

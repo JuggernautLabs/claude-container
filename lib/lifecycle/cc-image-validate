@@ -1,0 +1,103 @@
+#!/usr/bin/env bash
+# ============================================================================
+# cc-image-validate — Validates a Docker image has required binaries
+# ============================================================================
+# USAGE: cc-image-validate <image> [--json]
+# INPUTS: image — Docker image name or ID
+# OUTPUTS: human-readable status (default) or JSON (--json)
+# READS: Docker image (runs test container on cache miss, inspect on hit)
+# WRITES: cache file at $CC_CACHE_DIR/image-validated/<image_id>
+# DESTROYS: nothing
+# ============================================================================
+
+SCRIPT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
+source "$SCRIPT_DIR/lib/core/contract.sh"
+source "$SCRIPT_DIR/lib/core/constants.sh"
+source "$SCRIPT_DIR/lib/core/contracts.sh"
+
+# --- Args ---
+image=""
+json_output=false
+
+for arg in "$@"; do
+    case "$arg" in
+        --json) json_output=true ;;
+        -*) cc_error "Unknown flag: $arg"; exit 1 ;;
+        *) [[ -z "$image" ]] && image="$arg" ;;
+    esac
+done
+
+if [[ -z "$image" ]]; then
+    cc_error "Usage: cc-image-validate <image> [--json]"
+    exit 1
+fi
+
+# --- Run contract ---
+cc_require_docker || exit 1
+
+result=$(contract_image "$image")
+rc=$?
+
+# --- Output ---
+if $json_output; then
+    # Build JSON from contract output lines
+    ok="true"
+    if [[ $rc -ne 0 ]]; then
+        ok="false"
+    fi
+
+    fail_items=()
+    warn_items=()
+    ok_items=()
+
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        case "$line" in
+            fail:*)  fail_items+=("${line#fail:}") ;;
+            warn:*)  warn_items+=("${line#warn:}") ;;
+            ok:*)    ok_items+=("${line#ok:}") ;;
+        esac
+    done <<< "$result"
+
+    # Build JSON arrays
+    json_fails="["
+    for i in "${!fail_items[@]}"; do
+        [[ $i -gt 0 ]] && json_fails+=","
+        json_fails+="\"${fail_items[$i]}\""
+    done
+    json_fails+="]"
+
+    json_warns="["
+    for i in "${!warn_items[@]}"; do
+        [[ $i -gt 0 ]] && json_warns+=","
+        json_warns+="\"${warn_items[$i]}\""
+    done
+    json_warns+="]"
+
+    json_ok="["
+    for i in "${!ok_items[@]}"; do
+        [[ $i -gt 0 ]] && json_ok+=","
+        json_ok+="\"${ok_items[$i]}\""
+    done
+    json_ok+="]"
+
+    echo "{\"ok\":$ok,\"image\":\"$image\",\"failures\":$json_fails,\"warnings\":$json_warns,\"present\":$json_ok}"
+else
+    # Human output
+    if [[ $rc -eq 0 ]]; then
+        cc_ok "Image validated: $image"
+    else
+        cc_error "Image validation failed: $image"
+    fi
+
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        case "$line" in
+            fail:*)  cc_error "  missing: ${line#fail:}" ;;
+            warn:*)  cc_warn "  optional missing: ${line#warn:}" ;;
+            ok:*)    cc_ok "  found: ${line#ok:}" ;;
+        esac
+    done <<< "$result"
+fi
+
+exit $rc

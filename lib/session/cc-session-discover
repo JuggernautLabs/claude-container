@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+# cc-session-discover — scan directories for git repos
+# USAGE: cc-session-discover <directory> [--json]
+# OUTPUTS: stdout: name|path lines (or JSON with --json)
+# READS: filesystem
+# WRITES: nothing
+# DESTROYS: nothing
+
+SCRIPT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
+source "$SCRIPT_DIR/lib/core/contract.sh"
+source "$SCRIPT_DIR/lib/core/constants.sh"
+
+_dir=""; _json=false
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --json) _json=true; shift ;;
+        --help|-h) echo "Usage: cc-session-discover <dir> [--json]"; exit 0 ;;
+        *) _dir="$1"; shift ;;
+    esac
+done
+[[ -z "$_dir" ]] && { cc_error "Usage: cc-session-discover <dir>"; exit 1; }
+[[ ! -d "$_dir" ]] && { cc_error "Not a directory: $_dir"; exit 1; }
+
+_abs="$(cd "$_dir" && pwd)"
+_parent="$(dirname "$_abs")"
+_prefix="$(basename "$_abs")"
+_results=()
+
+for d in "$_abs"/*/; do
+    [[ -d "$d/.git" ]] || continue
+    [[ -f "$d/.git" ]] && continue  # skip worktrees
+    _name="${_prefix}/$(basename "$d")"
+    _path="$(cd "$d" && pwd)"
+    _results+=("${_name}|${_path}")
+done
+
+if $_json; then
+    echo "["
+    for i in "${!_results[@]}"; do
+        IFS='|' read -r n p <<< "${_results[$i]}"
+        [[ $i -gt 0 ]] && echo ","
+        printf '  {"name":"%s","path":"%s"}' "$n" "$p"
+    done
+    echo ""
+    echo "]"
+else
+    printf '%s\n' "${_results[@]}"
+fi

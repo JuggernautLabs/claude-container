@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# cc-session-add-repo — add repos to an existing session
+# USAGE: cc-session-add-repo <session_name> <repo_path> [<repo_path>...]
+# READS: host git repos, session volume
+# WRITES: clones into volume, updates .claude-projects.yml
+# DESTROYS: nothing
+
+SCRIPT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
+source "$SCRIPT_DIR/lib/core/contract.sh"
+source "$SCRIPT_DIR/lib/core/constants.sh"
+source "$SCRIPT_DIR/lib/utils.sh"
+source "$SCRIPT_DIR/lib/platform.sh"
+source "$SCRIPT_DIR/lib/docker-utils.sh"
+source "$SCRIPT_DIR/lib/config.sh"
+source "$SCRIPT_DIR/lib/git-session.sh"
+source "$SCRIPT_DIR/lib/session-mgmt.sh"
+
+session="${1:-}"
+[[ -z "$session" ]] && { cc_error "Usage: cc-session-add-repo <session> <path> [<path>...]"; exit 1; }
+shift
+
+vol=$(cc_session_volume "$session")
+docker volume inspect "$vol" &>/dev/null || { cc_error "Session not found: $session"; exit 1; }
+
+[[ $# -eq 0 ]] && { cc_error "No repo paths given"; exit 1; }
+
+_added=0; _failed=0
+for _rpath in "$@"; do
+    _abs="$_rpath"
+    [[ "$_abs" != /* ]] && _abs="$(cd "$_rpath" 2>/dev/null && pwd)" || true
+    [[ -z "$_abs" || ! -d "$_abs" ]] && { cc_warn "Not found: $_rpath"; _failed=$((_failed+1)); continue; }
+    is_git_repo "$_abs" || { cc_warn "Not a git repo: $_abs"; _failed=$((_failed+1)); continue; }
+    cc_info "Adding $(basename "$_abs")..."
+    session_add_repo "$session" "$_abs" && _added=$((_added+1)) || _failed=$((_failed+1))
+done
+
+cc_ok "Added $_added repo(s)"
+[[ $_failed -gt 0 ]] && cc_warn "$_failed failed"
+[[ $_failed -gt 0 ]] && exit 1
+exit 0

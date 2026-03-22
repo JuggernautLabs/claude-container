@@ -1,0 +1,80 @@
+#!/usr/bin/env bash
+# cc-snapshot — Snapshot all session state in one shot
+#
+# CONTRACT:
+#   USAGE:    cc-snapshot <volume> <session_name> <target_branch> <output_dir> [--repo <filter>]
+#   INPUTS:   volume (Docker volume name), session_name, target_branch, output_dir, optional repo filter
+#   OUTPUTS:  per-repo result files in output_dir (container_head, session_head, target_head, etc.)
+#   READS:    Docker volume (one docker run), host git repos
+#   WRITES:   result files in output_dir via _pull_result_set
+#   DESTROYS: nothing
+
+SCRIPT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
+source "$SCRIPT_DIR/lib/core/contract.sh"
+source "$SCRIPT_DIR/lib/core/constants.sh"
+source "$SCRIPT_DIR/lib/utils.sh"
+source "$SCRIPT_DIR/lib/platform.sh"
+source "$SCRIPT_DIR/lib/docker-utils.sh"
+source "$SCRIPT_DIR/lib/session-discovery.sh"
+
+usage() {
+    cat >&2 <<EOF
+Usage: cc-snapshot <volume> <session_name> <target_branch> <output_dir> [--repo <filter>]
+
+Snapshot all session state from a Docker volume in one shot.
+Writes per-repo result files to output_dir.
+
+Arguments:
+  volume          Docker volume name (e.g. claude-session-foo)
+  session_name    Session/branch name used for extraction
+  target_branch   Branch to merge into (e.g. main)
+  output_dir      Directory for result files
+
+Options:
+  --repo <filter>   Comma-separated partial repo name filter
+  --help, -h        Show this help
+EOF
+}
+
+# --- Arg parsing ---
+volume=""
+session_name=""
+target_branch=""
+output_dir=""
+repo_filter=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --help|-h) usage; exit 0 ;;
+        --repo) repo_filter="$2"; shift 2 ;;
+        -*)
+            cc_error "Unknown option: $1"
+            usage
+            exit 1
+            ;;
+        *)
+            if [[ -z "$volume" ]]; then
+                volume="$1"
+            elif [[ -z "$session_name" ]]; then
+                session_name="$1"
+            elif [[ -z "$target_branch" ]]; then
+                target_branch="$1"
+            elif [[ -z "$output_dir" ]]; then
+                output_dir="$1"
+            else
+                cc_error "Unexpected argument: $1"
+                usage
+                exit 1
+            fi
+            shift
+            ;;
+    esac
+done
+
+if [[ -z "$volume" || -z "$session_name" || -z "$target_branch" || -z "$output_dir" ]]; then
+    cc_error "Missing required arguments"
+    usage
+    exit 1
+fi
+
+snapshot_session_state "$volume" "$session_name" "$target_branch" "$output_dir" "$repo_filter"

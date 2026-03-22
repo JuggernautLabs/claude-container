@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+# cc-classify — Classify one repo's sync state from snapshot data
+#
+# CONTRACT:
+#   USAGE:    cc-classify <result_dir> <repo_name> <session_name> <target_branch>
+#   INPUTS:   result_dir (snapshot output), repo_name, session_name, target_branch
+#   OUTPUTS:  sync_state, sync_action, sync_detail written to result dir
+#   READS:    result files from snapshot, host git repos (for ancestry checks)
+#   WRITES:   sync_state, sync_action, sync_detail to result dir
+#   DESTROYS: nothing
+
+SCRIPT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
+source "$SCRIPT_DIR/lib/core/contract.sh"
+source "$SCRIPT_DIR/lib/core/constants.sh"
+source "$SCRIPT_DIR/lib/utils.sh"
+source "$SCRIPT_DIR/lib/platform.sh"
+source "$SCRIPT_DIR/lib/docker-utils.sh"
+source "$SCRIPT_DIR/lib/commands/sync/classify.sh"
+
+usage() {
+    cat >&2 <<EOF
+Usage: cc-classify <result_dir> <repo_name> <session_name> <target_branch>
+
+Classify one repo's sync state from snapshot data.
+Writes sync_state, sync_action, and sync_detail to the result dir.
+
+Arguments:
+  result_dir      Directory containing snapshot result files
+  repo_name       Repository name (e.g. org/repo)
+  session_name    Session/branch name
+  target_branch   Branch to merge into (e.g. main)
+
+Options:
+  --help, -h      Show this help
+EOF
+}
+
+# --- Arg parsing ---
+result_dir=""
+repo_name=""
+session_name=""
+target_branch=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --help|-h) usage; exit 0 ;;
+        -*)
+            cc_error "Unknown option: $1"
+            usage
+            exit 1
+            ;;
+        *)
+            if [[ -z "$result_dir" ]]; then
+                result_dir="$1"
+            elif [[ -z "$repo_name" ]]; then
+                repo_name="$1"
+            elif [[ -z "$session_name" ]]; then
+                session_name="$1"
+            elif [[ -z "$target_branch" ]]; then
+                target_branch="$1"
+            else
+                cc_error "Unexpected argument: $1"
+                usage
+                exit 1
+            fi
+            shift
+            ;;
+    esac
+done
+
+if [[ -z "$result_dir" || -z "$repo_name" || -z "$session_name" || -z "$target_branch" ]]; then
+    cc_error "Missing required arguments"
+    usage
+    exit 1
+fi
+
+classify_repo_sync_state "$result_dir" "$repo_name" "$session_name" "$target_branch"

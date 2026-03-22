@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+# cc-merge — Auto-merge session branches into target branch
+#
+# CONTRACT:
+#   USAGE:    cc-merge <session_name> <target_branch> [--dry-run] [--repo <filter>] [--squash|--no-squash] [--result-dir <dir>]
+#   INPUTS:   session_name, target_branch, optional flags
+#   OUTPUTS:  merges session into target (or dry-run detection report)
+#   READS:    host git repos (session branch, target branch)
+#   WRITES:   merges session into target branch on host repos
+#   DESTROYS: modifies target branch (with confirmation in verify mode)
+
+SCRIPT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
+source "$SCRIPT_DIR/lib/core/contract.sh"
+source "$SCRIPT_DIR/lib/core/constants.sh"
+source "$SCRIPT_DIR/lib/utils.sh"
+source "$SCRIPT_DIR/lib/platform.sh"
+source "$SCRIPT_DIR/lib/docker-utils.sh"
+source "$SCRIPT_DIR/lib/session-discovery.sh"
+source "$SCRIPT_DIR/lib/merge-detect.sh"
+source "$SCRIPT_DIR/lib/session-mgmt.sh"
+
+usage() {
+    cat >&2 <<EOF
+Usage: cc-merge <session_name> <target_branch> [options]
+
+Auto-merge session branches into the target branch.
+
+Arguments:
+  session_name    Session name (e.g. my-session)
+  target_branch   Branch to merge into (e.g. main)
+
+Options:
+  --dry-run             Detect merge status without merging
+  --repo <filter>       Comma-separated partial repo name filter
+  --squash              Use squash merge (default)
+  --no-squash           Use regular merge
+  --result-dir <dir>    Use pre-existing result dir from snapshot
+  --help, -h            Show this help
+EOF
+}
+
+# --- Arg parsing ---
+session_name=""
+target_branch=""
+dry_run="false"
+repo_filter=""
+squash="true"
+result_dir=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --help|-h) usage; exit 0 ;;
+        --dry-run) dry_run="true"; shift ;;
+        --repo) repo_filter="$2"; shift 2 ;;
+        --squash) squash="true"; shift ;;
+        --no-squash) squash="false"; shift ;;
+        --result-dir) result_dir="$2"; shift 2 ;;
+        -*)
+            cc_error "Unknown option: $1"
+            usage
+            exit 1
+            ;;
+        *)
+            if [[ -z "$session_name" ]]; then
+                session_name="$1"
+            elif [[ -z "$target_branch" ]]; then
+                target_branch="$1"
+            else
+                cc_error "Unexpected argument: $1"
+                usage
+                exit 1
+            fi
+            shift
+            ;;
+    esac
+done
+
+if [[ -z "$session_name" || -z "$target_branch" ]]; then
+    cc_error "Missing required arguments: session_name and target_branch"
+    usage
+    exit 1
+fi
+
+session_auto_merge "$session_name" "$target_branch" "$dry_run" "$repo_filter" "$squash" "$result_dir"
