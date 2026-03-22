@@ -3373,6 +3373,12 @@ session_auto_merge() {
                     ;;
                 "would create"*)
                     git -C "$proj_path" branch "$target_branch" "$session_name" 2>/dev/null
+                    # If HEAD is on the new branch, checkout to populate working tree
+                    local _current_br
+                    _current_br=$(git -C "$proj_path" symbolic-ref --short HEAD 2>/dev/null || echo "")
+                    if [[ "$_current_br" == "$target_branch" ]]; then
+                        git -C "$proj_path" reset --hard "$target_branch" 2>/dev/null || true
+                    fi
                     _write_merge_result "OK" "$proj_name" "created '$target_branch' from $session_name"
                     exit 0
                     ;;
