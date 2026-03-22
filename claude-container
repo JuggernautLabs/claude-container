@@ -710,6 +710,10 @@ if $USE_GIT_SESSION; then
     # Handle --clone-from: clone volumes from existing session if target doesn't exist
     if [[ -n "$CLONE_FROM" ]] && ! $_session_existed; then
         session_clone "$CLONE_FROM" "$SESSION_NAME"
+    elif $_session_existed && [[ ${#DISCOVER_REPOS_DIRS[@]} -gt 0 ]]; then
+        # Session exists + --discover-repos: skip create_git_session (it would
+        # re-discover and print the full repo list again). Just add new repos below.
+        info "Resuming existing multi-project session: $SESSION_NAME"
     else
         create_git_session "$SESSION_NAME" "$WORKSPACE_DIR"
     fi
