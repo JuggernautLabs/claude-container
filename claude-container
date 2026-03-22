@@ -988,8 +988,36 @@ if $START_HERE && $USE_GIT_SESSION && [[ -n "$SESSION_NAME" ]]; then
         # Remove stopped container so docker run re-reads .main-project
         docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
     else
-        warn "Current directory doesn't match any project in session '$SESSION_NAME'"
-        info "Container will start in /workspace"
+        # cwd not in session — check if it's a git repo we can add
+        _cwd=$(pwd)
+        if is_git_repo "$_cwd"; then
+            _repo_basename=$(basename "$_cwd")
+            warn "Current directory is not in session '$SESSION_NAME'"
+            echo ""
+            printf "Add '%s' to session and start here? [y/N] " "$_repo_basename"
+            read -r _add_answer
+            case "$_add_answer" in
+                [yY]|[yY][eE][sS])
+                    info "Adding $_repo_basename to session..."
+                    session_add_repo "$SESSION_NAME" "$_cwd"
+                    # Now set it as main project
+                    _added_name=$(basename "$_cwd")
+                    docker run --rm --entrypoint sh \
+                        --user "$(id -u):$(id -u)" \
+                        -v "$GIT_SESSION_VOLUME:/session" \
+                        "${GIT_UTIL_IMAGE:-alpine/git}" \
+                        -c "echo '$_added_name' > /session/.main-project" 2>/dev/null || true
+                    info "Start here: $_added_name"
+                    docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
+                    ;;
+                *)
+                    info "Container will start in /workspace"
+                    ;;
+            esac
+        else
+            warn "Current directory is not a git repo"
+            info "Container will start in /workspace"
+        fi
     fi
 fi
 
