@@ -62,21 +62,40 @@ fi
 # (simpler than su developer which breaks heredocs)
 mkdir -p /home/developer/.claude /home/developer/.cargo /home/developer/.npm /home/developer/.cache/pip
 
-# Pre-accept trust dialog for /workspace and all subdirectories
-python3 << 'TRUSTPY' 2>/dev/null || echo '{"theme":"dark-ansi","hasCompletedOnboarding":true,"bypassPermissionsModeAccepted":true}' > "/home/developer/.claude.json"
+# .claude.json lives in the state volume (.claude/) so it survives container rebuilds.
+# Symlink from the expected location to the volume.
+if [[ ! -L /home/developer/.claude.json ]] || [[ "$(readlink /home/developer/.claude.json)" != "/home/developer/.claude/.claude.json" ]]; then
+    rm -f /home/developer/.claude.json 2>/dev/null || true
+    ln -s /home/developer/.claude/.claude.json /home/developer/.claude.json
+fi
+
+# Merge trust entries into existing .claude.json (preserves conversations, settings)
+python3 << 'TRUSTPY' 2>/dev/null || true
 import json, glob, os
-projects = {"/workspace": {"hasTrustDialogAccepted": True}}
+
+config_path = "/home/developer/.claude/.claude.json"
+
+config = {}
+try:
+    with open(config_path) as f:
+        config = json.load(f)
+except (FileNotFoundError, json.JSONDecodeError):
+    pass
+
+config.setdefault("theme", "dark-ansi")
+config["hasCompletedOnboarding"] = True
+config["bypassPermissionsModeAccepted"] = True
+
+projects = config.get("projects", {})
+projects["/workspace"] = {"hasTrustDialogAccepted": True}
 for pattern in ["/workspace/*/", "/workspace/*/*/"]:
     for d in glob.glob(pattern):
         if os.path.isdir(os.path.join(d, ".git")):
-            projects[d.rstrip("/")] = {"hasTrustDialogAccepted": True}
-config = {
-    "theme": "dark-ansi",
-    "hasCompletedOnboarding": True,
-    "bypassPermissionsModeAccepted": True,
-    "projects": projects
-}
-with open("/home/developer/.claude.json", "w") as f:
+            proj = projects.setdefault(d.rstrip("/"), {})
+            proj["hasTrustDialogAccepted"] = True
+config["projects"] = projects
+
+with open(config_path, "w") as f:
     json.dump(config, f)
 TRUSTPY
 
