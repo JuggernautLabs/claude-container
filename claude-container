@@ -909,6 +909,11 @@ DOCKER_ARGS+=(
     "-v" "$SCRIPT_DIR/lib/container/agent-run.sh:/usr/local/bin/agent-run:ro"
 )
 
+# Always start as root — the entrypoint handles privilege drop via gosu.
+# Custom Dockerfiles may set USER developer, but the entrypoint needs root
+# to create users, fix permissions, and set up the environment.
+DOCKER_ARGS+=("--user" "0:0")
+
 # Pass through claude args if provided
 if [[ ${#CLAUDE_ARGS[@]} -gt 0 ]]; then
     # Serialize the array as a base64-encoded string to preserve spaces and special chars

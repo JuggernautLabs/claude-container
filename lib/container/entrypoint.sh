@@ -52,17 +52,11 @@ fi
 # Home Directory & Config
 # ============================================================================
 
-# Create config dirs — handle both root and non-root entry
-_home="${HOME:-/home/developer}"
-if [[ "$(id -u)" == "0" ]]; then
-    mkdir -p /home/developer/.claude /home/developer/.cargo /home/developer/.npm /home/developer/.cache/pip
-else
-    # Non-root (custom Dockerfile with USER directive)
-    mkdir -p "$_home/.claude" "$_home/.cargo" "$_home/.npm" "$_home/.cache/pip" 2>/dev/null || true
-fi
+# Create config dirs (entrypoint always runs as root, drops privileges later via gosu)
+mkdir -p /home/developer/.claude /home/developer/.cargo /home/developer/.npm /home/developer/.cache/pip
 
 # Pre-accept trust dialog for /workspace and all subdirectories
-python3 << 'TRUSTPY' 2>/dev/null || echo '{"theme":"dark-ansi","hasCompletedOnboarding":true,"bypassPermissionsModeAccepted":true}' > "$_home/.claude.json"
+python3 << 'TRUSTPY' 2>/dev/null || echo '{"theme":"dark-ansi","hasCompletedOnboarding":true,"bypassPermissionsModeAccepted":true}' > "/home/developer/.claude.json"
 import json, glob, os
 projects = {"/workspace": {"hasTrustDialogAccepted": True}}
 for pattern in ["/workspace/*/", "/workspace/*/*/"]:
@@ -75,17 +69,15 @@ config = {
     "bypassPermissionsModeAccepted": True,
     "projects": projects
 }
-import pathlib
-_home = pathlib.Path.home()
-with open(_home / ".claude.json", "w") as f:
+with open("/home/developer/.claude.json", "w") as f:
     json.dump(config, f)
 TRUSTPY
 
 # Statusline settings (base64-encoded to avoid quoting issues)
-echo "eyJzdGF0dXNMaW5lIjp7InR5cGUiOiJjb21tYW5kIiwiY29tbWFuZCI6ImlucHV0PSQoY2F0KTsgbW9kZWw9JChlY2hvIFwiJGlucHV0XCIgfCBqcSAtciAnLm1vZGVsLmRpc3BsYXlfbmFtZSAvLyAubW9kZWwuaWQgLy8gXCI/XCInIHwgdHIgJ1s6dXBwZXI6XScgJ1s6bG93ZXI6XScgfCB0ciAnICcgJy0nKTsgY29zdD0kKGVjaG8gXCIkaW5wdXRcIiB8IGpxIC1yICcuY29zdC50b3RhbF9jb3N0X3VzZCAvLyAwJyB8IHhhcmdzIHByaW50ZiAnJCUuMmYnKTsgb3ZlcjIwMGs9JChlY2hvIFwiJGlucHV0XCIgfCBqcSAtciAnLmV4Y2VlZHNfMjAwa190b2tlbnMnKTsgaWYgWyBcIiRvdmVyMjAwa1wiID0gXCJ0cnVlXCIgXTsgdGhlbiBjdHg9J+KaoO+4jz4yMDBrJzsgZWxzZSBjdHg9JzwyMDBrJzsgZmk7IGN3ZD0kKGVjaG8gXCIkaW5wdXRcIiB8IGpxIC1yICcud29ya3NwYWNlLmN1cnJlbnRfZGlyJyk7IGRpcj0kKGJhc2VuYW1lIFwiJGN3ZFwiKTsgY2QgXCIkY3dkXCIgMj4vZGV2L251bGwgfHwgdHJ1ZTsgYnJhbmNoPSQoZ2l0IHN5bWJvbGljLXJlZiAtLXNob3J0IEhFQUQgMj4vZGV2L251bGwpOyBkaXJ0eT0kKGdpdCBzdGF0dXMgLS1wb3JjZWxhaW4gMj4vZGV2L251bGwgfCBoZWFkIC0xKTsgaWYgWyAtbiBcIiRkaXJ0eVwiIF07IHRoZW4gbWFyaz0nKic7IGVsc2UgbWFyaz0nJzsgZmk7IHNlc3M9XCIke0NMQVVERV9TRVNTSU9OX05BTUU6LX1cIjsgaWYgWyAtbiBcIiRzZXNzXCIgXSAmJiBbIC1uIFwiJGJyYW5jaFwiIF07IHRoZW4gZWNobyBcIlskc2Vzc10gJG1vZGVsQCRkaXI6KCRicmFuY2gkbWFyaykgJGNvc3QgJGN0eFwiOyBlbGlmIFsgLW4gXCIkc2Vzc1wiIF07IHRoZW4gZWNobyBcIlskc2Vzc10gJG1vZGVsQCRkaXIgJGNvc3QgJGN0eFwiOyBlbGlmIFsgLW4gXCIkYnJhbmNoXCIgXTsgdGhlbiBlY2hvIFwiJG1vZGVsQCRkaXI6KCRicmFuY2gkbWFyaykgJGNvc3QgJGN0eFwiOyBlbHNlIGVjaG8gXCIkbW9kZWxAJGRpciAkY29zdCAkY3R4XCI7IGZpIn19Cg==" | base64 -d > "$_home/.claude/settings.json"
+echo "eyJzdGF0dXNMaW5lIjp7InR5cGUiOiJjb21tYW5kIiwiY29tbWFuZCI6ImlucHV0PSQoY2F0KTsgbW9kZWw9JChlY2hvIFwiJGlucHV0XCIgfCBqcSAtciAnLm1vZGVsLmRpc3BsYXlfbmFtZSAvLyAubW9kZWwuaWQgLy8gXCI/XCInIHwgdHIgJ1s6dXBwZXI6XScgJ1s6bG93ZXI6XScgfCB0ciAnICcgJy0nKTsgY29zdD0kKGVjaG8gXCIkaW5wdXRcIiB8IGpxIC1yICcuY29zdC50b3RhbF9jb3N0X3VzZCAvLyAwJyB8IHhhcmdzIHByaW50ZiAnJCUuMmYnKTsgb3ZlcjIwMGs9JChlY2hvIFwiJGlucHV0XCIgfCBqcSAtciAnLmV4Y2VlZHNfMjAwa190b2tlbnMnKTsgaWYgWyBcIiRvdmVyMjAwa1wiID0gXCJ0cnVlXCIgXTsgdGhlbiBjdHg9J+KaoO+4jz4yMDBrJzsgZWxzZSBjdHg9JzwyMDBrJzsgZmk7IGN3ZD0kKGVjaG8gXCIkaW5wdXRcIiB8IGpxIC1yICcud29ya3NwYWNlLmN1cnJlbnRfZGlyJyk7IGRpcj0kKGJhc2VuYW1lIFwiJGN3ZFwiKTsgY2QgXCIkY3dkXCIgMj4vZGV2L251bGwgfHwgdHJ1ZTsgYnJhbmNoPSQoZ2l0IHN5bWJvbGljLXJlZiAtLXNob3J0IEhFQUQgMj4vZGV2L251bGwpOyBkaXJ0eT0kKGdpdCBzdGF0dXMgLS1wb3JjZWxhaW4gMj4vZGV2L251bGwgfCBoZWFkIC0xKTsgaWYgWyAtbiBcIiRkaXJ0eVwiIF07IHRoZW4gbWFyaz0nKic7IGVsc2UgbWFyaz0nJzsgZmk7IHNlc3M9XCIke0NMQVVERV9TRVNTSU9OX05BTUU6LX1cIjsgaWYgWyAtbiBcIiRzZXNzXCIgXSAmJiBbIC1uIFwiJGJyYW5jaFwiIF07IHRoZW4gZWNobyBcIlskc2Vzc10gJG1vZGVsQCRkaXI6KCRicmFuY2gkbWFyaykgJGNvc3QgJGN0eFwiOyBlbGlmIFsgLW4gXCIkc2Vzc1wiIF07IHRoZW4gZWNobyBcIlskc2Vzc10gJG1vZGVsQCRkaXIgJGNvc3QgJGN0eFwiOyBlbGlmIFsgLW4gXCIkYnJhbmNoXCIgXTsgdGhlbiBlY2hvIFwiJG1vZGVsQCRkaXI6KCRicmFuY2gkbWFyaykgJGNvc3QgJGN0eFwiOyBlbHNlIGVjaG8gXCIkbW9kZWxAJGRpciAkY29zdCAkY3R4XCI7IGZpIn19Cg==" | base64 -d > "/home/developer/.claude/settings.json" 2>/dev/null || true
 
 # Copy git config
-if [[ -f /root/.gitconfig ]] && [[ "$(id -u)" == "0" ]]; then
+if [[ -f /root/.gitconfig ]]; then
     cp /root/.gitconfig /home/developer/.gitconfig 2>/dev/null || true
 fi
 
@@ -99,7 +91,7 @@ fi
 # User Setup
 # ============================================================================
 
-if [[ "$(id -u)" == "0" ]] && { [[ "${RUN_AS_USER:-}" == "1" ]] || [[ "${RUN_AS_ROOTISH:-}" == "1" ]]; }; then
+if [[ "${RUN_AS_USER:-}" == "1" ]] || [[ "${RUN_AS_ROOTISH:-}" == "1" ]]; then
     groupadd -g $DEV_GID developer 2>/dev/null || true
     useradd -u $HOST_UID -g $DEV_GID -m -s /bin/bash developer 2>/dev/null || true
     chown -R developer:developer /home/developer
