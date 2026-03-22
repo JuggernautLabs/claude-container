@@ -277,7 +277,7 @@ cmd_pull() {
                 local _vm
                 _vm=$(grep "^merge_detail=" "$_vf" 2>/dev/null | tail -1 | cut -d= -f2-)
                 case "$_vm" in
-                    "squash-merge"*|"fast-forward"*|"merge cleanly"*|"squash-merged"*)
+                    "squash-merge"*|"fast-forward"*|"merge cleanly"*|"squash-merged"*|"would create"*|"created"*)
                         _has_mergeable=true
                         break
                         ;;

@@ -440,19 +440,21 @@ snapshot_session_state() {
             continue
         fi
 
-        # Host session branch HEAD
+        # Host session branch HEAD (only if branch actually exists)
         local _session_head=""
         if git -C "$_path" show-ref --verify --quiet "refs/heads/$session_name" 2>/dev/null; then
-            _session_head=$(git -C "$_path" rev-parse "refs/heads/$session_name" 2>/dev/null)
+            _session_head=$(git -C "$_path" rev-parse "refs/heads/$session_name" 2>/dev/null || echo "")
+            # Validate looks like a SHA (rev-parse outputs the ref name on failure)
+            [[ "$_session_head" =~ ^[0-9a-f]{7,} ]] || _session_head=""
         fi
         _pull_result_set "$output_dir" "$_name" "session_head" "${_session_head:-}"
 
         # Host target branch HEAD
         local _target_head=""
-        if [[ -n "$target_branch" ]]; then
-            _target_head=$(git -C "$_path" rev-parse "refs/heads/$target_branch" 2>/dev/null || echo "")
-            _pull_result_set "$output_dir" "$_name" "target_head" "${_target_head:-}"
+        if [[ -n "$target_branch" ]] && git -C "$_path" show-ref --verify --quiet "refs/heads/$target_branch" 2>/dev/null; then
+            _target_head=$(git -C "$_path" rev-parse "refs/heads/$target_branch" 2>/dev/null)
         fi
+        [[ -n "$target_branch" ]] && _pull_result_set "$output_dir" "$_name" "target_head" "${_target_head:-}"
 
         # Squash-base ref
         if [[ -n "$session_name" ]]; then
