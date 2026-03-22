@@ -1119,51 +1119,64 @@ if $USE_GIT_SESSION && ! $EPHEMERAL && [[ -n "$SESSION_NAME" ]]; then
             docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
             _existing_ctr=""
         else
-            # Check if container was built from a different image than current
-            _ctr_image=$(docker inspect --format '{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null || echo "")
-            if [[ -n "$_ctr_image" && "$_ctr_image" != "$IMAGE_NAME" ]]; then
-                info "Image changed ($_ctr_image → $IMAGE_NAME) — rebuilding container..."
-                docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
-                _existing_ctr=""
+            # Detect stale container configuration and repair by rebuilding
+            _needs_rebuild=false
+            _rebuild_reasons=()
+
+            # Check 1: image changed (compare ID, not just name — catches rebuilds)
+            _ctr_image_id=$(docker inspect --format '{{.Image}}' "$CONTAINER_NAME" 2>/dev/null || echo "")
+            _current_image_id=$(docker inspect --format '{{.Id}}' "$IMAGE_NAME" 2>/dev/null || echo "")
+            if [[ -n "$_ctr_image_id" && -n "$_current_image_id" && "$_ctr_image_id" != "$_current_image_id" ]]; then
+                _needs_rebuild=true
+                _rebuild_reasons+=("image rebuilt (container: ${_ctr_image_id:0:12}, current: ${_current_image_id:0:12})")
+            fi
+            # Also check image name (catches renamed images)
+            _ctr_image_name=$(docker inspect --format '{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null || echo "")
+            if [[ -n "$_ctr_image_name" && "$_ctr_image_name" != "$IMAGE_NAME" ]]; then
+                _needs_rebuild=true
+                _rebuild_reasons+=("image name: $_ctr_image_name → $IMAGE_NAME")
             fi
 
-            # Detect stale container configuration and repair by rebuilding
-            if [[ -n "$_existing_ctr" ]]; then
-                _needs_rebuild=false
-                _rebuild_reasons=()
+            # Check 2: entrypoint mount points to a different script dir
+            _ctr_entrypoint=$(docker inspect --format '{{range .Mounts}}{{if eq .Destination "/usr/local/bin/cc-entrypoint"}}{{.Source}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null || echo "")
+            _expected_entrypoint="$SCRIPT_DIR/lib/container/entrypoint.sh"
+            if [[ -n "$_ctr_entrypoint" && "$_ctr_entrypoint" != "$_expected_entrypoint" ]]; then
+                _needs_rebuild=true
+                _rebuild_reasons+=("entrypoint: $_ctr_entrypoint → $_expected_entrypoint")
+            fi
 
-                # Check 1: entrypoint mount points to a different script dir
-                _ctr_entrypoint=$(docker inspect --format '{{range .Mounts}}{{if eq .Destination "/usr/local/bin/cc-entrypoint"}}{{.Source}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null || echo "")
-                _expected_entrypoint="$SCRIPT_DIR/lib/container/entrypoint.sh"
-                if [[ -n "$_ctr_entrypoint" && "$_ctr_entrypoint" != "$_expected_entrypoint" ]]; then
-                    _needs_rebuild=true
-                    _rebuild_reasons+=("entrypoint: $_ctr_entrypoint → $_expected_entrypoint")
-                fi
+            # Check 3: container was created without --user 0:0 (needs root for entrypoint)
+            _ctr_user=$(docker inspect --format '{{.Config.User}}' "$CONTAINER_NAME" 2>/dev/null || echo "")
+            if [[ "$_ctr_user" != "0:0" && "$_ctr_user" != "0" && "$_ctr_user" != "root" ]]; then
+                _needs_rebuild=true
+                _rebuild_reasons+=("user: '$_ctr_user' (needs root for entrypoint setup)")
+            fi
 
-                # Check 2: container was created without --user 0:0 (needs root for entrypoint)
-                _ctr_user=$(docker inspect --format '{{.Config.User}}' "$CONTAINER_NAME" 2>/dev/null || echo "")
-                if [[ "$_ctr_user" != "0:0" && "$_ctr_user" != "0" && "$_ctr_user" != "root" ]]; then
-                    _needs_rebuild=true
-                    _rebuild_reasons+=("user: '$_ctr_user' (needs root for entrypoint setup)")
-                fi
+            # Check 4: stale env vars
+            _ctr_continue=$(docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$CONTAINER_NAME" 2>/dev/null | grep "^CONTINUE_SESSION=1$" || true)
+            if [[ -n "$_ctr_continue" ]] && ! $CONTINUE_SESSION; then
+                _needs_rebuild=true
+                _rebuild_reasons+=("stale env: CONTINUE_SESSION=1 baked in")
+            fi
 
-                # Check 3: container has stale env vars that conflict
-                # (e.g. CONTINUE_SESSION=1 baked in from a previous --continue run)
-                _ctr_continue=$(docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$CONTAINER_NAME" 2>/dev/null | grep "^CONTINUE_SESSION=1$" || true)
-                if [[ -n "$_ctr_continue" ]] && ! $CONTINUE_SESSION; then
-                    _needs_rebuild=true
-                    _rebuild_reasons+=("stale env: CONTINUE_SESSION=1 baked in")
-                fi
+            # Check 5: critical tools missing from image (catches bad images that got through)
+            if ! $_needs_rebuild; then
+                for _tool in gosu git claude; do
+                    if ! docker run --rm --entrypoint sh "$IMAGE_NAME" -c "command -v $_tool" &>/dev/null; then
+                        _needs_rebuild=true
+                        _rebuild_reasons+=("image missing: $_tool")
+                    fi
+                done
+            fi
 
-                if $_needs_rebuild; then
-                    warn "Container needs rebuild:"
-                    for _reason in "${_rebuild_reasons[@]}"; do
-                        echo -e "  ${DIM}· $_reason${NC}"
-                    done
-                    info "Removing stale container..."
-                    docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
-                    _existing_ctr=""
-                fi
+            if $_needs_rebuild; then
+                warn "Container needs rebuild:"
+                for _reason in "${_rebuild_reasons[@]}"; do
+                    echo -e "  ${DIM}· $_reason${NC}"
+                done
+                info "Removing stale container..."
+                docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
+                _existing_ctr=""
             fi
 
             # Only check mounts and resume if container still exists
