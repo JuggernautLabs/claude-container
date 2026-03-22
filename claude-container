@@ -1073,8 +1073,7 @@ if $USE_GIT_SESSION && [[ -n "$SESSION_NAME" ]] && docker volume inspect "$GIT_S
                 -v "$GIT_SESSION_VOLUME:/session" \
                 "${GIT_UTIL_IMAGE:-alpine/git}" \
                 -c "echo '$_resolved_main' > /session/.main-project" 2>/dev/null || true
-            # Need fresh container to pick up new .main-project
-            docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
+            # .main-project is in the volume — entrypoint reads it on every start, no rebuild needed
         fi
     fi
 fi
@@ -1174,9 +1173,34 @@ if $USE_GIT_SESSION && ! $EPHEMERAL && [[ -n "$SESSION_NAME" ]]; then
                 for _reason in "${_rebuild_reasons[@]}"; do
                     echo -e "  ${DIM}· $_reason${NC}"
                 done
-                info "Removing stale container..."
-                docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
-                _existing_ctr=""
+
+                # Check for uncommitted work that would be lost (non-git files in workspace)
+                echo ""
+                echo -e "  ${DIM}Volume data (/workspace) is preserved — only the container is replaced.${NC}"
+                echo -e "  ${DIM}Files outside /workspace or in non-git directories survive in the volume.${NC}"
+                echo -e "  ${YELLOW}Uncommitted changes in git repos inside the container will be lost.${NC}"
+
+                if [[ -t 0 ]]; then
+                    echo ""
+                    printf "Remove container and rebuild? [y/N] "
+                    _rebuild_answer=""
+                    read -r _rebuild_answer
+                    case "$_rebuild_answer" in
+                        [yY]|[yY][eE][sS])
+                            info "Removing container..."
+                            docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
+                            _existing_ctr=""
+                            ;;
+                        *)
+                            info "Keeping existing container. It may not work correctly."
+                            info "To rebuild later: claude-container session -s $SESSION_NAME rebuild"
+                            ;;
+                    esac
+                else
+                    # Non-interactive: don't remove, just warn
+                    warn "Container is stale but running non-interactively — not removing."
+                    warn "Run interactively or use: claude-container session -s $SESSION_NAME rebuild"
+                fi
             fi
 
             # Only check mounts and resume if container still exists
@@ -1189,8 +1213,10 @@ if $USE_GIT_SESSION && ! $EPHEMERAL && [[ -n "$SESSION_NAME" ]]; then
                     [[ -z "$_msrc" ]] && continue
                     [[ "$_mtype" != "bind" ]] && continue
                     if [[ -d "$_msrc" && "$_msrc" == *"/token-"* ]]; then
-                        warn "Corrupted mount detected: $_msrc is a directory (expected file)"
-                        info "Removing stale container — a fresh one will be created..."
+                        warn "Corrupted mount: $_msrc is a directory (expected file)"
+                        echo -e "  ${DIM}This is a Docker Desktop race condition — the container cannot start.${NC}"
+                        echo -e "  ${DIM}Cleaning up corrupted path and removing container.${NC}"
+                        echo -e "  ${DIM}Volume data is preserved.${NC}"
                         rm -rf "$_msrc"
                         docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
                         _existing_ctr=""
