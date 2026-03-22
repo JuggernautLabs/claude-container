@@ -952,6 +952,59 @@ if $ENABLE_DOCKER; then
     fi
 fi
 
+# Validate image has required tools for the entrypoint
+_validate_image() {
+    local image="$1"
+    local _missing=()
+    local _warnings=()
+
+    # Critical: gosu (privilege drop — no fallback)
+    if ! docker run --rm --entrypoint sh "$image" -c 'command -v gosu' &>/dev/null; then
+        _missing+=("gosu")
+    fi
+    # Critical: git (workspace operations)
+    if ! docker run --rm --entrypoint sh "$image" -c 'command -v git' &>/dev/null; then
+        _missing+=("git")
+    fi
+    # Critical: claude (the whole point)
+    if ! docker run --rm --entrypoint sh "$image" -c 'command -v claude' &>/dev/null; then
+        _missing+=("claude (Claude Code CLI)")
+    fi
+    # Soft: python3 (trust dialog, has fallback)
+    if ! docker run --rm --entrypoint sh "$image" -c 'command -v python3' &>/dev/null; then
+        _warnings+=("python3 (trust dialog will use fallback)")
+    fi
+    # Soft: sudo (rootish mode)
+    if [[ "${RUN_AS_ROOTISH:-}" == "true" ]]; then
+        if ! docker run --rm --entrypoint sh "$image" -c 'command -v sudo' &>/dev/null; then
+            _warnings+=("sudo (rootish mode won't work — use --as-root or add sudo to Dockerfile)")
+        fi
+    fi
+
+    if [[ ${#_missing[@]} -gt 0 ]]; then
+        error "Image '$image' is missing required tools:"
+        for _m in "${_missing[@]}"; do
+            echo -e "  ${RED}✗${NC} $_m"
+        done
+        echo ""
+        if [[ -n "${DOCKERFILE:-}" ]]; then
+            echo "Your Dockerfile must be based on the claude-container base image:"
+            echo "  FROM ghcr.io/hypermemetic/claude-container:latest"
+            echo ""
+            echo "Or install the missing tools manually."
+        else
+            echo "Use the default image or a Dockerfile based on:"
+            echo "  FROM ghcr.io/hypermemetic/claude-container:latest"
+        fi
+        exit 1
+    fi
+    if [[ ${#_warnings[@]} -gt 0 ]]; then
+        for _w in "${_warnings[@]}"; do
+            warn "Image missing: $_w"
+        done
+    fi
+}
+
 info "Starting container..."
 echo "  Image: $IMAGE_NAME"
 if [[ -n "${DOCKERFILE:-}" ]]; then
@@ -1146,7 +1199,8 @@ fi
 
 # Run container with mounted entrypoint (skip if reusing existing container)
 if ! $_CONTAINER_REUSED; then
-docker run "${DOCKER_ARGS[@]}" "$IMAGE_NAME" /bin/bash -c 'chmod +x /usr/local/bin/cc-entrypoint /usr/local/bin/agent-run 2>/dev/null; exec /usr/local/bin/cc-entrypoint'
+    _validate_image "$IMAGE_NAME"
+    docker run "${DOCKER_ARGS[@]}" "$IMAGE_NAME" /bin/bash -c 'chmod +x /usr/local/bin/cc-entrypoint /usr/local/bin/agent-run 2>/dev/null; exec /usr/local/bin/cc-entrypoint'
 fi  # end: if ! $_CONTAINER_REUSED
 
 # Session exit message
