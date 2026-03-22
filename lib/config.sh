@@ -327,19 +327,42 @@ get_main_project() {
     local config_file="$1"
 
     if ! command -v yq &>/dev/null; then
-        return 1
+        return 0
     fi
 
     # Try to find project with main: true
     local main_proj
     main_proj=$(yq eval '.projects | to_entries | .[] | select(.value.main == true) | .key' "$config_file" 2>/dev/null | head -1)
-
     if [[ -n "$main_proj" ]]; then
         echo "$main_proj"
-    else
-        # Fall back to first project
-        yq eval '.projects | keys | .[0]' "$config_file" 2>/dev/null
+        return 0
     fi
+
+    # Try to match cwd against project paths
+    local _cwd
+    _cwd=$(pwd)
+    while IFS='|' read -r _pname _ppath; do
+        [[ -z "$_ppath" ]] && continue
+        if [[ "$_cwd" == "$_ppath" || "$_cwd" == "$_ppath"/* ]]; then
+            echo "$_pname"
+            return 0
+        fi
+    done <<< "$(yq eval '.projects | to_entries | .[] | .key + "|" + .value.path' "$config_file" 2>/dev/null)" || true
+
+    # Try to match session name against project names
+    local _session="${SESSION_NAME:-}"
+    if [[ -n "$_session" ]]; then
+        while IFS= read -r _pname; do
+            [[ -z "$_pname" ]] && continue
+            if [[ "${_pname##*/}" == "$_session" || "$_pname" == *"/$_session" ]]; then
+                echo "$_pname"
+                return 0
+            fi
+        done <<< "$(yq eval '.projects | keys | .[]' "$config_file" 2>/dev/null)" || true
+    fi
+
+    # Fall back to first project
+    yq eval '.projects | keys | .[0]' "$config_file" 2>/dev/null
 }
 
 # ============================================================================
