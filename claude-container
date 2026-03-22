@@ -1074,13 +1074,40 @@ if $USE_GIT_SESSION && ! $EPHEMERAL && [[ -n "$SESSION_NAME" ]]; then
                 _existing_ctr=""
             fi
 
-            # Check if entrypoint mount points to a different script dir
-            # (e.g. installed copy vs dev repo, or dev repo changed)
+            # Detect stale container configuration and repair by rebuilding
             if [[ -n "$_existing_ctr" ]]; then
+                _needs_rebuild=false
+                _rebuild_reasons=()
+
+                # Check 1: entrypoint mount points to a different script dir
                 _ctr_entrypoint=$(docker inspect --format '{{range .Mounts}}{{if eq .Destination "/usr/local/bin/cc-entrypoint"}}{{.Source}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null || echo "")
                 _expected_entrypoint="$SCRIPT_DIR/lib/container/entrypoint.sh"
                 if [[ -n "$_ctr_entrypoint" && "$_ctr_entrypoint" != "$_expected_entrypoint" ]]; then
-                    info "Entrypoint changed — rebuilding container..."
+                    _needs_rebuild=true
+                    _rebuild_reasons+=("entrypoint: $_ctr_entrypoint → $_expected_entrypoint")
+                fi
+
+                # Check 2: container was created without --user 0:0 (needs root for entrypoint)
+                _ctr_user=$(docker inspect --format '{{.Config.User}}' "$CONTAINER_NAME" 2>/dev/null || echo "")
+                if [[ "$_ctr_user" != "0:0" && "$_ctr_user" != "0" && "$_ctr_user" != "root" ]]; then
+                    _needs_rebuild=true
+                    _rebuild_reasons+=("user: '$_ctr_user' (needs root for entrypoint setup)")
+                fi
+
+                # Check 3: container has stale env vars that conflict
+                # (e.g. CONTINUE_SESSION=1 baked in from a previous --continue run)
+                _ctr_continue=$(docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$CONTAINER_NAME" 2>/dev/null | grep "^CONTINUE_SESSION=1$" || true)
+                if [[ -n "$_ctr_continue" ]] && ! $CONTINUE_SESSION; then
+                    _needs_rebuild=true
+                    _rebuild_reasons+=("stale env: CONTINUE_SESSION=1 baked in")
+                fi
+
+                if $_needs_rebuild; then
+                    warn "Container needs rebuild:"
+                    for _reason in "${_rebuild_reasons[@]}"; do
+                        echo -e "  ${DIM}· $_reason${NC}"
+                    done
+                    info "Removing stale container..."
                     docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
                     _existing_ctr=""
                 fi
