@@ -949,6 +949,9 @@ fi
 
 info "Starting container..."
 echo "  Image: $IMAGE_NAME"
+if [[ -n "${DOCKERFILE:-}" ]]; then
+    echo "  Dockerfile: $DOCKERFILE"
+fi
 if $USE_GIT_SESSION; then
     echo "  Workspace: $GIT_SESSION_VOLUME -> /workspace (git session)"
 else
@@ -1058,6 +1061,14 @@ if $USE_GIT_SESSION && ! $EPHEMERAL && [[ -n "$SESSION_NAME" ]]; then
             docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
             _existing_ctr=""
         else
+            # Check if container was built from a different image than current
+            _ctr_image=$(docker inspect --format '{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null || echo "")
+            if [[ -n "$_ctr_image" && "$_ctr_image" != "$IMAGE_NAME" ]]; then
+                info "Image changed ($_ctr_image → $IMAGE_NAME) — rebuilding container..."
+                docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
+                _existing_ctr=""
+            fi
+
             # Check for corrupted mounts before resuming (Docker Desktop can leave
             # directories where files should be, e.g. token mounts)
             _mount_ok=true
