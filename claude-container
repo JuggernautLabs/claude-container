@@ -297,10 +297,22 @@ while [[ $# -gt 0 ]]; do
             ;;
 
         --dockerfile)
-            # Specify explicit Dockerfile path (auto-detected if not provided)
+            # Specify explicit Dockerfile path or directory containing one
             DOCKERFILE_SET=true
             if [[ -n "${2:-}" ]] && [[ ! "$2" =~ ^- ]]; then
-                DOCKERFILE="$2"
+                if [[ -d "$2" ]]; then
+                    # Directory given — search for Dockerfile
+                    if [[ -f "$2/Dockerfile" ]]; then
+                        DOCKERFILE="$2/Dockerfile"
+                    elif [[ -f "$2/dockerfile" ]]; then
+                        DOCKERFILE="$2/dockerfile"
+                    else
+                        error "No Dockerfile found in: $2"
+                        exit 1
+                    fi
+                else
+                    DOCKERFILE="$2"
+                fi
                 shift 2
             else
                 shift
