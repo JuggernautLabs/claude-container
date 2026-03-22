@@ -2355,6 +2355,11 @@ _extract_multi_project_direct() {
             _missing_host_repos+=("$proj_name|$proj_path")
             continue
         fi
+        if ! is_git_repo "$proj_path"; then
+            info "  $proj_name: host path exists but is not a git repo — will extract from session"
+            _missing_host_repos+=("$proj_name|$proj_path")
+            continue
+        fi
         _valid_projects+=("$proj_name|$proj_path")
         echo "$proj_name"
     done <<< "$projects" > "$bundle_dir/.projects"
