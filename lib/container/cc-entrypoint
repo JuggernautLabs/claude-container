@@ -1,0 +1,148 @@
+#!/bin/bash
+# cc-entrypoint — container entrypoint, Phase 1 (root)
+#
+# Runs as root (--user 0:0). Sets up the environment, creates the developer
+# user, then exec's into cc-developer-setup as developer via gosu.
+#
+# READS: /run/secrets/claude_token, env vars (HOST_UID, RUN_AS_ROOTISH, etc.)
+# WRITES: /etc/sudoers.d/developer, /usr/local/bin/fin, /tmp/.gitconfig-source
+# DESTROYS: nothing
+
+# NO set -e — explicit error handling throughout
+
+# ============================================================================
+# Phase 1.1: Token Setup
+# ============================================================================
+
+if [[ -n "${CLAUDE_CODE_OAUTH_TOKEN_NESTED:-}" ]]; then
+    export CLAUDE_CODE_OAUTH_TOKEN="$CLAUDE_CODE_OAUTH_TOKEN_NESTED"
+elif [[ -f /run/secrets/claude_token ]]; then
+    export CLAUDE_CODE_OAUTH_TOKEN=$(cat /run/secrets/claude_token)
+elif [[ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]]; then
+    echo "ERROR: No token found (neither file nor env var)" >&2
+    exit 1
+fi
+
+# ============================================================================
+# Phase 1.2: Locale Check
+# ============================================================================
+
+if [[ -n "${LC_ALL:-}" ]] && ! locale -a 2>/dev/null | grep -qi "${LC_ALL%%.*}"; then
+    echo "WARNING: locale '$LC_ALL' not available — add 'locales' package and 'locale-gen $LC_ALL' to your Dockerfile" >&2
+    unset LC_ALL
+fi
+
+# ============================================================================
+# Phase 1.3: Overlay Setup (deprecated compat)
+# ============================================================================
+
+if [[ "${USE_OVERLAY:-}" == "1" ]]; then
+    if command -v fuse-overlayfs &>/dev/null; then
+        mkdir -p /workspace-lower /workspace-upper /workspace-work /workspace
+        if fuse-overlayfs -o lowerdir=/workspace-lower,upperdir=/workspace-upper,workdir=/workspace-work /workspace 2>/dev/null; then
+            echo "  Overlay: fuse-overlayfs"
+        else
+            mount --bind /workspace-lower /workspace 2>/dev/null || ln -sf /workspace-lower /workspace
+            echo "  Fallback: direct mount, read-only"
+        fi
+        cd /workspace
+    fi
+fi
+
+# ============================================================================
+# Phase 1.4: Verify Mode (early exit)
+# ============================================================================
+
+if [[ "${VERIFY_MODE:-}" == "1" ]]; then
+    echo "=== Verification ==="
+    echo "Run as: $(if [[ "${RUN_AS_ROOTISH:-}" == "1" ]]; then echo "developer (sudo)"; elif [[ "${RUN_AS_USER:-}" == "1" ]]; then echo "developer"; else echo "root"; fi)"
+    echo "Claude: $(which claude 2>&1)"
+    echo "Platform: ${PLATFORM:-unknown}"
+    echo "Token: ${CLAUDE_CODE_OAUTH_TOKEN:0:20}..."
+    echo "Gosu: $(which gosu 2>&1)"
+    echo "Git: $(which git 2>&1)"
+    claude -p "Say 'verification OK'" 2>&1 || echo "Claude test failed"
+    exit 0
+fi
+
+# ============================================================================
+# Phase 1.5: User Creation
+# ============================================================================
+
+DEV_GID=61000
+HOST_UID="${HOST_UID:-1000}"
+
+if [[ "${RUN_AS_USER:-}" == "1" ]] || [[ "${RUN_AS_ROOTISH:-}" == "1" ]]; then
+    groupadd -g $DEV_GID developer 2>/dev/null || true
+    useradd -u $HOST_UID -g $DEV_GID -m -s /bin/bash developer 2>/dev/null || true
+    chown developer:developer /workspace 2>/dev/null || true
+
+    # Docker socket
+    if [[ -S /var/run/docker.sock ]]; then
+        chmod 666 /var/run/docker.sock 2>/dev/null || true
+    fi
+
+    # Sudo setup
+    if [[ "${RUN_AS_ROOTISH:-}" == "1" ]]; then
+        if command -v sudo &>/dev/null; then
+            echo "developer ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/developer 2>/dev/null || true
+            chmod 0440 /etc/sudoers.d/developer 2>/dev/null || true
+            cat > /usr/local/bin/rootish << 'WRAPPER'
+#!/bin/bash
+exec sudo "$@"
+WRAPPER
+            chmod +x /usr/local/bin/rootish 2>/dev/null || true
+        else
+            echo "WARNING: sudo not found - rootish mode requires sudo in the image" >&2
+            echo "         Use --dockerfile to build an image with sudo, or use --as-root" >&2
+        fi
+    fi
+fi
+
+# ============================================================================
+# Phase 1.6: Install fin command
+# ============================================================================
+
+cat > /usr/local/bin/fin << 'FINSCRIPT'
+#!/bin/bash
+if [[ $# -eq 0 ]]; then
+    echo "Usage: fin <description>"
+    echo "Signals completion of conflict resolution and terminates the session."
+    exit 1
+fi
+echo "$*" > /workspace/.reconcile-complete
+echo ""
+echo "Session complete: $*"
+kill 1
+FINSCRIPT
+chmod +x /usr/local/bin/fin
+
+# ============================================================================
+# Phase 1.7: Stage files for developer
+# ============================================================================
+
+# Copy gitconfig to tmp (readable by developer, avoids chown)
+if [[ -f /root/.gitconfig ]]; then
+    cp /root/.gitconfig /tmp/.gitconfig-source 2>/dev/null || true
+    chmod 644 /tmp/.gitconfig-source 2>/dev/null || true
+fi
+
+# Docker CLI check
+if [[ -S /var/run/docker.sock ]] && ! command -v docker &>/dev/null; then
+    echo "WARNING: docker socket mounted but docker CLI not found" >&2
+fi
+
+# ============================================================================
+# Phase 1.8: Hand off to developer setup
+# ============================================================================
+
+# cc-developer-setup does Phase 2 (config) + Phase 3 (launch) as developer.
+# It's a mounted script at /usr/local/bin/cc-developer-setup.
+# Using exec so PID 1 becomes the developer process.
+
+if [[ "${RUN_AS_USER:-}" == "1" ]] || [[ "${RUN_AS_ROOTISH:-}" == "1" ]]; then
+    exec gosu developer /usr/local/bin/cc-developer-setup
+else
+    # Pure root mode
+    HOME=/home/developer exec /usr/local/bin/cc-developer-setup
+fi

@@ -1,0 +1,101 @@
+#!/bin/bash
+# cc-developer-setup — Phase 2+3: config setup + launch (runs as developer)
+# Called by cc-entrypoint via gosu. All files owned by developer — zero chown.
+# READS: /workspace config, env vars
+# WRITES: ~/.claude.json, ~/.claude/settings.json, ~/.gitconfig, CLAUDE.md
+# DESTROYS: nothing
+
+# Phase 2.1: Config dirs
+mkdir -p ~/.claude ~/.cargo ~/.npm ~/.cache/pip 2>/dev/null || true
+
+# Phase 2.2: .claude.json in volume (survives rebuilds)
+if [ ! -L ~/.claude.json ] || [ "$(readlink ~/.claude.json 2>/dev/null)" != "$HOME/.claude/.claude.json" ]; then
+    rm -f ~/.claude.json 2>/dev/null || true
+    ln -s "$HOME/.claude/.claude.json" ~/.claude.json 2>/dev/null || true
+fi
+
+python3 -c '
+import json, glob, os
+p = os.path.expanduser("~/.claude/.claude.json")
+c = {}
+try:
+    c = json.load(open(p))
+except:
+    pass
+c.setdefault("theme","dark-ansi")
+c["hasCompletedOnboarding"]=True
+c["bypassPermissionsModeAccepted"]=True
+pr = c.get("projects",{})
+pr["/workspace"]={"hasTrustDialogAccepted":True}
+for pat in ["/workspace/*/","/workspace/*/*/"]:
+    for d in glob.glob(pat):
+        if os.path.isdir(os.path.join(d,".git")):
+            pr.setdefault(d.rstrip("/"),{})["hasTrustDialogAccepted"]=True
+c["projects"]=pr
+json.dump(c,open(p,"w"))
+' 2>/dev/null || {
+    [ ! -f "$HOME/.claude/.claude.json" ] && echo '{"theme":"dark-ansi","hasCompletedOnboarding":true,"bypassPermissionsModeAccepted":true}' > "$HOME/.claude/.claude.json"
+}
+
+# Phase 2.3: Statusline
+echo "eyJzdGF0dXNMaW5lIjp7InR5cGUiOiJjb21tYW5kIiwiY29tbWFuZCI6ImlucHV0PSQoY2F0KTsgbW9kZWw9JChlY2hvIFwiJGlucHV0XCIgfCBqcSAtciAnLm1vZGVsLmRpc3BsYXlfbmFtZSAvLyAubW9kZWwuaWQgLy8gXCI/XCInIHwgdHIgJ1s6dXBwZXI6XScgJ1s6bG93ZXI6XScgfCB0ciAnICcgJy0nKTsgY29zdD0kKGVjaG8gXCIkaW5wdXRcIiB8IGpxIC1yICcuY29zdC50b3RhbF9jb3N0X3VzZCAvLyAwJyB8IHhhcmdzIHByaW50ZiAnJCUuMmYnKTsgb3ZlcjIwMGs9JChlY2hvIFwiJGlucHV0XCIgfCBqcSAtciAnLmV4Y2VlZHNfMjAwa190b2tlbnMnKTsgaWYgWyBcIiRvdmVyMjAwa1wiID0gXCJ0cnVlXCIgXTsgdGhlbiBjdHg9J+KaoO+4jz4yMDBrJzsgZWxzZSBjdHg9JzwyMDBrJzsgZmk7IGN3ZD0kKGVjaG8gXCIkaW5wdXRcIiB8IGpxIC1yICcud29ya3NwYWNlLmN1cnJlbnRfZGlyJyk7IGRpcj0kKGJhc2VuYW1lIFwiJGN3ZFwiKTsgY2QgXCIkY3dkXCIgMj4vZGV2L251bGwgfHwgdHJ1ZTsgYnJhbmNoPSQoZ2l0IHN5bWJvbGljLXJlZiAtLXNob3J0IEhFQUQgMj4vZGV2L251bGwpOyBkaXJ0eT0kKGdpdCBzdGF0dXMgLS1wb3JjZWxhaW4gMj4vZGV2L251bGwgfCBoZWFkIC0xKTsgaWYgWyAtbiBcIiRkaXJ0eVwiIF07IHRoZW4gbWFyaz0nKic7IGVsc2UgbWFyaz0nJzsgZmk7IHNlc3M9XCIke0NMQVVERV9TRVNTSU9OX05BTUU6LX1cIjsgaWYgWyAtbiBcIiRzZXNzXCIgXSAmJiBbIC1uIFwiJGJyYW5jaFwiIF07IHRoZW4gZWNobyBcIlskc2Vzc10gJG1vZGVsQCRkaXI6KCRicmFuY2gkbWFyaykgJGNvc3QgJGN0eFwiOyBlbGlmIFsgLW4gXCIkc2Vzc1wiIF07IHRoZW4gZWNobyBcIlskc2Vzc10gJG1vZGVsQCRkaXIgJGNvc3QgJGN0eFwiOyBlbGlmIFsgLW4gXCIkYnJhbmNoXCIgXTsgdGhlbiBlY2hvIFwiJG1vZGVsQCRkaXI6KCRicmFuY2gkbWFyaykgJGNvc3QgJGN0eFwiOyBlbHNlIGVjaG8gXCIkbW9kZWxAJGRpciAkY29zdCAkY3R4XCI7IGZpIn19Cg==" | base64 -d > "$HOME/.claude/settings.json" 2>/dev/null || true
+
+# Phase 2.4: Git config
+[ -f /tmp/.gitconfig-source ] && cp /tmp/.gitconfig-source "$HOME/.gitconfig" 2>/dev/null || true
+
+# Phase 2.5: CLAUDE.md injection
+if [ -n "${AGENT_TASK:-}" ] && [ "${AGENT_TASK}" != "work" ] && [ ! -f /workspace/CLAUDE.md ]; then
+    _session="${CLAUDE_SESSION_NAME:-}"
+    _repos=""
+    for _d in /workspace/*/ /workspace/*/*/; do
+        [ -d "$_d/.git" ] && _repos="$_repos- ${_d#/workspace/}\n"
+    done
+    case "${AGENT_TASK}" in
+        resolve-conflicts)
+            printf "# Conflict Resolution\nSession: %s\n\n## Repos\n%b\n## Instructions\nResolve all merge conflicts. grep -r '<<<<<<< HEAD' . to find them.\nWhen done: fin \"description\"\n" "$_session" "$_repos" > /workspace/CLAUDE.md ;;
+        rebase-conflicts)
+            printf "# Rebase Resolution\nSession: %s\n\n## Repos\n%b\n## Instructions\nResolve rebase conflicts. git add + git rebase --continue.\nWhen done: fin \"description\"\n" "$_session" "$_repos" > /workspace/CLAUDE.md ;;
+        review)
+            printf "# Code Review\nSession: %s\n\n## Repos\n%b\n## Instructions\nReview only — do NOT modify.\n" "$_session" "$_repos" > /workspace/CLAUDE.md ;;
+        exec)
+            printf "# Task\nSession: %s\n\n## Repos\n%b\n" "$_session" "$_repos" > /workspace/CLAUDE.md ;;
+    esac
+fi
+
+# Phase 2.6: Working directory
+WORK_DIR="/workspace"
+if [ -f /workspace/.main-project ]; then
+    MAIN_PROJ=$(cat /workspace/.main-project)
+    [ -d "/workspace/$MAIN_PROJ" ] && WORK_DIR="/workspace/$MAIN_PROJ"
+fi
+
+# Phase 2.7: Early exits
+if [ "${SHELL_ONLY:-}" = "1" ]; then cd "$WORK_DIR"; exec bash; fi
+if [ -n "${BASH_EXEC:-}" ]; then cd "$WORK_DIR"; exec bash -c "$BASH_EXEC"; fi
+
+# Phase 3: Build args + launch
+CLAUDE_CMD_ARGS=""
+[ "${RUN_AS_USER:-}" = "1" ] || [ "${RUN_AS_ROOTISH:-}" = "1" ] && CLAUDE_CMD_ARGS="--dangerously-skip-permissions"
+[ "${CONTINUE_SESSION:-}" = "1" ] && CLAUDE_CMD_ARGS="--continue $CLAUDE_CMD_ARGS"
+
+if [ -n "${CLAUDE_PASSTHROUGH_ARGS:-}" ]; then
+    _decoded=$(echo "$CLAUDE_PASSTHROUGH_ARGS" | base64 -d 2>/dev/null || echo "$CLAUDE_PASSTHROUGH_ARGS" | base64 -D 2>/dev/null || echo "")
+    [ -n "$_decoded" ] && CLAUDE_CMD_ARGS="$CLAUDE_CMD_ARGS $_decoded"
+fi
+
+CLAUDE_INITIAL_PROMPT=""
+if [ -f /workspace/.merge-into-summary ]; then
+    CLAUDE_INITIAL_PROMPT=$(cat /workspace/.merge-into-summary)
+    rm -f /workspace/.merge-into-summary
+elif [ -f /workspace/.sync-summary ]; then
+    CLAUDE_INITIAL_PROMPT=$(cat /workspace/.sync-summary)
+    rm -f /workspace/.sync-summary
+fi
+
+cd "$WORK_DIR"
+if [ -n "$CLAUDE_INITIAL_PROMPT" ]; then
+    echo "$CLAUDE_INITIAL_PROMPT" > /tmp/.claude-initial-prompt
+    exec /usr/local/bin/cc-agent-run $CLAUDE_CMD_ARGS "$(cat /tmp/.claude-initial-prompt)"
+else
+    exec /usr/local/bin/cc-agent-run $CLAUDE_CMD_ARGS
+fi
