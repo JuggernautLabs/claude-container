@@ -961,6 +961,51 @@ if [[ ${#EXPOSE_PORTS[@]} -gt 0 ]]; then
 fi
 echo ""
 
+# Update .main-project based on cwd before every launch
+# (get_main_project tries: main:true, cwd match, session name match, first key)
+if $USE_GIT_SESSION && [[ -n "$SESSION_NAME" ]] && docker volume inspect "$GIT_SESSION_VOLUME" &>/dev/null; then
+    _resolved_main=""
+    _session_cfg=$(docker run --rm --entrypoint sh \
+        -v "$GIT_SESSION_VOLUME:/session:ro" "${GIT_UTIL_IMAGE:-alpine/git}" \
+        -c 'cat /session/.claude-projects.yml' 2>/dev/null || true)
+    if [[ -n "$_session_cfg" ]] && command -v yq &>/dev/null; then
+        _cwd=$(pwd)
+        # Match cwd against project paths
+        while IFS='|' read -r _pname _ppath; do
+            [[ -z "$_ppath" ]] && continue
+            if [[ "$_cwd" == "$_ppath" || "$_cwd" == "$_ppath"/* ]]; then
+                _resolved_main="$_pname"
+                break
+            fi
+        done <<< "$(echo "$_session_cfg" | yq eval '.projects | to_entries | .[] | .key + "|" + .value.path' - 2>/dev/null)" || true
+
+        # Match session name against project names
+        if [[ -z "$_resolved_main" ]]; then
+            while IFS= read -r _pname; do
+                [[ -z "$_pname" ]] && continue
+                if [[ "${_pname##*/}" == "$SESSION_NAME" || "$_pname" == *"/$SESSION_NAME" ]]; then
+                    _resolved_main="$_pname"
+                    break
+                fi
+            done <<< "$(echo "$_session_cfg" | yq eval '.projects | keys | .[]' - 2>/dev/null)" || true
+        fi
+    fi
+    if [[ -n "$_resolved_main" ]]; then
+        _current_main=$(docker run --rm --entrypoint sh \
+            -v "$GIT_SESSION_VOLUME:/session:ro" "${GIT_UTIL_IMAGE:-alpine/git}" \
+            -c 'cat /session/.main-project 2>/dev/null' 2>/dev/null || true)
+        if [[ "$_current_main" != "$_resolved_main" ]]; then
+            docker run --rm --entrypoint sh \
+                --user "$(id -u):$(id -u)" \
+                -v "$GIT_SESSION_VOLUME:/session" \
+                "${GIT_UTIL_IMAGE:-alpine/git}" \
+                -c "echo '$_resolved_main' > /session/.main-project" 2>/dev/null || true
+            # Need fresh container to pick up new .main-project
+            docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
+        fi
+    fi
+fi
+
 # Container reuse logic for persistent (non-ephemeral) session containers
 _CONTAINER_REUSED=false
 if $USE_GIT_SESSION && ! $EPHEMERAL && [[ -n "$SESSION_NAME" ]]; then
