@@ -94,7 +94,14 @@ fi
 if [[ "${RUN_AS_USER:-}" == "1" ]] || [[ "${RUN_AS_ROOTISH:-}" == "1" ]]; then
     groupadd -g $DEV_GID developer 2>/dev/null || true
     useradd -u $HOST_UID -g $DEV_GID -m -s /bin/bash developer 2>/dev/null || true
-    chown -R developer:developer /home/developer
+    # Fix ownership of home dir and key config dirs (NOT recursive on all of home —
+    # .claude/ and .npm/ can have thousands of cached files from previous runs)
+    chown developer:developer /home/developer 2>/dev/null || true
+    # Key config files (non-recursive, fast)
+    chown developer:developer /home/developer/.claude.json /home/developer/.gitconfig 2>/dev/null || true
+    chown developer:developer /home/developer/.claude /home/developer/.cargo /home/developer/.npm /home/developer/.cache 2>/dev/null || true
+    # Claude config needs recursive fix (settings, session-env, etc.) but skip debug/statsig bloat
+    chown -R developer:developer /home/developer/.claude/settings.json /home/developer/.claude/session-env 2>/dev/null || true
     chown developer:developer /workspace 2>/dev/null || true
 
     # Make docker socket accessible if mounted
