@@ -444,6 +444,13 @@ create_git_session() {
         source_volume_name=$(grep " $source_dir " /proc/self/mountinfo 2>/dev/null | grep -oP '/var/lib/docker/volumes/\K[^/]+' | head -1 || echo "")
     fi
 
+    # If CONFIG_FILE was already set (e.g. by --discover-repos in main script),
+    # use it directly — don't re-discover.
+    if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then
+        create_multi_project_session "$name" "$CONFIG_FILE"
+        return $?
+    fi
+
     # Check for --discover-repos flags (highest priority)
     if [[ ${#DISCOVER_REPOS_DIRS[@]} -gt 0 ]]; then
         local discovered_config
