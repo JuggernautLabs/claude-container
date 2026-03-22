@@ -1069,29 +1069,30 @@ if $USE_GIT_SESSION && ! $EPHEMERAL && [[ -n "$SESSION_NAME" ]]; then
                 _existing_ctr=""
             fi
 
-            # Check for corrupted mounts before resuming (Docker Desktop can leave
-            # directories where files should be, e.g. token mounts)
-            _mount_ok=true
-            _mounts=""
-            _mounts=$(docker inspect --format '{{range .Mounts}}{{.Source}}|{{.Type}}{{"\n"}}{{end}}' "$CONTAINER_NAME" 2>/dev/null || true)
-            while IFS='|' read -r _msrc _mtype; do
-                [[ -z "$_msrc" ]] && continue
-                [[ "$_mtype" != "bind" ]] && continue
-                # If source is a directory but was meant to be a file (token, secret)
-                if [[ -d "$_msrc" && "$_msrc" == *"/token-"* ]]; then
-                    warn "Corrupted mount detected: $_msrc is a directory (expected file)"
-                    info "Removing stale container — a fresh one will be created..."
-                    rm -rf "$_msrc"
-                    docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
-                    _existing_ctr=""
-                    _mount_ok=false
-                    break
-                fi
-            done <<< "$_mounts" || true
+            # Only check mounts and resume if container still exists
+            if [[ -n "$_existing_ctr" ]]; then
+                # Check for corrupted mounts before resuming
+                _mount_ok=true
+                _mounts=""
+                _mounts=$(docker inspect --format '{{range .Mounts}}{{.Source}}|{{.Type}}{{"\n"}}{{end}}' "$CONTAINER_NAME" 2>/dev/null || true)
+                while IFS='|' read -r _msrc _mtype; do
+                    [[ -z "$_msrc" ]] && continue
+                    [[ "$_mtype" != "bind" ]] && continue
+                    if [[ -d "$_msrc" && "$_msrc" == *"/token-"* ]]; then
+                        warn "Corrupted mount detected: $_msrc is a directory (expected file)"
+                        info "Removing stale container — a fresh one will be created..."
+                        rm -rf "$_msrc"
+                        docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
+                        _existing_ctr=""
+                        _mount_ok=false
+                        break
+                    fi
+                done <<< "$_mounts" || true
 
-            if $_mount_ok; then
-                info "Resuming container for session '$SESSION_NAME'..."
-                docker start -ai "$CONTAINER_NAME" || true
+                if $_mount_ok; then
+                    info "Resuming container for session '$SESSION_NAME'..."
+                    docker start -ai "$CONTAINER_NAME" || true
+                fi
             fi
         fi
         # Only mark as reused if we didn't remove it for a task launch
