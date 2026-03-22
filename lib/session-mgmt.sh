@@ -595,12 +595,14 @@ session_add_repos_bulk() {
 
         while IFS='|' read -r status name size; do
             [[ -z "$status" ]] && continue
-            if [[ "$status" == "OK" ]]; then
+            # Only parse lines matching our OK|name|size or FAIL|name protocol
+            if [[ "$status" == "OK" && -n "$name" ]]; then
                 success "  $name ($size)"
-            else
-                error "  $name failed"
+            elif [[ "$status" == "FAIL" && -n "$name" ]]; then
+                error "  $name: clone failed"
                 failed=1
             fi
+            # Ignore other lines (git stderr, clone progress, etc.)
         done <<< "$clone_output"
     fi
 
